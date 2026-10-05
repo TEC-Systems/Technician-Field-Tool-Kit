@@ -1467,10 +1467,9 @@ internal sealed class ToolkitWindow : Form
                 string directory = Path.Combine(Path.GetTempPath(), "TEC-FieldToolkit-Update-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(directory);
                 string installer = Path.Combine(directory, "TEC-Systems-FieldToolkit-Setup.exe"), sums = Path.Combine(directory, "SHA256SUMS.txt");
                 using (WebClient client = new WebClient()) { client.Headers[HttpRequestHeader.UserAgent] = "TEC-Systems-Field-Toolkit"; client.DownloadFile(setupUrl, installer); client.DownloadFile(sumsUrl, sums); }
-                Match match = Regex.Match(File.ReadAllText(sums), @"(?im)^([a-f0-9]{64})\s+TEC-Systems-FieldToolkit-Setup\.exe$");
-                if (!match.Success) throw new InvalidOperationException("Release checksum is missing.");
+                string expected = ParseReleaseChecksum(File.ReadAllText(sums));
                 using (SHA256 sha = SHA256.Create()) using (FileStream stream = File.OpenRead(installer))
-                { string actual = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", ""); if (!actual.Equals(match.Groups[1].Value, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Installer checksum mismatch."); }
+                { string actual = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", ""); if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Installer checksum mismatch."); }
                 BeginInvoke(new Action(delegate {
                     try
                     {
@@ -1484,11 +1483,22 @@ internal sealed class ToolkitWindow : Form
         });
     }
 
+    private static string ParseReleaseChecksum(string content)
+    {
+        Match match = Regex.Match(content.TrimStart('\uFEFF'), @"(?im)^([a-f0-9]{64})[ \t]+TEC-Systems-FieldToolkit-Setup\.exe[ \t]*\r?$");
+        if (!match.Success) throw new InvalidOperationException("Release checksum is missing.");
+        return match.Groups[1].Value;
+    }
+
     public int SelfTest()
     {
         try
         {
             testing = true;
+            string checksumSample = new string('a', 64) + "  TEC-Systems-FieldToolkit-Setup.exe";
+            if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
+                ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
+                throw new InvalidOperationException("Release checksum line ending handling failed.");
             if (tabs.TabPages.Count != 6) throw new InvalidOperationException("Expected six active tabs.");
             if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner")
                 throw new InvalidOperationException("IP Scanner must be next to IP Shifter.");

@@ -151,7 +151,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
 $verify = Start-Process -FilePath $setup -ArgumentList '/verify' -PassThru -Wait
 if ($verify.ExitCode -ne 0) { throw 'Installer payload verification failed.' }
 $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
-Set-Content -LiteralPath (Join-Path $dist 'SHA256SUMS.txt') -Value ("{0}  TEC-Systems-FieldToolkit-Setup.exe" -f $hash) -Encoding ASCII
+[System.IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS.txt'), ("{0}  TEC-Systems-FieldToolkit-Setup.exe`n" -f $hash), [System.Text.Encoding]::ASCII)
 Compress-Archive -Path $setup -DestinationPath $installerZip -Force
 Write-Host ('Built: {0}' -f $setup)
 Write-Host ('Installer ZIP: {0}' -f $installerZip)
