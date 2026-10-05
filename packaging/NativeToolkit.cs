@@ -385,6 +385,7 @@ internal sealed class ToolkitWindow : Form
         BuildNetworkPage(Page("Network Troubleshooting"));
         BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
+        Page("test");
         BuildLogPanel();
         internetTimer = new System.Windows.Forms.Timer { Interval = 30000 };
         internetTimer.Tick += delegate { UpdateInternet(); };
@@ -1733,7 +1734,7 @@ internal sealed class ToolkitWindow : Form
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
                 throw new InvalidOperationException("Release checksum line ending handling failed.");
-            if (tabs.TabPages.Count != 6) throw new InvalidOperationException("Expected six active tabs.");
+            if (tabs.TabPages.Count != 7) throw new InvalidOperationException("Expected seven active tabs.");
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
             if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner")
