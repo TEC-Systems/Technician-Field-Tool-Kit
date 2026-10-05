@@ -752,8 +752,8 @@ internal sealed class ToolkitWindow : Form
         string[] labels = { "System Summary", "Disk Summary", "Service Check", "Event Errors", "Problem Devices", "Update Status" };
         Action[] actions = { SystemSummary, DiskSummary, ServiceCheck, EventErrors, ProblemDevices, UpdateStatus };
         for (int i = 0; i < labels.Length; i++) B(page, labels[i], 18 + (i % 5) * 144, 130 + (i / 5) * 40, 132, actions[i], "Write " + labels[i].ToLowerInvariant() + " findings to the technician log.", Cobalt);
-        page.Controls.Add(L("Open tools", 18, 252, 180));
-        FlowLayoutPanel tools = new FlowLayoutPanel { Left = 18, Top = 280, Width = 708, Height = 126, AutoScroll = true, WrapContents = true };
+        page.Controls.Add(L("Open tools", 18, 220, 180));
+        FlowLayoutPanel tools = new FlowLayoutPanel { Left = 18, Top = 244, Width = 708, Height = 126, AutoScroll = true, WrapContents = true };
         page.Controls.Add(tools);
         string[,] specs = {
             { "Services", "services.msc", "" }, { "Event Viewer", "eventvwr.msc", "" }, { "Device Manager", "devmgmt.msc", "" },
@@ -764,16 +764,16 @@ internal sealed class ToolkitWindow : Form
             { "Printers", "control.exe", "printers" }, { "IPConfig /all", "cmd.exe", "/k ipconfig /all" }
         };
         for (int i = 0; i < specs.GetLength(0); i++) { string name = specs[i, 0], exe = specs[i, 1], arg = specs[i, 2]; B(tools, name, 0, 0, 126, delegate { OpenTool(name, exe, arg); }, "Open " + name + " for Windows troubleshooting.", Slate).Margin = new Padding(0, 0, 8, 8); }
-        page.Controls.Add(L("Saved RDP sites", 18, 416, 200));
-        rdpSiteChoice = new ComboBox { Left = 18, Top = 441, Width = 354, DropDownStyle = ComboBoxStyle.DropDownList };
+        page.Controls.Add(L("Saved RDP sites", 18, 380, 200));
+        rdpSiteChoice = new ComboBox { Left = 18, Top = 405, Width = 354, DropDownStyle = ComboBoxStyle.DropDownList };
         rdpSiteChoice.SelectedIndexChanged += delegate { LoadSelectedRdpSite(); };
         page.Controls.Add(rdpSiteChoice);
-        B(page, "Open RDP", 388, 437, 118, delegate { OpenRdp(rdpTarget.Text); }, "Connect to the selected or entered server using Remote Desktop. Credentials are not saved.", Cobalt);
-        B(page, "New", 518, 437, 100, NewRdpSite, "Clear the RDP fields to enter a new site.", Slate);
-        page.Controls.Add(L("Site name", 18, 480, 120)); rdpSiteName = T(18, 504, 270, ""); page.Controls.Add(rdpSiteName);
-        page.Controls.Add(L("Server IP / hostname", 304, 480, 220)); rdpTarget = T(304, 504, 270, ""); page.Controls.Add(rdpTarget);
-        B(page, "Save Site", 18, 536, 130, SaveRdpSite, "Save or update this site's RDP destination on this laptop. Passwords are never stored.", Green);
-        B(page, "Delete Site", 164, 536, 130, DeleteRdpSite, "Remove the selected saved RDP site after confirmation.", Slate);
+        B(page, "Open RDP", 388, 401, 118, delegate { OpenRdp(rdpTarget.Text); }, "Connect to the selected or entered server using Remote Desktop. Credentials are not saved.", Cobalt);
+        B(page, "New", 518, 401, 100, NewRdpSite, "Clear the RDP fields to enter a new site.", Slate);
+        page.Controls.Add(L("Site name", 18, 444, 120)); rdpSiteName = T(18, 468, 270, ""); page.Controls.Add(rdpSiteName);
+        page.Controls.Add(L("Server IP / hostname", 304, 444, 220)); rdpTarget = T(304, 468, 270, ""); page.Controls.Add(rdpTarget);
+        B(page, "Save Site", 18, 500, 130, SaveRdpSite, "Save or update this site's RDP destination on this laptop. Passwords are never stored.", Green);
+        B(page, "Delete Site", 164, 500, 130, DeleteRdpSite, "Remove the selected saved RDP site after confirmation.", Slate);
         RefreshRdpSites(null);
     }
 
@@ -1801,6 +1801,12 @@ internal sealed class ToolkitWindow : Form
                 throw new InvalidOperationException("NetBIOS hostname parsing failed.");
             if (typeof(ToolkitWindow).Assembly.GetReferencedAssemblies().Any(a => a.Name == "System.Management.Automation")) throw new InvalidOperationException("PowerShell runtime reference found.");
             Show(); Application.DoEvents();
+            foreach (string caption in new[] { "Save Site", "Delete Site" })
+            {
+                Control siteButton = windowsPage.Controls.Cast<Control>().First(control => control.Text == caption);
+                if (!windowsPage.ClientRectangle.Contains(siteButton.Bounds))
+                    throw new InvalidOperationException(caption + " is clipped at the startup window size.");
+            }
             RdpSiteProfile testRdp = new RdpSiteProfile { Name = "Self-test site", Host = "192.0.2.10" };
             rdpSites.Add(testRdp);
             RefreshRdpSites(testRdp);
