@@ -221,7 +221,6 @@ internal sealed class ToolkitWindow : Form
         ConfigureTray();
         ApplyTheme();
         Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (testing) return; RefreshAdapters(); RefreshProfiles(); RefreshScannerAdapters(); UpdateInternet(); internetTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
-        Resize += delegate { if (WindowState == FormWindowState.Minimized) Hide(); };
         FormClosing += OnClosing;
     }
 
@@ -723,7 +722,6 @@ internal sealed class ToolkitWindow : Form
         pingTarget = T(18, 42, 280, "8.8.8.8"); page.Controls.Add(pingTarget);
         B(page, "Ping Terminal", 314, 38, 132, delegate { PingTerminal(pingTarget.Text, continuousPing.Checked); }, "Open live replies in a terminal. Four pings by default or continuous when checked.", Cobalt);
         B(page, "DNS Lookup", 458, 38, 118, delegate { Lookup(pingTarget.Text); }, "Resolve the entered hostname using Windows DNS.", Cobalt);
-        B(page, "ARP Cache", 588, 38, 118, delegate { RunExternal("ARP", "arp.exe", "-a"); }, "Show local IP-to-MAC neighbor mappings.", Cobalt);
         continuousPing = new CheckBox { Text = "Continuous ping", Left = 18, Top = 78, Width = 160 }; page.Controls.Add(continuousPing);
         page.Controls.Add(L("Windows checks", 18, 106, 200));
         string[] labels = { "System Summary", "Disk Summary", "Service Check", "Event Errors", "Problem Devices", "Update Status" };
@@ -1655,6 +1653,11 @@ internal sealed class ToolkitWindow : Form
             if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner")
                 throw new InvalidOperationException("IP Scanner must be next to IP Shifter.");
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
+            TabPage windowsPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Windows Troubleshooting");
+            if (windowsPage.Controls.Cast<Control>().Any(c => c.Text == "ARP Cache") ||
+                !networkPage.Controls.Cast<Control>().OfType<GroupBox>().First(c => c.Text == "Quick Capture")
+                    .Controls.Cast<Control>().Any(c => c.Text == "ARP Cache"))
+                throw new InvalidOperationException("ARP Cache belongs only in Network Troubleshooting.");
             if (networkPage.Controls.Cast<Control>().Any(c => c.Text == "VLAN clues" || c.Text == "Inspect Selected Adapter")) throw new InvalidOperationException("VLAN clues controls remain.");
             GroupBox deviceAccess = networkPage.Controls.Cast<Control>().OfType<GroupBox>().First(c => c.Text == "Device Access");
             if (!deviceAccess.Controls.Cast<Control>().Any(c => c.Text == "Test Telnet") ||
@@ -1722,6 +1725,10 @@ internal sealed class ToolkitWindow : Form
             bmsProfiles.Remove(testProfile);
             RefreshBmsProfiles();
             if (!tray.Visible) throw new InvalidOperationException("Tray icon not visible.");
+            WindowState = FormWindowState.Minimized; Application.DoEvents();
+            if (!Visible || !ShowInTaskbar || WindowState != FormWindowState.Minimized)
+                throw new InvalidOperationException("Minimize removed the toolkit from the taskbar.");
+            WindowState = FormWindowState.Normal; Application.DoEvents();
             Close(); Application.DoEvents();
             if (!tray.Visible || Visible) throw new InvalidOperationException("Close did not keep the app in the tray.");
             RestoreFromTray(); Application.DoEvents();
