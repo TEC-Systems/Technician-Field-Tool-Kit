@@ -1,6 +1,8 @@
 # TEC Systems Field Toolkit 0.2.10
 
-Download `TEC-Systems-FieldToolkit-Install.zip`, extract it, and run `TEC-Systems-FieldToolkit-Setup.exe`. The Setup EXE is also available directly in this folder. `TEC-Systems-FieldToolkit.exe` is the native application binary, not the installer; if running it directly, keep `version.txt` and `assets/` beside it.
+**To install:** Download `TEC-Systems-FieldToolkit-Install.zip`, extract it, and run `TEC-Systems-FieldToolkit-Setup.exe`. You can also download the Setup EXE directly from this folder. Click **Install** in the Setup window; it creates Start menu and optional desktop shortcuts. The application may open automatically after installation.
+
+The `portable/` subfolder is for IT testing only. Its `TEC-Systems-FieldToolkit.exe` launches directly and does **not** install shortcuts or register the app in Windows.
 
 For an update, first use the notification-area arrow near the clock, right-click the TEC icon, and select **Exit Toolkit**. Closing the main window only hides it. Then run Setup. Saved profiles and logs stay in the Windows user data folder.
 

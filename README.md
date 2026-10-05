@@ -4,7 +4,7 @@ Windows field toolkit for TEC Systems technicians. The installed app is native C
 
 ## Install and run
 
-- Download `TEC-Systems-FieldToolkit-Install.zip` from the latest GitHub release or `releases/v0.2.10` in this repository. Extract it, then run the `TEC-Systems-FieldToolkit-Setup.exe` inside. Setup installs the actual native app per user, creates a Start menu shortcut, and can create a desktop shortcut. Technicians do not need PowerShell or a batch file to launch it.
+- Download `TEC-Systems-FieldToolkit-Install.zip` from the latest GitHub release or `releases/v0.2.10` in this repository. Extract it, run `TEC-Systems-FieldToolkit-Setup.exe`, and click **Install**. Setup installs the native app per user, creates a Start menu shortcut, and can create a desktop shortcut. The EXE in `releases/v0.2.10/portable` runs without installing and is for IT testing only. Technicians do not need PowerShell or a batch file to launch the installed toolkit.
 - Double-click the **TEC Systems Field Toolkit** icon. The toolkit runs inside its own EXE process and requests Windows administrator rights when an IP change needs them.
 - The original TEC emblem also appears in the Windows notification area, darkened for legibility. Minimize or click X to keep the toolkit running in the tray. Double-click the icon to reopen it, or right-click for Open Toolkit, Check Updates, and Exit Toolkit. Only **Exit Toolkit** quits the toolkit. Windows may initially place the icon in the hidden-icons menu.
 - The installer is currently unsigned, so Windows SmartScreen may show a warning. TEC Systems IT should sign the installer before broad deployment.
