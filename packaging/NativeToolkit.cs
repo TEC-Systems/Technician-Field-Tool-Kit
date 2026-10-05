@@ -91,6 +91,13 @@ internal sealed class BmsServerProfile
     public string User = "";
 }
 
+internal sealed class RdpSiteProfile
+{
+    public string Name = "";
+    public string Host = "";
+    public override string ToString() { return Name + "  |  " + Host; }
+}
+
 internal sealed class ToolkitAdapter
 {
     public string Name = "";
@@ -144,6 +151,7 @@ internal sealed class ToolkitWindow : Form
     private readonly JavaScriptSerializer json = new JavaScriptSerializer();
     private readonly List<ToolkitProfile> profiles = new List<ToolkitProfile>();
     private readonly List<BmsServerProfile> bmsProfiles = new List<BmsServerProfile>();
+    private readonly List<RdpSiteProfile> rdpSites = new List<RdpSiteProfile>();
     private readonly List<ToolkitAdapter> adapters = new List<ToolkitAdapter>();
     private readonly HashSet<ListView> themedLists = new HashSet<ListView>();
     private readonly HashSet<ComboBox> themedCombos = new HashSet<ComboBox>();
@@ -172,8 +180,9 @@ internal sealed class ToolkitWindow : Form
     private Button themeButton;
     private TextBox pingTarget;
     private CheckBox continuousPing;
-    private TextBox webTarget;
     private TextBox rdpTarget;
+    private TextBox rdpSiteName;
+    private ComboBox rdpSiteChoice;
     private TextBox networkTarget;
     private TextBox switchTarget;
     private ComboBox switchScheme;
@@ -265,6 +274,17 @@ internal sealed class ToolkitWindow : Form
                     bmsProfiles.Add(new BmsServerProfile { Name = name, Host = host, User = Value(row, "User") });
                 }
             }
+            if (settings.TryGetValue("RdpSites", out saved) && saved is IEnumerable)
+            {
+                foreach (object entry in (IEnumerable)saved)
+                {
+                    IDictionary<string, object> row = entry as IDictionary<string, object>;
+                    if (row == null) continue;
+                    string name = Value(row, "Name").Trim(), host = Value(row, "Host").Trim();
+                    if (name.Length == 0 || !ValidTarget(host) || rdpSites.Any(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
+                    rdpSites.Add(new RdpSiteProfile { Name = name, Host = host });
+                }
+            }
             if (bmsProfiles.Count == 0 && ValidTarget(Value(settings, "EbiHost")))
                 bmsProfiles.Add(new BmsServerProfile { Name = "Saved server", Host = Value(settings, "EbiHost"), User = Value(settings, "EbiUser") });
         }
@@ -281,6 +301,9 @@ internal sealed class ToolkitWindow : Form
         }).ToArray();
         settings["BmsServerProfiles"] = bmsProfiles.Select(p => new Dictionary<string, object> {
             { "Name", p.Name }, { "Host", p.Host }, { "User", p.User }
+        }).ToArray();
+        settings["RdpSites"] = rdpSites.Select(p => new Dictionary<string, object> {
+            { "Name", p.Name }, { "Host", p.Host }
         }).ToArray();
         settings.Remove("EbiHost");
         settings.Remove("EbiUser");
@@ -736,13 +759,73 @@ internal sealed class ToolkitWindow : Form
             { "System Props", "sysdm.cpl", "" }, { "Task Manager", "taskmgr.exe", "" }, { "Command Prompt", "cmd.exe", "" },
             { "Task Scheduler", "taskschd.msc", "" }, { "Firewall Console", "wf.msc", "" }, { "Credential Mgr", "control.exe", "/name Microsoft.CredentialManager" },
             { "Shared Folders", "fsmgmt.msc", "" }, { "Windows Update", "ms-settings:windowsupdate", "" }, { "Remote Desktop", "mstsc.exe", "" },
-            { "Printers", "control.exe", "printers" }
+            { "Printers", "control.exe", "printers" }, { "IPConfig /all", "cmd.exe", "/k ipconfig /all" }
         };
         for (int i = 0; i < specs.GetLength(0); i++) { string name = specs[i, 0], exe = specs[i, 1], arg = specs[i, 2]; B(tools, name, 0, 0, 126, delegate { OpenTool(name, exe, arg); }, "Open " + name + " for Windows troubleshooting.", Slate).Margin = new Padding(0, 0, 8, 8); }
-        page.Controls.Add(L("Web URL", 18, 416, 120)); webTarget = T(18, 442, 420, "http://"); page.Controls.Add(webTarget);
-        B(page, "Open Webpage", 456, 438, 150, delegate { OpenWeb(webTarget.Text); }, "Open a site or BMS web interface.", Cobalt);
-        page.Controls.Add(L("RDP Target", 18, 478, 120)); rdpTarget = T(18, 504, 420, ""); page.Controls.Add(rdpTarget);
-        B(page, "Open RDP", 456, 500, 150, delegate { OpenRdp(rdpTarget.Text); }, "Start Remote Desktop to the entered host.", Cobalt);
+        page.Controls.Add(L("Saved RDP sites", 18, 416, 200));
+        rdpSiteChoice = new ComboBox { Left = 18, Top = 441, Width = 354, DropDownStyle = ComboBoxStyle.DropDownList };
+        rdpSiteChoice.SelectedIndexChanged += delegate { LoadSelectedRdpSite(); };
+        page.Controls.Add(rdpSiteChoice);
+        B(page, "Open RDP", 388, 437, 118, delegate { OpenRdp(rdpTarget.Text); }, "Connect to the selected or entered server using Remote Desktop. Credentials are not saved.", Cobalt);
+        B(page, "New", 518, 437, 100, NewRdpSite, "Clear the RDP fields to enter a new site.", Slate);
+        page.Controls.Add(L("Site name", 18, 480, 120)); rdpSiteName = T(18, 504, 270, ""); page.Controls.Add(rdpSiteName);
+        page.Controls.Add(L("Server IP / hostname", 304, 480, 220)); rdpTarget = T(304, 504, 270, ""); page.Controls.Add(rdpTarget);
+        B(page, "Save Site", 18, 536, 130, SaveRdpSite, "Save or update this site's RDP destination on this laptop. Passwords are never stored.", Green);
+        B(page, "Delete Site", 164, 536, 130, DeleteRdpSite, "Remove the selected saved RDP site after confirmation.", Slate);
+        RefreshRdpSites(null);
+    }
+
+    private void RefreshRdpSites(RdpSiteProfile selected)
+    {
+        rdpSiteChoice.BeginUpdate();
+        rdpSiteChoice.Items.Clear();
+        foreach (RdpSiteProfile site in rdpSites.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)) rdpSiteChoice.Items.Add(site);
+        rdpSiteChoice.SelectedItem = selected;
+        rdpSiteChoice.EndUpdate();
+    }
+
+    private void LoadSelectedRdpSite()
+    {
+        RdpSiteProfile site = rdpSiteChoice.SelectedItem as RdpSiteProfile;
+        if (site == null) return;
+        rdpSiteName.Text = site.Name;
+        rdpTarget.Text = site.Host;
+    }
+
+    private void NewRdpSite()
+    {
+        rdpSiteChoice.SelectedIndex = -1;
+        rdpSiteName.Clear();
+        rdpTarget.Clear();
+        rdpSiteName.Focus();
+    }
+
+    private void SaveRdpSite()
+    {
+        string name = rdpSiteName.Text.Trim(), host = rdpTarget.Text.Trim();
+        if (name.Length == 0) throw new InvalidOperationException("Enter a site name.");
+        if (!ValidTarget(host)) throw new InvalidOperationException("Enter a valid server IP address or hostname.");
+        RdpSiteProfile selected = rdpSiteChoice.SelectedItem as RdpSiteProfile;
+        if (rdpSites.Any(p => !Object.ReferenceEquals(p, selected) && p.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException("An RDP site with that name already exists. Select it to edit, or use a different name.");
+        if (selected == null) { selected = new RdpSiteProfile(); rdpSites.Add(selected); }
+        selected.Name = name;
+        selected.Host = host;
+        SaveSettings();
+        RefreshRdpSites(selected);
+        Log("RDP", "OK", "Saved site: " + name + " (" + host + ")");
+    }
+
+    private void DeleteRdpSite()
+    {
+        RdpSiteProfile selected = rdpSiteChoice.SelectedItem as RdpSiteProfile;
+        if (selected == null) throw new InvalidOperationException("Select a saved RDP site to delete.");
+        if (MessageBox.Show(this, "Delete saved RDP site '" + selected.Name + "'?", "Delete RDP Site", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        rdpSites.Remove(selected);
+        SaveSettings();
+        NewRdpSite();
+        RefreshRdpSites(null);
+        Log("RDP", "OK", "Deleted site: " + selected.Name);
     }
 
     private void SystemSummary()
@@ -1654,6 +1737,18 @@ internal sealed class ToolkitWindow : Form
                 throw new InvalidOperationException("IP Scanner must be next to IP Shifter.");
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
             TabPage windowsPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Windows Troubleshooting");
+            if (windowsPage.Controls.Cast<Control>().Any(c => c.Text == "Open Webpage" || c.Text == "Web URL") ||
+                rdpSiteChoice == null || rdpSiteName == null || rdpTarget == null ||
+                !windowsPage.Controls.Cast<Control>().Any(c => c.Text == "Save Site"))
+                throw new InvalidOperationException("Windows RDP site controls are missing or the old webpage control remains.");
+            FlowLayoutPanel windowsTools = windowsPage.Controls.Cast<Control>().OfType<FlowLayoutPanel>().First();
+            if (!windowsTools.Controls.Cast<Control>().Any(c => c.Text == "IPConfig /all"))
+                throw new InvalidOperationException("Command Prompt IPConfig /all shortcut is missing.");
+            string rdpSample = json.Serialize(new[] { new Dictionary<string, object> { { "Name", "Test site" }, { "Host", "192.0.2.10" } } });
+            object[] rdpRoundTrip = json.Deserialize<object[]>(rdpSample);
+            IDictionary<string, object> rdpLoaded = rdpRoundTrip[0] as IDictionary<string, object>;
+            if (rdpLoaded == null || Value(rdpLoaded, "Name") != "Test site" || Value(rdpLoaded, "Host") != "192.0.2.10")
+                throw new InvalidOperationException("RDP site serialization failed.");
             if (windowsPage.Controls.Cast<Control>().Any(c => c.Text == "ARP Cache") ||
                 !networkPage.Controls.Cast<Control>().OfType<GroupBox>().First(c => c.Text == "Quick Capture")
                     .Controls.Cast<Control>().Any(c => c.Text == "ARP Cache"))
@@ -1702,6 +1797,16 @@ internal sealed class ToolkitWindow : Form
                 throw new InvalidOperationException("NetBIOS hostname parsing failed.");
             if (typeof(ToolkitWindow).Assembly.GetReferencedAssemblies().Any(a => a.Name == "System.Management.Automation")) throw new InvalidOperationException("PowerShell runtime reference found.");
             Show(); Application.DoEvents();
+            RdpSiteProfile testRdp = new RdpSiteProfile { Name = "Self-test site", Host = "192.0.2.10" };
+            rdpSites.Add(testRdp);
+            RefreshRdpSites(testRdp);
+            if (rdpSiteName.Text != testRdp.Name || rdpTarget.Text != testRdp.Host)
+                throw new InvalidOperationException("Selecting an RDP site did not load its server address.");
+            NewRdpSite();
+            if (rdpSiteChoice.SelectedIndex != -1 || rdpSiteName.Text.Length != 0 || rdpTarget.Text.Length != 0)
+                throw new InvalidOperationException("New RDP site did not clear the previous selection.");
+            rdpSites.Remove(testRdp);
+            RefreshRdpSites(null);
             tabs.SelectedTab = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "IP Shifter");
             split.SplitterDistance = 650;
             Application.DoEvents();

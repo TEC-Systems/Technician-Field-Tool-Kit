@@ -21,10 +21,11 @@ Publishing a release makes it available for download; it does not forcibly repla
 
 ## Saved data
 
-Technician settings, IP profiles, and logs are saved per Windows user under `%LOCALAPPDATA%\TEC Systems\Field Toolkit`. Older BMS flow/link and screenshot files remain there but are no longer shown by this app. They are not stored in this repository or shared automatically between laptops. Back up that folder before replacing a laptop or Windows profile.
+Technician settings, IP profiles, saved RDP sites, and logs are saved per Windows user under `%LOCALAPPDATA%\TEC Systems\Field Toolkit`. Older BMS flow/link and screenshot files remain there but are no longer shown by this app. They are not stored in this repository or shared automatically between laptops. Back up that folder before replacing a laptop or Windows profile.
 
 ## Field diagnostics
 
+- **Windows Troubleshooting** opens `IPConfig /all` in a Command Prompt that stays open. Its saved RDP sites list stores site names and server hostnames/IPs; choose a site and click **Open RDP**, or enter a server directly. Save, edit, or delete sites locally. No RDP passwords are stored. The old webpage field has been removed from this tab.
 - **IP Shifter** lists connected and disconnected adapters, shows their configured IPv4 addresses when Windows exposes them, and saves named adapter/IP/DNS profiles. Its full-width profile list adjusts column widths when the toolkit is resized. Applying a change requires Windows administrator rights and confirmation; the toolkit reads the adapter again afterward to verify the requested IP.
 - **IP Scanner** sits next to IP Shifter, selects a connected adapter, and fills its real IPv4 subnet. Large subnets default to a 254-address slice near the laptop. Technicians can enter any ascending range up to 1,024 addresses. It scans with ICMP and common TCP probes (22, 80, 443, 445, 3389), resolves hostnames through reverse DNS with a NetBIOS fallback, shows local ARP MACs and offline MAC-prefix owners when available, and exports CSV. A MAC-prefix owner may differ from the device brand. Devices that publish neither reverse DNS nor NetBIOS names will still have blank hostnames; silent hosts and filtered services may be absent.
 - **Support bundle** exports the current toolkit log with network snapshots, a system summary and service list, or both into a ZIP. Review the package before sharing because it can contain sensitive machine and network details.
