@@ -332,9 +332,9 @@ internal sealed class ToolkitWindow : Form
         tabs.BringToFront();
         BuildWindowsPage(Page("Windows Troubleshooting"));
         BuildIpPage(Page("IP Shifter"));
+        BuildScannerPage(Page("IP Scanner"));
         BuildNetworkPage(Page("Network Troubleshooting"));
         BuildBmsPage(Page("BMS Tools"));
-        BuildScannerPage(Page("IP Scanner"));
         BuildFeedbackPage(Page("Feedback"));
         BuildLogPanel();
         internetTimer = new System.Windows.Forms.Timer { Interval = 30000 };
@@ -1490,6 +1490,8 @@ internal sealed class ToolkitWindow : Form
         {
             testing = true;
             if (tabs.TabPages.Count != 6) throw new InvalidOperationException("Expected six active tabs.");
+            if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner")
+                throw new InvalidOperationException("IP Scanner must be next to IP Shifter.");
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
             if (networkPage.Controls.Cast<Control>().Any(c => c.Text == "VLAN clues" || c.Text == "Inspect Selected Adapter")) throw new InvalidOperationException("VLAN clues controls remain.");
             GroupBox deviceAccess = networkPage.Controls.Cast<Control>().OfType<GroupBox>().First(c => c.Text == "Device Access");
