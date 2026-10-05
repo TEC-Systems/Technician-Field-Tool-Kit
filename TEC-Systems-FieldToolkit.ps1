@@ -5,6 +5,7 @@
 
     Managed by TEC Systems IT.
 #>
+param([switch]$TestMode)
 
 # -------------------------------
 # Initialization
@@ -67,18 +68,31 @@ $script:ManagedBy = 'Managed by TEC Systems IT'
 $script:AppFolder = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'TEC Systems\Field Toolkit'
 $script:ConfigFile = Join-Path -Path $script:AppFolder -ChildPath 'config.json'
 $script:BmsFlowFile = Join-Path -Path $script:AppFolder -ChildPath 'bms-troubleshooting-flows-v2.json'
+$script:BmsCommandsFile = Join-Path -Path $script:AppFolder -ChildPath 'bms-commands-v1.json'
 $script:LinksFile = Join-Path -Path $script:AppFolder -ChildPath 'important-links-docs-v1.json'
 $script:ScreenshotFolder = Join-Path -Path $script:AppFolder -ChildPath 'Screenshots'
 $script:LogFile = Join-Path -Path $script:AppFolder -ChildPath ("TEC_FieldToolkit_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
 $script:LogoPath = Join-Path -Path $PSScriptRoot -ChildPath 'assets\TEC Systems Full Logo Cobalt RGB.png'
+$script:ToolkitVersion = '0.0.0'
+$versionPath = Join-Path -Path $PSScriptRoot -ChildPath 'version.txt'
+if (Test-Path -LiteralPath $versionPath) { $script:ToolkitVersion = (Get-Content -LiteralPath $versionPath -First 1).Trim() }
 $script:Config = $null
 $script:AdapterList = @()
 $script:BmsFlows = @()
+$script:BmsCommands = @()
 $script:ImportantLinks = @()
 $script:CurrentBmsCategory = $null
 $script:CurrentBmsStepId = $null
+$script:CurrentBmsCommandName = $null
 $script:IsAdminMode = $false
 $script:PreserveBmsRunResult = $false
+$script:BmsStepHistory = New-Object System.Collections.Generic.List[string]
+$script:AdminMaxFailedAttempts = 5
+$script:AdminLockoutMinutes = 10
+$script:ThemeColors = $null
+$script:trayIcon = $null
+$script:trayMenu = $null
+$script:ExitRequested = $false
 
 if (-not (Test-Path -Path $script:AppFolder)) {
     New-Item -Path $script:AppFolder -ItemType Directory -Force | Out-Null
@@ -105,8 +119,62 @@ function New-DefaultConfig {
         )
         Notes = ''
         AdminPasswordHash = ''
+        AdminPasswordHashProtected = ''
+        AdminFailedAttempts = 0
+        AdminLockoutUntilUtc = ''
         DarkMode = $false
+        OnlineTroubleshootingUrl = 'http://127.0.0.1:8787/troubleshoot'
         OpenAIModel = 'gpt-5'
+    }
+}
+
+function Protect-LocalSecret {
+    param(
+        [string]$PlainText,
+        [string]$Purpose = 'FieldToolkitSecret'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PlainText)) {
+        return ''
+    }
+
+    try {
+        $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($PlainText)
+        $entropy = [System.Text.Encoding]::UTF8.GetBytes(('TEC Systems Field Toolkit|{0}' -f $Purpose))
+        $protectedBytes = [System.Security.Cryptography.ProtectedData]::Protect(
+            $plainBytes,
+            $entropy,
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        return [Convert]::ToBase64String($protectedBytes)
+    }
+    catch {
+        return ''
+    }
+}
+
+function Unprotect-LocalSecret {
+    param(
+        [string]$ProtectedText,
+        [string]$Purpose = 'FieldToolkitSecret'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ProtectedText)) {
+        return ''
+    }
+
+    try {
+        $protectedBytes = [Convert]::FromBase64String($ProtectedText)
+        $entropy = [System.Text.Encoding]::UTF8.GetBytes(('TEC Systems Field Toolkit|{0}' -f $Purpose))
+        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            $protectedBytes,
+            $entropy,
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        return [System.Text.Encoding]::UTF8.GetString($plainBytes)
+    }
+    catch {
+        return ''
     }
 }
 
@@ -142,14 +210,49 @@ function Load-Config {
     if (-not $script:Config.PSObject.Properties['AdminPasswordHash']) {
         $script:Config | Add-Member -NotePropertyName AdminPasswordHash -NotePropertyValue ''
     }
+    if (-not $script:Config.PSObject.Properties['AdminPasswordHashProtected']) {
+        $script:Config | Add-Member -NotePropertyName AdminPasswordHashProtected -NotePropertyValue ''
+    }
+    if (-not $script:Config.PSObject.Properties['AdminFailedAttempts']) {
+        $script:Config | Add-Member -NotePropertyName AdminFailedAttempts -NotePropertyValue 0
+    }
+    if (-not $script:Config.PSObject.Properties['AdminLockoutUntilUtc']) {
+        $script:Config | Add-Member -NotePropertyName AdminLockoutUntilUtc -NotePropertyValue ''
+    }
     if (-not $script:Config.PSObject.Properties['DarkMode']) {
         $script:Config | Add-Member -NotePropertyName DarkMode -NotePropertyValue $false
+    }
+    if (-not $script:Config.PSObject.Properties['OnlineTroubleshootingUrl']) {
+        $script:Config | Add-Member -NotePropertyName OnlineTroubleshootingUrl -NotePropertyValue 'http://127.0.0.1:8787/troubleshoot'
     }
     if (-not $script:Config.PSObject.Properties['OpenAIModel']) {
         $script:Config | Add-Member -NotePropertyName OpenAIModel -NotePropertyValue 'gpt-5'
     }
+
+    $needsConfigSave = $false
+    $legacyAdminHash = [string]$script:Config.AdminPasswordHash
+    $protectedAdminHash = [string]$script:Config.AdminPasswordHashProtected
+
+    if (-not [string]::IsNullOrWhiteSpace($legacyAdminHash) -and [string]::IsNullOrWhiteSpace($protectedAdminHash)) {
+        $migratedHash = Protect-LocalSecret -PlainText $legacyAdminHash -Purpose 'AdminPasswordHash'
+        if (-not [string]::IsNullOrWhiteSpace($migratedHash)) {
+            $script:Config.AdminPasswordHashProtected = $migratedHash
+            $script:Config.AdminPasswordHash = ''
+            $needsConfigSave = $true
+        }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($legacyAdminHash)) {
+        $script:Config.AdminPasswordHash = ''
+        $needsConfigSave = $true
+    }
+
     if ($script:Config.PSObject.Properties['OpenAIApiKeyProtected']) {
         [void]$script:Config.PSObject.Properties.Remove('OpenAIApiKeyProtected')
+        $needsConfigSave = $true
+    }
+
+    if ($needsConfigSave) {
+        Save-Config
     }
 }
 
@@ -162,6 +265,33 @@ function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Restart-ToolkitElevated {
+    $scriptPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        throw 'Could not determine the toolkit script path for elevation.'
+    }
+
+    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ('-NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $scriptPath) | Out-Null
+}
+
+function Ensure-ToolkitAdministrator {
+    param([string]$Feature = 'run this action')
+
+    if (Test-IsAdministrator) {
+        return $true
+    }
+
+    if (Confirm-Action -Title 'Administrator Required' -Message ("{0} requires administrator rights. Relaunch the toolkit as administrator now?" -f $Feature)) {
+        Restart-ToolkitElevated
+        Add-Log -Area 'Admin' -Level 'INFO' -Message ('Relaunch requested for: {0}' -f $Feature)
+    }
+    else {
+        Add-Log -Area 'Admin' -Level 'WARN' -Message ('Skipped elevation for: {0}' -f $Feature)
+    }
+
+    return $false
 }
 
 function Add-Log {
@@ -200,6 +330,16 @@ function Set-MainStatus {
     }
 }
 
+function Schedule-StatusReset {
+    param([int]$Milliseconds = 3500)
+
+    if ((Get-Variable -Name statusResetTimer -Scope Script -ErrorAction SilentlyContinue) -and $script:statusResetTimer) {
+        $script:statusResetTimer.Stop()
+        $script:statusResetTimer.Interval = [Math]::Max(1000, $Milliseconds)
+        $script:statusResetTimer.Start()
+    }
+}
+
 function Invoke-UiAction {
     param(
         [string]$Name,
@@ -216,11 +356,15 @@ function Invoke-UiAction {
         Add-Log -Area $Name -Level 'INFO' -Message 'Started.'
         & $Action
         Add-Log -Area $Name -Level 'OK' -Message 'Completed.'
+        if ((Get-Variable -Name statusResetTimer -Scope Script -ErrorAction SilentlyContinue) -and $script:statusResetTimer) {
+            $script:statusResetTimer.Stop()
+        }
         Set-MainStatus -Text 'Ready' -Color ([System.Drawing.Color]::FromArgb(45, 130, 80))
     }
     catch {
         Add-Log -Area $Name -Level 'ERROR' -Message $_.Exception.Message
         Set-MainStatus -Text 'Error: check log' -Color ([System.Drawing.Color]::FromArgb(190, 55, 55))
+        Schedule-StatusReset -Milliseconds 5000
     }
     finally {
         if ((Get-Variable -Name progress -Scope Script -ErrorAction SilentlyContinue) -and $script:progress) {
@@ -334,6 +478,366 @@ function Show-PasswordDialog {
     return $payload
 }
 
+function Test-AdminPasswordPolicy {
+    param([string]$Password)
+
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        return 'Password cannot be blank.'
+    }
+    if ($Password.Length -lt 8) {
+        return 'Use at least 8 characters for the admin password.'
+    }
+
+    return $null
+}
+
+function Get-AdminPasswordRecord {
+    $protectedHash = if ($script:Config.PSObject.Properties['AdminPasswordHashProtected']) {
+        [string]$script:Config.AdminPasswordHashProtected
+    }
+    else {
+        ''
+    }
+    $legacyHash = if ($script:Config.PSObject.Properties['AdminPasswordHash']) {
+        [string]$script:Config.AdminPasswordHash
+    }
+    else {
+        ''
+    }
+
+    $hasStoredValue = (-not [string]::IsNullOrWhiteSpace($protectedHash)) -or (-not [string]::IsNullOrWhiteSpace($legacyHash))
+    $hash = ''
+    $isReadable = $true
+    $storage = 'NotConfigured'
+
+    if (-not [string]::IsNullOrWhiteSpace($protectedHash)) {
+        $storage = 'Protected'
+        $hash = Unprotect-LocalSecret -ProtectedText $protectedHash -Purpose 'AdminPasswordHash'
+        if ([string]::IsNullOrWhiteSpace($hash)) {
+            $isReadable = $false
+        }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($legacyHash)) {
+        $storage = 'Legacy'
+        $hash = $legacyHash
+    }
+
+    return [pscustomobject]@{
+        Hash = $hash
+        HasStoredValue = $hasStoredValue
+        IsReadable = $isReadable
+        Storage = $storage
+    }
+}
+
+function Set-StoredAdminPassword {
+    param([string]$Password)
+
+    $policyMessage = Test-AdminPasswordPolicy -Password $Password
+    if ($policyMessage) {
+        throw $policyMessage
+    }
+
+    $hash = Get-PasswordHash -Password $Password
+    $protectedHash = Protect-LocalSecret -PlainText $hash -Purpose 'AdminPasswordHash'
+    if ([string]::IsNullOrWhiteSpace($protectedHash)) {
+        throw 'Windows could not protect the admin password on this profile.'
+    }
+
+    $script:Config.AdminPasswordHashProtected = $protectedHash
+    $script:Config.AdminPasswordHash = ''
+    $script:Config.AdminFailedAttempts = 0
+    $script:Config.AdminLockoutUntilUtc = ''
+    Save-Config
+}
+
+function Get-AdminLockoutStatus {
+    $lockoutValue = if ($script:Config.PSObject.Properties['AdminLockoutUntilUtc']) {
+        [string]$script:Config.AdminLockoutUntilUtc
+    }
+    else {
+        ''
+    }
+
+    if ([string]::IsNullOrWhiteSpace($lockoutValue)) {
+        return [pscustomobject]@{
+            IsLocked = $false
+            Remaining = [TimeSpan]::Zero
+            UntilUtc = $null
+        }
+    }
+
+    try {
+        $untilUtc = [datetime]::Parse($lockoutValue, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+    }
+    catch {
+        $script:Config.AdminLockoutUntilUtc = ''
+        Save-Config
+        return [pscustomobject]@{
+            IsLocked = $false
+            Remaining = [TimeSpan]::Zero
+            UntilUtc = $null
+        }
+    }
+
+    $remaining = $untilUtc - (Get-Date).ToUniversalTime()
+    if ($remaining.TotalSeconds -le 0) {
+        $script:Config.AdminLockoutUntilUtc = ''
+        Save-Config
+        return [pscustomobject]@{
+            IsLocked = $false
+            Remaining = [TimeSpan]::Zero
+            UntilUtc = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        IsLocked = $true
+        Remaining = $remaining
+        UntilUtc = $untilUtc
+    }
+}
+
+function Format-AdminLockoutRemaining {
+    param([TimeSpan]$Remaining)
+
+    if ($Remaining.TotalHours -ge 1) {
+        return '{0:D2}:{1:D2}:{2:D2}' -f [math]::Floor($Remaining.TotalHours), $Remaining.Minutes, $Remaining.Seconds
+    }
+
+    return '{0:D2}:{1:D2}' -f [math]::Max(0, [math]::Floor($Remaining.TotalMinutes)), $Remaining.Seconds
+}
+
+function Clear-AdminSecurityBackoff {
+    $changed = $false
+
+    if ([int]$script:Config.AdminFailedAttempts -ne 0) {
+        $script:Config.AdminFailedAttempts = 0
+        $changed = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:Config.AdminLockoutUntilUtc)) {
+        $script:Config.AdminLockoutUntilUtc = ''
+        $changed = $true
+    }
+
+    if ($changed) {
+        Save-Config
+    }
+}
+
+function Register-FailedAdminAttempt {
+    $failedAttempts = 0
+    if ($script:Config.PSObject.Properties['AdminFailedAttempts']) {
+        $failedAttempts = [int]$script:Config.AdminFailedAttempts
+    }
+
+    $failedAttempts++
+    $script:Config.AdminFailedAttempts = $failedAttempts
+    $remainingBeforeLockout = [math]::Max(0, $script:AdminMaxFailedAttempts - $failedAttempts)
+    $lockoutApplied = $false
+    $lockoutStatus = $null
+
+    if ($failedAttempts -ge $script:AdminMaxFailedAttempts) {
+        $script:Config.AdminFailedAttempts = 0
+        $script:Config.AdminLockoutUntilUtc = (Get-Date).ToUniversalTime().AddMinutes($script:AdminLockoutMinutes).ToString('o')
+        $lockoutApplied = $true
+        $lockoutStatus = Get-AdminLockoutStatus
+    }
+
+    Save-Config
+
+    return [pscustomobject]@{
+        FailedAttempts = $failedAttempts
+        RemainingBeforeLockout = $remainingBeforeLockout
+        LockoutApplied = $lockoutApplied
+        LockoutStatus = $lockoutStatus
+    }
+}
+
+function Get-AdminFailureDelayMilliseconds {
+    $failedAttempts = 0
+    if ($script:Config.PSObject.Properties['AdminFailedAttempts']) {
+        $failedAttempts = [int]$script:Config.AdminFailedAttempts
+    }
+
+    return [Math]::Min(4000, (800 + ($failedAttempts * 600)))
+}
+
+function Get-AdminEditorStatusText {
+    if ($script:IsAdminMode) {
+        return 'Editor: Unlocked'
+    }
+
+    $lockoutStatus = Get-AdminLockoutStatus
+    if ($lockoutStatus.IsLocked) {
+        return 'Editor: Cooldown'
+    }
+
+    return 'Editor: Locked'
+}
+
+function Get-AdminButtonText {
+    if ($script:IsAdminMode) {
+        return 'Lock Editor'
+    }
+
+    $lockoutStatus = Get-AdminLockoutStatus
+    if ($lockoutStatus.IsLocked) {
+        return ('Locked {0}' -f (Format-AdminLockoutRemaining -Remaining $lockoutStatus.Remaining))
+    }
+
+    return 'Unlock Editor'
+}
+
+function Update-HeaderToolbarLayout {
+    $searchX = 658
+    if ($script:lblHeaderSearch) { $script:lblHeaderSearch.Location = New-Object System.Drawing.Point($searchX, 54) }
+    if ($script:txtHeaderSearch) { $script:txtHeaderSearch.Location = New-Object System.Drawing.Point($searchX, 74) }
+    if ($script:btnHeaderSearch) { $script:btnHeaderSearch.Location = New-Object System.Drawing.Point(($searchX + 134), 70) }
+    if ($script:btnThemeToggle) { $script:btnThemeToggle.Location = New-Object System.Drawing.Point(($searchX + 204), 70) }
+    return
+    $hasPasswordButton = (
+        (Get-Variable -Name btnChangeAdminPassword -Scope Script -ErrorAction SilentlyContinue) -and
+        $script:btnChangeAdminPassword -and
+        $script:btnChangeAdminPassword.Visible
+    )
+
+    if ((Get-Variable -Name lblAdminEditor -Scope Script -ErrorAction SilentlyContinue) -and $script:lblAdminEditor) {
+        $script:lblAdminEditor.Location = New-Object System.Drawing.Point(342, 78)
+        $script:lblAdminEditor.Size = New-Object System.Drawing.Size(104, 22)
+    }
+
+    if ((Get-Variable -Name btnAdminMode -Scope Script -ErrorAction SilentlyContinue) -and $script:btnAdminMode) {
+        $script:btnAdminMode.Location = New-Object System.Drawing.Point(452, 70)
+        $script:btnAdminMode.Size = New-Object System.Drawing.Size(120, 30)
+    }
+
+    if ($hasPasswordButton) {
+        $passwordX = 582
+        $searchX = 748
+    }
+    else {
+        $passwordX = 582
+        $searchX = 658
+    }
+
+    if ((Get-Variable -Name btnChangeAdminPassword -Scope Script -ErrorAction SilentlyContinue) -and $script:btnChangeAdminPassword) {
+        $script:btnChangeAdminPassword.Location = New-Object System.Drawing.Point($passwordX, 70)
+        $script:btnChangeAdminPassword.Size = New-Object System.Drawing.Size(136, 30)
+    }
+
+    if ((Get-Variable -Name lblHeaderSearch -Scope Script -ErrorAction SilentlyContinue) -and $script:lblHeaderSearch) {
+        $script:lblHeaderSearch.Location = New-Object System.Drawing.Point($searchX, 54)
+        $script:lblHeaderSearch.Size = New-Object System.Drawing.Size(110, 18)
+    }
+
+    if ((Get-Variable -Name txtHeaderSearch -Scope Script -ErrorAction SilentlyContinue) -and $script:txtHeaderSearch) {
+        $script:txtHeaderSearch.Location = New-Object System.Drawing.Point($searchX, 74)
+        $script:txtHeaderSearch.Size = New-Object System.Drawing.Size(126, 24)
+    }
+
+    if ((Get-Variable -Name btnHeaderSearch -Scope Script -ErrorAction SilentlyContinue) -and $script:btnHeaderSearch) {
+        $script:btnHeaderSearch.Location = New-Object System.Drawing.Point(($searchX + 134), 70)
+        $script:btnHeaderSearch.Size = New-Object System.Drawing.Size(62, 30)
+    }
+
+    if ((Get-Variable -Name btnThemeToggle -Scope Script -ErrorAction SilentlyContinue) -and $script:btnThemeToggle) {
+        $script:btnThemeToggle.Location = New-Object System.Drawing.Point(($searchX + 204), 70)
+        $script:btnThemeToggle.Size = New-Object System.Drawing.Size(86, 30)
+    }
+}
+
+function Change-AdminPassword {
+    if (-not (Assert-AdminMode -Feature 'change the admin password')) {
+        return
+    }
+
+    $record = Get-AdminPasswordRecord
+    if (-not $record.HasStoredValue) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Set an admin password first by unlocking the editor once.',
+            'Admin Password',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+
+    if (-not $record.IsReadable) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'The stored admin password could not be read on this Windows profile. Create a fresh password from this device profile instead.',
+            'Admin Password',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+        Add-Log -Area 'Admin Mode' -Level 'ERROR' -Message 'Stored admin password could not be read for password change.'
+        return
+    }
+
+    $currentPassword = Show-PasswordDialog -Title 'Verify Current Password' -Prompt 'Enter the current admin password.'
+    if (-not $currentPassword) {
+        return
+    }
+
+    if ((Get-PasswordHash -Password $currentPassword.Password) -ne $record.Hash) {
+        Start-Sleep -Milliseconds 1200
+        [System.Windows.Forms.MessageBox]::Show(
+            'The current admin password is not correct.',
+            'Admin Password',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+        Add-Log -Area 'Admin Mode' -Level 'WARN' -Message 'Password change blocked because the current password was incorrect.'
+        return
+    }
+
+    $newPassword = Show-PasswordDialog -Title 'Change Admin Password' -Prompt 'Enter the new admin password.' -ConfirmPassword
+    if (-not $newPassword) {
+        return
+    }
+
+    if ($newPassword.Password -ne $newPassword.ConfirmPassword) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'The new passwords did not match.',
+            'Admin Password',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        return
+    }
+
+    if ($newPassword.Password -eq $currentPassword.Password) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Pick a different password than the current one.',
+            'Admin Password',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+
+    try {
+        Set-StoredAdminPassword -Password $newPassword.Password
+        Update-AdminModeUi
+        Add-Log -Area 'Admin Mode' -Level 'OK' -Message 'Admin password changed.'
+        [System.Windows.Forms.MessageBox]::Show(
+            'Admin password updated for this Windows profile.',
+            'Admin Password',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            $_.Exception.Message,
+            'Admin Password',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+        Add-Log -Area 'Admin Mode' -Level 'ERROR' -Message ('Could not change admin password: {0}' -f $_.Exception.Message)
+    }
+}
+
 function Set-EditorTextBoxState {
     param(
         $Control,
@@ -357,16 +861,19 @@ function Update-AdminModeUi {
     $isEnabled = $script:IsAdminMode
     $editorTextBoxNames = @(
         'txtBmsCategory', 'txtBmsStepName', 'txtBmsPrompt', 'txtBmsButtonText', 'txtBmsButtonNotes',
-        'txtLinkCategory', 'txtLinkTitle', 'txtLinkTarget', 'txtLinkNotes'
+        'txtLinkCategory', 'txtLinkTitle', 'txtLinkTarget', 'txtLinkNotes',
+        'txtBmsCommandName', 'txtBmsCommandCategory', 'txtBmsCommandDescription', 'txtBmsCommandText'
     )
     $editorControlNames = @(
-        'lstBmsButtons', 'lstBmsSteps', 'cboBmsNextStep'
+        'lstBmsButtons', 'lstBmsSteps', 'cboBmsNextStep',
+        'cboBmsCommandType', 'chkBmsCommandRequiresAdmin', 'chkBmsCommandConfirm', 'chkBmsCommandKeepWindowOpen'
     )
     $editorButtonNames = @(
         'btnNewBmsTopic', 'btnDeleteBmsTopic', 'btnSaveBmsTopic',
         'btnNewBmsStep', 'btnDeleteBmsStep', 'btnSaveBmsStep', 'btnSetBmsStartStep',
         'btnNewBmsButton', 'btnSaveBmsButton', 'btnDeleteBmsButton',
-        'btnNewLink', 'btnSaveLink', 'btnDeleteLink'
+        'btnNewLink', 'btnSaveLink', 'btnDeleteLink',
+        'btnNewBmsCommand', 'btnSaveBmsCommand', 'btnDeleteBmsCommand'
     )
 
     foreach ($name in $editorTextBoxNames) {
@@ -382,13 +889,31 @@ function Update-AdminModeUi {
     }
 
     if ((Get-Variable -Name lblAdminEditor -Scope Script -ErrorAction SilentlyContinue) -and $script:lblAdminEditor) {
-        $script:lblAdminEditor.Text = if ($script:IsAdminMode) { 'Editor: Unlocked' } else { 'Editor: Locked' }
-        $script:lblAdminEditor.ForeColor = if ($script:IsAdminMode) { [System.Drawing.Color]::FromArgb(45, 130, 80) } else { [System.Drawing.Color]::FromArgb(190, 120, 45) }
+        $script:lblAdminEditor.Text = Get-AdminEditorStatusText
+        $script:lblAdminEditor.ForeColor = if ($script:IsAdminMode) {
+            [System.Drawing.Color]::FromArgb(45, 130, 80)
+        }
+        elseif ((Get-AdminLockoutStatus).IsLocked) {
+            [System.Drawing.Color]::FromArgb(185, 70, 60)
+        }
+        else {
+            [System.Drawing.Color]::FromArgb(190, 120, 45)
+        }
     }
 
     if ((Get-Variable -Name btnAdminMode -Scope Script -ErrorAction SilentlyContinue) -and $script:btnAdminMode) {
-        $script:btnAdminMode.Text = if ($script:IsAdminMode) { 'Lock Editor' } else { 'Unlock Editor' }
+        $script:btnAdminMode.Text = Get-AdminButtonText
     }
+
+    if ((Get-Variable -Name btnChangeAdminPassword -Scope Script -ErrorAction SilentlyContinue) -and $script:btnChangeAdminPassword) {
+        $script:btnChangeAdminPassword.Enabled = $script:IsAdminMode
+        $script:btnChangeAdminPassword.Visible = $script:IsAdminMode
+    }
+
+    Update-HeaderToolbarLayout
+    $script:lblAdminEditor.Visible = $false
+    $script:btnAdminMode.Visible = $false
+    $script:btnChangeAdminPassword.Visible = $false
 
     if ((Get-Variable -Name tvBmsFlowOutline -Scope Script -ErrorAction SilentlyContinue) -and $script:tvBmsFlowOutline) {
         $script:tvBmsFlowOutline.Visible = $script:IsAdminMode
@@ -421,6 +946,22 @@ function Update-AdminModeUi {
         }
     }
 
+    if ((Get-Variable -Name tabsBmsCommandModes -Scope Script -ErrorAction SilentlyContinue) -and
+        (Get-Variable -Name tabBmsCommandEditor -Scope Script -ErrorAction SilentlyContinue) -and
+        (Get-Variable -Name tabBmsCommandRun -Scope Script -ErrorAction SilentlyContinue) -and
+        $script:tabsBmsCommandModes -and $script:tabBmsCommandEditor -and $script:tabBmsCommandRun) {
+        $editorPresent = $script:tabsBmsCommandModes.TabPages.Contains($script:tabBmsCommandEditor)
+        if ($script:IsAdminMode -and -not $editorPresent) {
+            [void]$script:tabsBmsCommandModes.TabPages.Add($script:tabBmsCommandEditor)
+        }
+        elseif (-not $script:IsAdminMode -and $editorPresent) {
+            if ($script:tabsBmsCommandModes.SelectedTab -eq $script:tabBmsCommandEditor) {
+                $script:tabsBmsCommandModes.SelectedTab = $script:tabBmsCommandRun
+            }
+            $script:tabsBmsCommandModes.TabPages.Remove($script:tabBmsCommandEditor)
+        }
+    }
+
     Update-AiSettingsUi
 }
 
@@ -448,18 +989,35 @@ function Toggle-AdminMode {
         return
     }
 
-    if ([string]::IsNullOrWhiteSpace($script:Config.AdminPasswordHash)) {
-        $passwordSetup = Show-PasswordDialog -Title 'Set Admin Password' -Prompt 'Create a password for BMS/Docs editing.' -ConfirmPassword
+    $lockoutStatus = Get-AdminLockoutStatus
+    if ($lockoutStatus.IsLocked) {
+        $remainingText = Format-AdminLockoutRemaining -Remaining $lockoutStatus.Remaining
+        [System.Windows.Forms.MessageBox]::Show(
+            ("Too many incorrect password attempts. Wait {0} before trying again." -f $remainingText),
+            'Admin Mode',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        Update-AdminModeUi
+        Add-Log -Area 'Admin Mode' -Level 'WARN' -Message ('Unlock attempt blocked during cooldown ({0} remaining).' -f $remainingText)
+        return
+    }
+
+    $passwordRecord = Get-AdminPasswordRecord
+    if ($passwordRecord.HasStoredValue -and -not $passwordRecord.IsReadable) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'The stored admin password cannot be read on this Windows profile. Reset the toolkit password from the original profile or recreate the local config on this laptop.',
+            'Admin Mode',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+        Add-Log -Area 'Admin Mode' -Level 'ERROR' -Message 'Stored admin password could not be read on this Windows profile.'
+        return
+    }
+
+    if (-not $passwordRecord.HasStoredValue) {
+        $passwordSetup = Show-PasswordDialog -Title 'Set Admin Password' -Prompt 'Create a password for BMS, links, and commands editing.' -ConfirmPassword
         if (-not $passwordSetup) {
-            return
-        }
-        if ([string]::IsNullOrWhiteSpace($passwordSetup.Password)) {
-            [System.Windows.Forms.MessageBox]::Show(
-                'Password cannot be blank.',
-                'Admin Mode',
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning
-            ) | Out-Null
             return
         }
         if ($passwordSetup.Password -ne $passwordSetup.ConfirmPassword) {
@@ -472,11 +1030,21 @@ function Toggle-AdminMode {
             return
         }
 
-        $script:Config.AdminPasswordHash = Get-PasswordHash -Password $passwordSetup.Password
-        Save-Config
-        $script:IsAdminMode = $true
-        Update-AdminModeUi
-        Add-Log -Area 'Admin Mode' -Level 'OK' -Message 'Admin password created and editor unlocked.'
+        try {
+            Set-StoredAdminPassword -Password $passwordSetup.Password
+            $script:IsAdminMode = $true
+            Update-AdminModeUi
+            Add-Log -Area 'Admin Mode' -Level 'OK' -Message 'Admin password created and editor unlocked.'
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                $_.Exception.Message,
+                'Admin Mode',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+            Add-Log -Area 'Admin Mode' -Level 'ERROR' -Message ('Could not create admin password: {0}' -f $_.Exception.Message)
+        }
         return
     }
 
@@ -485,19 +1053,34 @@ function Toggle-AdminMode {
         return
     }
 
-    if ((Get-PasswordHash -Password $passwordEntry.Password) -eq $script:Config.AdminPasswordHash) {
+    if ((Get-PasswordHash -Password $passwordEntry.Password) -eq $passwordRecord.Hash) {
+        Clear-AdminSecurityBackoff
         $script:IsAdminMode = $true
         Update-AdminModeUi
         Add-Log -Area 'Admin Mode' -Level 'OK' -Message 'Editor unlocked.'
     }
     else {
+        $attemptState = Register-FailedAdminAttempt
+        Start-Sleep -Milliseconds (Get-AdminFailureDelayMilliseconds)
+        $message = if ($attemptState.LockoutApplied -and $attemptState.LockoutStatus) {
+            'Too many incorrect attempts. Editor unlock is on cooldown for 10 minutes.'
+        }
+        else {
+            'The admin password is not correct.'
+        }
         [System.Windows.Forms.MessageBox]::Show(
-            'The admin password is not correct.',
+            $message,
             'Admin Mode',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error
         ) | Out-Null
-        Add-Log -Area 'Admin Mode' -Level 'WARN' -Message 'Incorrect admin password.'
+        Update-AdminModeUi
+        if ($attemptState.LockoutApplied -and $attemptState.LockoutStatus) {
+            Add-Log -Area 'Admin Mode' -Level 'WARN' -Message ('Too many incorrect admin passwords. Cooldown started for {0} minutes.' -f $script:AdminLockoutMinutes)
+        }
+        else {
+            Add-Log -Area 'Admin Mode' -Level 'WARN' -Message ('Incorrect admin password. {0} attempt(s) remaining before cooldown.' -f $attemptState.RemainingBeforeLockout)
+        }
     }
 }
 
@@ -539,10 +1122,12 @@ function Update-InternetStatus {
     if (Test-InternetConnection) {
         $script:lblInternet.Text = 'Internet: Online | {0}' -f (Get-NetworkTrafficText)
         $script:lblInternet.ForeColor = [System.Drawing.Color]::FromArgb(45, 130, 80)
+        if ($script:trayIcon) { $script:trayIcon.Text = 'TEC Systems Field Toolkit - Internet: Online' }
     }
     else {
         $script:lblInternet.Text = 'Internet: Offline'
         $script:lblInternet.ForeColor = [System.Drawing.Color]::FromArgb(190, 55, 55)
+        if ($script:trayIcon) { $script:trayIcon.Text = 'TEC Systems Field Toolkit - Internet: Offline' }
     }
 }
 
@@ -578,30 +1163,6 @@ function Get-NetworkTrafficText {
     catch {
         return 'Down n/a / Up n/a'
     }
-}
-
-function Get-NinjaOneInfo {
-    $paths = @(
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    )
-
-    foreach ($path in $paths) {
-        try {
-            $app = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName -match 'Ninja|NinjaOne|NinjaRMM' } |
-                Select-Object -First 1
-
-            if ($app) {
-                return ('NinjaOne: {0} {1}' -f $app.DisplayName, $app.DisplayVersion).Trim()
-            }
-        }
-        catch {
-        }
-    }
-
-    return 'NinjaOne: Not found'
 }
 
 function Convert-MaskToPrefixLength {
@@ -713,7 +1274,7 @@ function Get-NetshAdapterConfig {
 # -------------------------------
 # IP Shifter
 # -------------------------------
-function Refresh-Adapters {
+function Get-ToolkitAdapterInventory {
     $statusMap = @{
         0 = 'Disconnected'
         1 = 'Connecting'
@@ -730,66 +1291,146 @@ function Refresh-Adapters {
         12 = 'Credentials required'
     }
 
-    $script:AdapterList = @(Get-WmiObject -Class Win32_NetworkAdapter |
-        Where-Object { $_.NetConnectionID -and $_.PhysicalAdapter } |
-        Sort-Object -Property NetConnectionID |
-        ForEach-Object {
+    $inventory = @()
+
+    try {
+        $wmiAdapters = @(Get-WmiObject -Class Win32_NetworkAdapter -ErrorAction Stop |
+            Where-Object { $_.NetConnectionID })
+
+        foreach ($adapter in $wmiAdapters) {
             $statusText = 'Unknown'
-            if ($null -ne $_.NetConnectionStatus -and $statusMap.ContainsKey([int]$_.NetConnectionStatus)) {
-                $statusText = $statusMap[[int]$_.NetConnectionStatus]
+            if ($null -ne $adapter.NetConnectionStatus -and $statusMap.ContainsKey([int]$adapter.NetConnectionStatus)) {
+                $statusText = $statusMap[[int]$adapter.NetConnectionStatus]
             }
 
-            $deviceId = $_.DeviceID
-            $interfaceIndex = $_.InterfaceIndex
-            $config = Get-WmiObject -Class Win32_NetworkAdapterConfiguration |
-                Where-Object { $_.Index -eq [int]$deviceId -or $_.InterfaceIndex -eq $interfaceIndex } |
-                Select-Object -First 1
-
-            $ipText = 'No IP'
-            $maskText = ''
-            $gatewayText = ''
-            $dnsText = ''
-            if ($config -and $config.IPAddress) {
-                $ipv4 = @($config.IPAddress | Where-Object { $_ -match '^\d+\.' })
-                if ($ipv4.Count -gt 0) {
-                    $ipText = $ipv4 -join ', '
-                }
-                $maskText = (@($config.IPSubnet) -join ', ')
-                $gatewayText = (@($config.DefaultIPGateway) -join ', ')
-                $dnsText = (@($config.DNSServerSearchOrder) -join ', ')
+            $inventory += [pscustomobject]@{
+                Name = [string]$adapter.NetConnectionID
+                Description = [string]$adapter.Description
+                DeviceId = [int]$adapter.DeviceID
+                InterfaceIndex = [int]$adapter.InterfaceIndex
+                Guid = [string]$adapter.GUID
+                StatusText = $statusText
             }
+        }
+    }
+    catch {
+    }
 
-            if ($ipText -eq 'No IP' -or [string]::IsNullOrWhiteSpace($maskText)) {
-                $netshConfig = Get-NetshAdapterConfig -AdapterName $_.NetConnectionID
-                if ($netshConfig.IPAddress) {
-                    $ipText = $netshConfig.IPAddress
+    if (@($inventory).Count -gt 0) {
+        return @($inventory | Sort-Object -Property Name)
+    }
+
+    if (Get-Command -Name Get-NetAdapter -ErrorAction SilentlyContinue) {
+        try {
+            $netAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
+                $_.Name -and ($_.HardwareInterface -or $_.Status -in @('Up', 'Disconnected', 'Disabled', 'Not Present'))
+            })
+
+            foreach ($adapter in $netAdapters) {
+                $statusText = switch ([string]$adapter.Status) {
+                    'Up' { 'Connected' }
+                    'Disconnected' { 'Disconnected' }
+                    'Disabled' { 'Hardware disabled' }
+                    'Not Present' { 'Hardware not present' }
+                    default { [string]$adapter.Status }
                 }
-                if ($netshConfig.SubnetMask) {
-                    $maskText = $netshConfig.SubnetMask
+
+                $inventory += [pscustomobject]@{
+                    Name = [string]$adapter.Name
+                    Description = [string]$adapter.InterfaceDescription
+                    DeviceId = [int]$adapter.ifIndex
+                    InterfaceIndex = [int]$adapter.ifIndex
+                    Guid = [string]$adapter.InterfaceGuid
+                    StatusText = $statusText
                 }
-                if ($netshConfig.Gateway) {
-                    $gatewayText = $netshConfig.Gateway
+            }
+        }
+        catch {
+        }
+    }
+
+    return @($inventory | Sort-Object -Property Name)
+}
+
+function Get-ToolkitAdapterAddress {
+    param($Adapter)
+
+    $result = [ordered]@{ IPText = 'No IP'; MaskText = ''; GatewayText = ''; DnsText = '' }
+    $config = Get-WmiObject -Class Win32_NetworkAdapterConfiguration -Filter ('Index={0}' -f $Adapter.DeviceId) -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($config) {
+        $addresses = @($config.IPAddress | Where-Object { $_ -match '^\d+\.' })
+        if ($addresses.Count -gt 0) { $result.IPText = $addresses -join ', ' }
+        $masks = @($config.IPSubnet | Where-Object { $_ -match '^\d+\.' })
+        $result.MaskText = $masks -join ', '
+        $result.GatewayText = @($config.DefaultIPGateway) -join ', '
+        $result.DnsText = @($config.DNSServerSearchOrder) -join ', '
+    }
+
+    # Disconnected adapters can lose their live WMI address while keeping a static registry configuration.
+    if ($result.IPText -eq 'No IP' -and $Adapter.Guid) {
+        $path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{0}' -f $Adapter.Guid
+        $stored = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
+        if ($stored) {
+            $staticIp = @()
+            if ($stored.PSObject.Properties['IPAddress']) {
+                $staticIp = @($stored.IPAddress | Where-Object { $_ -and $_ -ne '0.0.0.0' })
+            }
+            if ($staticIp.Count -gt 0) {
+                $result.IPText = $staticIp -join ', '
+                if ($stored.PSObject.Properties['SubnetMask']) {
+                    $result.MaskText = @($stored.SubnetMask) -join ', '
                 }
-                if ($netshConfig.Dns) {
-                    $dnsText = $netshConfig.Dns
-                }
+            }
+            if ($stored.PSObject.Properties['DefaultGateway']) {
+                $result.GatewayText = @($stored.DefaultGateway) -join ', '
+            }
+            if ($stored.PSObject.Properties['NameServer']) {
+                $result.DnsText = @($stored.NameServer) -join ', '
+            }
+        }
+    }
+
+    if ($result.IPText -eq 'No IP') {
+        $netshConfig = Get-NetshAdapterConfig -AdapterName $Adapter.Name
+        if ($netshConfig.IPAddress) { $result.IPText = $netshConfig.IPAddress }
+        if ($netshConfig.SubnetMask) { $result.MaskText = $netshConfig.SubnetMask }
+        if ($netshConfig.Gateway) { $result.GatewayText = $netshConfig.Gateway }
+        if ($netshConfig.Dns) { $result.DnsText = $netshConfig.Dns }
+    }
+
+    return [pscustomobject]$result
+}
+
+function Refresh-Adapters {
+    $script:AdapterList = @(Get-ToolkitAdapterInventory | ForEach-Object {
+            $adapterName = [string]$_.Name
+            $statusText = [string]$_.StatusText
+            $deviceId = [int]$_.DeviceId
+            $interfaceIndex = [int]$_.InterfaceIndex
+            try {
+                $address = Get-ToolkitAdapterAddress -Adapter $_
+            }
+            catch {
+                Add-Log -Area 'IP Shifter' -Level 'WARN' -Message ('Could not read {0} configuration: {1}' -f $adapterName, $_.Exception.Message)
+                $address = [pscustomobject]@{ IPText = 'Unavailable'; MaskText = ''; GatewayText = ''; DnsText = '' }
             }
 
             [pscustomobject]@{
-                Name = $_.NetConnectionID
-                Description = $_.Description
+                Name = $adapterName
+                Description = [string]$_.Description
                 Index = $interfaceIndex
                 DeviceId = $deviceId
                 Status = $statusText
-                IPText = $ipText
-                MaskText = $maskText
-                GatewayText = $gatewayText
-                DnsText = $dnsText
+                IPText = $address.IPText
+                MaskText = $address.MaskText
+                GatewayText = $address.GatewayText
+                DnsText = $address.DnsText
             }
         })
 
     if ((Get-Variable -Name cboAdapter -Scope Script -ErrorAction SilentlyContinue) -and $script:cboAdapter) {
-        $previous = $script:cboAdapter.SelectedItem
+        $previous = if ($script:cboAdapter.SelectedItem) { Get-SelectedAdapterName } else { '' }
         $script:cboAdapter.Items.Clear()
         foreach ($adapter in $script:AdapterList) {
             $displayIp = $adapter.IPText
@@ -799,12 +1440,19 @@ function Refresh-Adapters {
             [void]$script:cboAdapter.Items.Add(('{0} [{1}] - IP: {2}' -f $adapter.Name, $adapter.Status, $displayIp))
         }
 
-        if ($previous -and $script:cboAdapter.Items.Contains($previous)) {
-            $script:cboAdapter.SelectedItem = $previous
+        $selected = -1
+        for ($i = 0; $i -lt $script:AdapterList.Count; $i++) {
+            if ($script:AdapterList[$i].Name -eq $previous) { $selected = $i; break }
+        }
+        if ($selected -ge 0) {
+            $script:cboAdapter.SelectedIndex = $selected
         }
         elseif ($script:cboAdapter.Items.Count -gt 0) {
             $script:cboAdapter.SelectedIndex = 0
         }
+    }
+    if ((Get-Variable -Name cboScanAdapter -Scope Script -ErrorAction SilentlyContinue) -and $script:cboScanAdapter) {
+        Refresh-ScannerAdapters
     }
 }
 
@@ -813,8 +1461,17 @@ function Get-SelectedAdapterName {
         throw 'Select a network adapter.'
     }
 
-    $selected = [string]$script:cboAdapter.SelectedItem
-    return ($selected -replace '\s+\[.*$', '')
+    return [string]$script:AdapterList[$script:cboAdapter.SelectedIndex].Name
+}
+
+function Get-IpProfileValue {
+    param($Profile, [string]$Name)
+
+    if (-not $Profile) { return '' }
+    if ($Profile.PSObject.Properties[$Name]) { return [string]$Profile.$Name }
+    if ($Name -eq 'IPAddress' -and $Profile.PSObject.Properties['IP']) { return [string]$Profile.IP }
+    if ($Name -eq 'SubnetMask' -and $Profile.PSObject.Properties['Mask']) { return [string]$Profile.Mask }
+    return ''
 }
 
 function Refresh-Profiles {
@@ -824,10 +1481,12 @@ function Refresh-Profiles {
 
     $script:lvProfiles.Items.Clear()
     foreach ($profile in @($script:Config.SiteProfiles)) {
-        $item = New-Object System.Windows.Forms.ListViewItem($profile.Name)
-        [void]$item.SubItems.Add($profile.IPAddress)
-        [void]$item.SubItems.Add($profile.SubnetMask)
-        [void]$item.SubItems.Add($profile.Gateway)
+        if (-not $profile) { continue }
+        $item = New-Object System.Windows.Forms.ListViewItem((Get-IpProfileValue -Profile $profile -Name 'Name'))
+        [void]$item.SubItems.Add((Get-IpProfileValue -Profile $profile -Name 'Adapter'))
+        [void]$item.SubItems.Add((Get-IpProfileValue -Profile $profile -Name 'IPAddress'))
+        [void]$item.SubItems.Add((Get-IpProfileValue -Profile $profile -Name 'SubnetMask'))
+        [void]$item.SubItems.Add((Get-IpProfileValue -Profile $profile -Name 'Gateway'))
         [void]$script:lvProfiles.Items.Add($item)
     }
 }
@@ -839,19 +1498,22 @@ function Load-SelectedProfile {
     }
 
     $profileName = $script:lvProfiles.SelectedItems[0].Text
-    $profile = @($script:Config.SiteProfiles | Where-Object { $_.Name -eq $profileName } | Select-Object -First 1)
+    $profile = $script:Config.SiteProfiles | Where-Object { $_.Name -eq $profileName } | Select-Object -First 1
     if (-not $profile) {
         Add-Log -Area 'IP Shifter' -Level 'WARN' -Message 'Profile was not found.'
         return
     }
 
-    $script:txtProfileName.Text = $profile.Name
-    $script:txtIpAddress.Text = $profile.IPAddress
-    $script:txtSubnetMask.Text = $profile.SubnetMask
-    $script:txtGateway.Text = $profile.Gateway
-    $script:txtDns1.Text = $profile.Dns1
-    $script:txtDns2.Text = $profile.Dns2
-    Add-Log -Area 'IP Shifter' -Level 'OK' -Message ("Loaded profile {0}" -f $profile.Name)
+    $script:txtProfileName.Text = Get-IpProfileValue -Profile $profile -Name 'Name'
+    $script:txtIpAddress.Text = Get-IpProfileValue -Profile $profile -Name 'IPAddress'
+    $script:txtSubnetMask.Text = Get-IpProfileValue -Profile $profile -Name 'SubnetMask'
+    $script:txtGateway.Text = Get-IpProfileValue -Profile $profile -Name 'Gateway'
+    $script:txtDns1.Text = Get-IpProfileValue -Profile $profile -Name 'Dns1'
+    $script:txtDns2.Text = Get-IpProfileValue -Profile $profile -Name 'Dns2'
+    for ($i = 0; $i -lt $script:AdapterList.Count; $i++) {
+        if ($script:AdapterList[$i].Name -eq (Get-IpProfileValue -Profile $profile -Name 'Adapter')) { $script:cboAdapter.SelectedIndex = $i; break }
+    }
+    Add-Log -Area 'IP Shifter' -Level 'OK' -Message ("Loaded profile {0}" -f (Get-IpProfileValue -Profile $profile -Name 'Name'))
 }
 
 function Save-IpProfile {
@@ -861,7 +1523,11 @@ function Save-IpProfile {
             throw 'Profile name is required.'
         }
 
+        Test-IPv4AddressText -Value $script:txtIpAddress.Text.Trim() -FieldName 'IP address'
         [void](Convert-MaskToPrefixLength -SubnetMask $script:txtSubnetMask.Text.Trim())
+        foreach ($field in @(@('Gateway', $script:txtGateway.Text), @('DNS 1', $script:txtDns1.Text), @('DNS 2', $script:txtDns2.Text))) {
+            if ($field[1].Trim()) { Test-IPv4AddressText -Value $field[1].Trim() -FieldName $field[0] }
+        }
 
         $profile = [pscustomobject]@{
             Name = $name
@@ -879,6 +1545,53 @@ function Save-IpProfile {
         Save-Config
         Refresh-Profiles
         Add-Log -Area 'IP Shifter' -Level 'OK' -Message ("Saved profile {0}" -f $name)
+    }
+}
+
+function Save-PendingNetworkDraft {
+    param([string]$Action)
+
+    $draft = [pscustomobject]@{
+        Action = $Action
+        Adapter = Get-SelectedAdapterName
+        ProfileName = $script:txtProfileName.Text
+        IPAddress = $script:txtIpAddress.Text
+        SubnetMask = $script:txtSubnetMask.Text
+        Gateway = $script:txtGateway.Text
+        Dns1 = $script:txtDns1.Text
+        Dns2 = $script:txtDns2.Text
+    }
+    $script:Config | Add-Member -NotePropertyName PendingNetworkDraft -NotePropertyValue $draft -Force
+    Save-Config
+}
+
+function Restore-PendingNetworkDraft {
+    if (-not $script:Config.PSObject.Properties['PendingNetworkDraft'] -or -not $script:Config.PendingNetworkDraft) { return }
+    $draft = $script:Config.PendingNetworkDraft
+    for ($i = 0; $i -lt $script:AdapterList.Count; $i++) {
+        if ($script:AdapterList[$i].Name -eq $draft.Adapter) { $script:cboAdapter.SelectedIndex = $i; break }
+    }
+    $script:txtProfileName.Text = [string]$draft.ProfileName
+    $script:txtIpAddress.Text = [string]$draft.IPAddress
+    $script:txtSubnetMask.Text = [string]$draft.SubnetMask
+    $script:txtGateway.Text = [string]$draft.Gateway
+    $script:txtDns1.Text = [string]$draft.Dns1
+    $script:txtDns2.Text = [string]$draft.Dns2
+    $script:Config.PendingNetworkDraft = $null
+    Save-Config
+    $script:tabs.SelectedTab = $script:tabIp
+    Add-Log -Area 'IP Shifter' -Level 'INFO' -Message ("Restored {0} draft for {1}; review and apply it." -f $draft.Action, $draft.Adapter)
+}
+
+function Remove-IpProfile {
+    Invoke-UiAction -Name 'Delete IP Profile' -Action {
+        if ($script:lvProfiles.SelectedItems.Count -eq 0) { throw 'Select a saved profile first.' }
+        $name = $script:lvProfiles.SelectedItems[0].Text
+        if (-not (Confirm-Action -Title 'Delete Profile' -Message ("Delete saved profile '{0}'? This does not change the adapter." -f $name))) { return }
+        $script:Config.SiteProfiles = @($script:Config.SiteProfiles | Where-Object { $_.Name -ne $name })
+        Save-Config
+        Refresh-Profiles
+        Add-Log -Area 'IP Shifter' -Level 'OK' -Message ("Deleted saved profile {0}" -f $name)
     }
 }
 
@@ -915,7 +1628,9 @@ function Show-AdapterDetails {
 function Apply-StaticIp {
     Invoke-UiAction -Name 'Apply Static IP' -Action {
         if (-not (Test-IsAdministrator)) {
-            throw 'Changing adapter IP requires running PowerShell as Administrator.'
+            Save-PendingNetworkDraft -Action 'Static IP'
+            [void](Ensure-ToolkitAdministrator -Feature 'Changing adapter IP settings')
+            return
         }
 
         $adapter = Get-SelectedAdapterName
@@ -981,6 +1696,10 @@ function Apply-StaticIp {
 
         Start-Sleep -Milliseconds 500
         Refresh-Adapters
+        $applied = @($script:AdapterList | Where-Object { $_.Name -eq $adapter } | Select-Object -First 1)
+        if (-not $applied -or @($applied.IPText -split ',\s*') -notcontains $ip) {
+            throw 'Windows did not report the requested IP after applying it. Check adapter details and the log.'
+        }
         Add-Log -Area 'IP Shifter' -Level 'OK' -Message ("Applied static IP {0} to {1}" -f $ip, $adapter)
     }
 }
@@ -988,7 +1707,9 @@ function Apply-StaticIp {
 function Apply-Dhcp {
     Invoke-UiAction -Name 'Set DHCP' -Action {
         if (-not (Test-IsAdministrator)) {
-            throw 'Changing adapter IP requires running PowerShell as Administrator.'
+            Save-PendingNetworkDraft -Action 'DHCP'
+            [void](Ensure-ToolkitAdministrator -Feature 'Changing adapter IP settings')
+            return
         }
 
         $adapter = Get-SelectedAdapterName
@@ -1851,6 +2572,10 @@ function Open-NetworkSettings {
 }
 
 function Save-TechnicianNotes {
+    if (-not ((Get-Variable -Name txtNotes -Scope Script -ErrorAction SilentlyContinue) -and $script:txtNotes)) {
+        return
+    }
+
     $script:Config.Notes = $script:txtNotes.Text
     Save-Config
     Add-Log -Area 'Notes' -Level 'OK' -Message 'Saved notes.'
@@ -1865,6 +2590,9 @@ function Capture-Screenshot {
             $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
             $path = Join-Path -Path $script:ScreenshotFolder -ChildPath ("Screenshot_{0:yyyyMMdd_HHmmss}.png" -f (Get-Date))
             $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+            if ((Get-Variable -Name txtFeedbackScreenshot -Scope Script -ErrorAction SilentlyContinue) -and $script:txtFeedbackScreenshot) {
+                $script:txtFeedbackScreenshot.Text = $path
+            }
             if ((Get-Variable -Name txtScreenshotPath -Scope Script -ErrorAction SilentlyContinue) -and $script:txtScreenshotPath) {
                 $script:txtScreenshotPath.Text = $path
             }
@@ -1883,6 +2611,23 @@ function New-DefaultBmsFlows {
 
 function New-DefaultImportantLinks {
     return @()
+}
+
+function New-DefaultBmsCommands {
+    return @()
+}
+
+function Remove-LegacyBundledBmsFlowSample {
+    $sampleCategoryName = 'Network Troubleshooting Sample'
+    $beforeCount = @($script:BmsFlows).Count
+    $script:BmsFlows = @($script:BmsFlows | Where-Object {
+        $_.Name -ne $sampleCategoryName -or $_.StartStepId -ne 'start' -or
+        -not (@($_.Steps | Where-Object { $_.Id -eq 'ping_test' }).Count -gt 0)
+    })
+    if (@($script:BmsFlows).Count -ne $beforeCount) {
+        Save-BmsFlows
+        Add-Log -Area 'BMS Flow' -Level 'INFO' -Message ('Removed legacy sample topic: {0}' -f $sampleCategoryName)
+    }
 }
 
 function New-BmsStepObject {
@@ -1994,6 +2739,40 @@ function Normalize-LinkItem {
     }
 }
 
+function Normalize-BmsCommand {
+    param($Item)
+
+    $name = if ($Item -and $Item.PSObject.Properties['Name']) { [string]$Item.Name } else { 'New Command' }
+    $category = if ($Item -and $Item.PSObject.Properties['Category']) { [string]$Item.Category } else { 'General' }
+    $description = if ($Item -and $Item.PSObject.Properties['Description']) { [string]$Item.Description } else { '' }
+    $commandType = if ($Item -and $Item.PSObject.Properties['CommandType']) { [string]$Item.CommandType } else { 'PowerShell' }
+    $commandText = if ($Item -and $Item.PSObject.Properties['CommandText']) { [string]$Item.CommandText } else { '' }
+    $requiresAdmin = $false
+    $confirmBeforeRun = $true
+    $keepWindowOpen = $true
+
+    if ($Item -and $Item.PSObject.Properties['RequiresAdmin']) {
+        $requiresAdmin = [bool]$Item.RequiresAdmin
+    }
+    if ($Item -and $Item.PSObject.Properties['ConfirmBeforeRun']) {
+        $confirmBeforeRun = [bool]$Item.ConfirmBeforeRun
+    }
+    if ($Item -and $Item.PSObject.Properties['KeepWindowOpen']) {
+        $keepWindowOpen = [bool]$Item.KeepWindowOpen
+    }
+
+    return [pscustomobject]@{
+        Name = $name
+        Category = $category
+        Description = $description
+        CommandType = $commandType
+        CommandText = $commandText
+        RequiresAdmin = $requiresAdmin
+        ConfirmBeforeRun = $confirmBeforeRun
+        KeepWindowOpen = $keepWindowOpen
+    }
+}
+
 function Save-BmsFlows {
     try {
         $script:BmsFlows | ConvertTo-Json -Depth 10 | Set-Content -Path $script:BmsFlowFile -Encoding UTF8
@@ -2027,10 +2806,40 @@ function Load-BmsFlows {
 function Save-ImportantLinks {
     try {
         $script:ImportantLinks | ConvertTo-Json -Depth 6 | Set-Content -Path $script:LinksFile -Encoding UTF8
-        Add-Log -Area 'Links' -Level 'OK' -Message 'Saved Important Links and Docs.'
+        Add-Log -Area 'Links' -Level 'OK' -Message 'Saved Important Links.'
     }
     catch {
         Add-Log -Area 'Links' -Level 'ERROR' -Message ('Could not save links: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Save-BmsCommands {
+    try {
+        $script:BmsCommands | ConvertTo-Json -Depth 6 | Set-Content -Path $script:BmsCommandsFile -Encoding UTF8
+        Add-Log -Area 'BMS Commands' -Level 'OK' -Message 'Saved BMS command definitions.'
+    }
+    catch {
+        Add-Log -Area 'BMS Commands' -Level 'ERROR' -Message ('Could not save BMS commands: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Load-BmsCommands {
+    if (Test-Path -Path $script:BmsCommandsFile) {
+        try {
+            $loaded = @(Get-Content -Path $script:BmsCommandsFile -Raw | ConvertFrom-Json)
+            $script:BmsCommands = @()
+            foreach ($item in $loaded) {
+                $script:BmsCommands += Normalize-BmsCommand -Item $item
+            }
+        }
+        catch {
+            $script:BmsCommands = @(New-DefaultBmsCommands)
+            Save-BmsCommands
+        }
+    }
+    else {
+        $script:BmsCommands = @(New-DefaultBmsCommands)
+        Save-BmsCommands
     }
 }
 
@@ -2289,10 +3098,38 @@ function Render-BmsButtons {
         return
     }
 
+    if (@($step.Buttons).Count -eq 0) {
+        $infoLabel = New-Object System.Windows.Forms.Label
+        $infoLabel.Text = 'This step does not have any more choices. Use Back or Restart Flow to move somewhere else in the path.'
+        $infoLabel.Location = New-Object System.Drawing.Point(0, 0)
+        $infoLabel.Size = New-Object System.Drawing.Size([Math]::Max(200, $script:pnlBmsButtons.ClientSize.Width - 18), 54)
+        $infoLabel.ForeColor = $colorMuted
+        $infoLabel | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
+        $script:pnlBmsButtons.Controls.Add($infoLabel)
+        return
+    }
+
+    $buttonWidth = [Math]::Max(200, [Math]::Min(220, $script:pnlBmsButtons.ClientSize.Width - 24))
     foreach ($choice in @($step.Buttons)) {
-        $button = New-Button -Text $choice.Text -OnClick { Show-BmsChoice -Choice $this.Tag } -X 0 -Y 0 -Width 220
+        $button = New-Button -Text $choice.Text -OnClick { Show-BmsChoice -Choice $this.Tag } -X 0 -Y 0 -Width $buttonWidth -Height 38
         $button.Tag = $choice
         $button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 8)
+        if ($script:toolTip) {
+            $tipParts = @()
+            if (-not [string]::IsNullOrWhiteSpace([string]$choice.Notes)) {
+                $tipParts += [string]$choice.Notes
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$choice.NextStepId)) {
+                $category = Get-SelectedBmsCategory
+                $nextStep = Get-BmsStepById -Category $category -StepId ([string]$choice.NextStepId)
+                if ($nextStep) {
+                    $tipParts += ('Next step: {0}' -f $nextStep.Name)
+                }
+            }
+            if (@($tipParts).Count -gt 0) {
+                $script:toolTip.SetToolTip($button, ($tipParts -join [Environment]::NewLine + [Environment]::NewLine))
+            }
+        }
         $script:pnlBmsButtons.Controls.Add($button)
     }
 }
@@ -2303,6 +3140,7 @@ function Select-BmsCategory {
         return
     }
 
+    $script:BmsStepHistory.Clear()
     $script:CurrentBmsCategory = $category.Name
     $script:CurrentBmsStepId = $category.StartStepId
     $script:txtBmsCategory.Text = $category.Name
@@ -2343,7 +3181,12 @@ function Select-BmsStep {
 
     Clear-BmsButtonEditor
     if (-not $script:PreserveBmsRunResult -and (Get-Variable -Name txtBmsResult -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsResult) {
-        $script:txtBmsResult.Text = ''
+        if (@($step.Buttons).Count -eq 0) {
+            $script:txtBmsResult.Text = $step.Prompt
+        }
+        else {
+            $script:txtBmsResult.Text = ''
+        }
     }
     Render-BmsButtons
     Refresh-BmsFlowOutline
@@ -2363,6 +3206,9 @@ function Show-BmsChoice {
         $category = Get-SelectedBmsCategory
         $nextStep = Get-BmsStepById -Category $category -StepId $nextStepId
         if ($nextStep) {
+            if ($script:CurrentBmsStepId) {
+                [void]$script:BmsStepHistory.Add([string]$script:CurrentBmsStepId)
+            }
             $script:PreserveBmsRunResult = $true
             $script:CurrentBmsStepId = $nextStep.Id
             $script:lstBmsSteps.SelectedItem = $nextStep.Name
@@ -2372,6 +3218,26 @@ function Show-BmsChoice {
     $script:txtBmsResult.Text = $notes
     $script:PreserveBmsRunResult = $false
     Add-Log -Area 'BMS Flow' -Level 'INFO' -Message ("Selected step button: {0}" -f $Choice.Text)
+}
+
+function Go-BackBmsStep {
+    if ($script:BmsStepHistory.Count -eq 0) {
+        return
+    }
+
+    $previousStepId = $script:BmsStepHistory[$script:BmsStepHistory.Count - 1]
+    $script:BmsStepHistory.RemoveAt($script:BmsStepHistory.Count - 1)
+    $category = Get-SelectedBmsCategory
+    $previousStep = Get-BmsStepById -Category $category -StepId $previousStepId
+    if (-not $previousStep) {
+        return
+    }
+
+    $script:txtBmsResult.Text = ''
+    $script:CurrentBmsStepId = $previousStep.Id
+    if ($script:lstBmsSteps.Items.Contains($previousStep.Name)) {
+        $script:lstBmsSteps.SelectedItem = $previousStep.Name
+    }
 }
 
 function Load-BmsButtonForEdit {
@@ -2771,6 +3637,7 @@ function Reset-BmsToStartStep {
         return
     }
 
+    $script:BmsStepHistory.Clear()
     $script:txtBmsResult.Text = ''
     $script:CurrentBmsStepId = $startStep.Id
     if ($script:lstBmsSteps.Items.Contains($startStep.Name)) {
@@ -2824,7 +3691,7 @@ function Load-LinkItem {
 }
 
 function Save-LinkItem {
-    if (-not (Assert-AdminMode -Feature 'create or edit important links and docs')) {
+    if (-not (Assert-AdminMode -Feature 'create or edit important links')) {
         return
     }
 
@@ -2836,7 +3703,7 @@ function Save-LinkItem {
     if ([string]::IsNullOrWhiteSpace($title)) {
         [System.Windows.Forms.MessageBox]::Show(
             'Link title is required.',
-            'Important Links and Docs',
+            'Important Links',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning
         ) | Out-Null
@@ -2868,7 +3735,7 @@ function Save-LinkItem {
 }
 
 function New-LinkItem {
-    if (-not (Assert-AdminMode -Feature 'create important links and docs')) {
+    if (-not (Assert-AdminMode -Feature 'create important links')) {
         return
     }
 
@@ -2880,7 +3747,7 @@ function New-LinkItem {
 }
 
 function Delete-LinkItem {
-    if (-not (Assert-AdminMode -Feature 'delete important links and docs')) {
+    if (-not (Assert-AdminMode -Feature 'delete important links')) {
         return
     }
 
@@ -2913,7 +3780,410 @@ function Open-LinkItem {
     }
 
     Start-Process -FilePath $item.Target
-    Add-Log -Area 'Links' -Level 'OK' -Message ("Opened link/doc: {0}" -f $item.Title)
+    Add-Log -Area 'Links' -Level 'OK' -Message ("Opened link: {0}" -f $item.Title)
+}
+
+function Convert-TextToEncodedCommand {
+    param([string]$Text)
+
+    return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Text))
+}
+
+function Get-BmsCommandByName {
+    param([string]$Name)
+
+    return ($script:BmsCommands | Where-Object { $_.Name -eq $Name } | Select-Object -First 1)
+}
+
+function Get-SelectedBmsCommandCategory {
+    if ((Get-Variable -Name cboBmsCommandCategoryFilter -Scope Script -ErrorAction SilentlyContinue) -and
+        $script:cboBmsCommandCategoryFilter -and
+        $script:cboBmsCommandCategoryFilter.SelectedItem) {
+        return [string]$script:cboBmsCommandCategoryFilter.SelectedItem
+    }
+
+    return 'All Categories'
+}
+
+function Get-BmsCommandsForSelectedCategory {
+    $category = Get-SelectedBmsCommandCategory
+    if ([string]::IsNullOrWhiteSpace($category) -or $category -eq 'All Categories') {
+        return @($script:BmsCommands | Sort-Object -Property Category, Name)
+    }
+
+    return @($script:BmsCommands | Where-Object { $_.Category -eq $category } | Sort-Object -Property Name)
+}
+
+function Refresh-BmsCommandCategoryFilter {
+    if (-not ((Get-Variable -Name cboBmsCommandCategoryFilter -Scope Script -ErrorAction SilentlyContinue) -and $script:cboBmsCommandCategoryFilter)) {
+        return
+    }
+
+    $previous = if ($script:cboBmsCommandCategoryFilter.SelectedItem) { [string]$script:cboBmsCommandCategoryFilter.SelectedItem } else { 'All Categories' }
+    $script:cboBmsCommandCategoryFilter.Items.Clear()
+    [void]$script:cboBmsCommandCategoryFilter.Items.Add('All Categories')
+
+    foreach ($category in @($script:BmsCommands | Select-Object -ExpandProperty Category -Unique | Sort-Object)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$category)) {
+            [void]$script:cboBmsCommandCategoryFilter.Items.Add([string]$category)
+        }
+    }
+
+    if ($script:cboBmsCommandCategoryFilter.Items.Contains($previous)) {
+        $script:cboBmsCommandCategoryFilter.SelectedItem = $previous
+    }
+    else {
+        $script:cboBmsCommandCategoryFilter.SelectedIndex = 0
+    }
+}
+
+function Refresh-BmsCommandList {
+    if (-not ((Get-Variable -Name lstBmsCommandItems -Scope Script -ErrorAction SilentlyContinue) -and $script:lstBmsCommandItems)) {
+        return
+    }
+
+    $previous = if ($script:lstBmsCommandItems.SelectedItem) { [string]$script:lstBmsCommandItems.SelectedItem } else { $script:CurrentBmsCommandName }
+    $script:lstBmsCommandItems.Items.Clear()
+
+    foreach ($item in @(Get-BmsCommandsForSelectedCategory)) {
+        [void]$script:lstBmsCommandItems.Items.Add($item.Name)
+    }
+
+    if ($previous -and $script:lstBmsCommandItems.Items.Contains($previous)) {
+        $script:lstBmsCommandItems.SelectedItem = $previous
+    }
+    elseif ($script:lstBmsCommandItems.Items.Count -gt 0) {
+        $script:lstBmsCommandItems.SelectedIndex = 0
+    }
+    else {
+        $script:CurrentBmsCommandName = $null
+        if ((Get-Variable -Name txtBmsCommandDescriptionView -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandDescriptionView) {
+            $script:txtBmsCommandDescriptionView.Text = ''
+        }
+        if ((Get-Variable -Name txtBmsCommandPreview -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandPreview) {
+            $script:txtBmsCommandPreview.Text = ''
+        }
+    }
+}
+
+function Clear-BmsCommandEditor {
+    if ((Get-Variable -Name txtBmsCommandName -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandName) {
+        $script:txtBmsCommandName.Text = ''
+    }
+    if ((Get-Variable -Name txtBmsCommandCategory -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandCategory) {
+        $script:txtBmsCommandCategory.Text = 'General'
+    }
+    if ((Get-Variable -Name txtBmsCommandDescription -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandDescription) {
+        $script:txtBmsCommandDescription.Text = ''
+    }
+    if ((Get-Variable -Name cboBmsCommandType -Scope Script -ErrorAction SilentlyContinue) -and $script:cboBmsCommandType) {
+        $script:cboBmsCommandType.SelectedItem = 'PowerShell'
+    }
+    if ((Get-Variable -Name txtBmsCommandText -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandText) {
+        $script:txtBmsCommandText.Text = ''
+    }
+    if ((Get-Variable -Name chkBmsCommandRequiresAdmin -Scope Script -ErrorAction SilentlyContinue) -and $script:chkBmsCommandRequiresAdmin) {
+        $script:chkBmsCommandRequiresAdmin.Checked = $false
+    }
+    if ((Get-Variable -Name chkBmsCommandConfirm -Scope Script -ErrorAction SilentlyContinue) -and $script:chkBmsCommandConfirm) {
+        $script:chkBmsCommandConfirm.Checked = $true
+    }
+    if ((Get-Variable -Name chkBmsCommandKeepWindowOpen -Scope Script -ErrorAction SilentlyContinue) -and $script:chkBmsCommandKeepWindowOpen) {
+        $script:chkBmsCommandKeepWindowOpen.Checked = $true
+    }
+}
+
+function Select-BmsCommandByName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return
+    }
+
+    $command = Get-BmsCommandByName -Name $Name
+    if (-not $command) {
+        return
+    }
+
+    $script:CurrentBmsCommandName = $command.Name
+
+    if ((Get-Variable -Name lstBmsCommandItems -Scope Script -ErrorAction SilentlyContinue) -and
+        $script:lstBmsCommandItems -and
+        $script:lstBmsCommandItems.Items.Contains($command.Name) -and
+        $script:lstBmsCommandItems.SelectedItem -ne $command.Name) {
+        $script:lstBmsCommandItems.SelectedItem = $command.Name
+    }
+
+    if ((Get-Variable -Name lblBmsCommandName -Scope Script -ErrorAction SilentlyContinue) -and $script:lblBmsCommandName) {
+        $script:lblBmsCommandName.Text = ('Command: {0}' -f $command.Name)
+    }
+    if ((Get-Variable -Name lblBmsCommandMeta -Scope Script -ErrorAction SilentlyContinue) -and $script:lblBmsCommandMeta) {
+        $script:lblBmsCommandMeta.Text = ('Category: {0} | Type: {1} | Admin: {2} | Confirm: {3}' -f $command.Category, $command.CommandType, $(if ($command.RequiresAdmin) { 'Yes' } else { 'No' }), $(if ($command.ConfirmBeforeRun) { 'Yes' } else { 'No' }))
+    }
+    if ((Get-Variable -Name txtBmsCommandDescriptionView -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandDescriptionView) {
+        $script:txtBmsCommandDescriptionView.Text = $command.Description
+    }
+    if ((Get-Variable -Name txtBmsCommandPreview -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandPreview) {
+        $script:txtBmsCommandPreview.Text = $command.CommandText
+    }
+    if ((Get-Variable -Name txtBmsCommandName -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandName) {
+        $script:txtBmsCommandName.Text = $command.Name
+    }
+    if ((Get-Variable -Name txtBmsCommandCategory -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandCategory) {
+        $script:txtBmsCommandCategory.Text = $command.Category
+    }
+    if ((Get-Variable -Name txtBmsCommandDescription -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandDescription) {
+        $script:txtBmsCommandDescription.Text = $command.Description
+    }
+    if ((Get-Variable -Name cboBmsCommandType -Scope Script -ErrorAction SilentlyContinue) -and $script:cboBmsCommandType) {
+        if ($script:cboBmsCommandType.Items.Contains($command.CommandType)) {
+            $script:cboBmsCommandType.SelectedItem = $command.CommandType
+        }
+    }
+    if ((Get-Variable -Name txtBmsCommandText -Scope Script -ErrorAction SilentlyContinue) -and $script:txtBmsCommandText) {
+        $script:txtBmsCommandText.Text = $command.CommandText
+    }
+    if ((Get-Variable -Name chkBmsCommandRequiresAdmin -Scope Script -ErrorAction SilentlyContinue) -and $script:chkBmsCommandRequiresAdmin) {
+        $script:chkBmsCommandRequiresAdmin.Checked = [bool]$command.RequiresAdmin
+    }
+    if ((Get-Variable -Name chkBmsCommandConfirm -Scope Script -ErrorAction SilentlyContinue) -and $script:chkBmsCommandConfirm) {
+        $script:chkBmsCommandConfirm.Checked = [bool]$command.ConfirmBeforeRun
+    }
+    if ((Get-Variable -Name chkBmsCommandKeepWindowOpen -Scope Script -ErrorAction SilentlyContinue) -and $script:chkBmsCommandKeepWindowOpen) {
+        $script:chkBmsCommandKeepWindowOpen.Checked = [bool]$command.KeepWindowOpen
+    }
+}
+
+function Select-BmsCommandItem {
+    if (-not ((Get-Variable -Name lstBmsCommandItems -Scope Script -ErrorAction SilentlyContinue) -and $script:lstBmsCommandItems)) {
+        return
+    }
+    if ($script:lstBmsCommandItems.SelectedItem -eq $null) {
+        return
+    }
+
+    Select-BmsCommandByName -Name ([string]$script:lstBmsCommandItems.SelectedItem)
+}
+
+function Refresh-BmsCommandButtons {
+    if (-not ((Get-Variable -Name pnlBmsCommandButtons -Scope Script -ErrorAction SilentlyContinue) -and $script:pnlBmsCommandButtons)) {
+        return
+    }
+
+    $script:pnlBmsCommandButtons.Controls.Clear()
+    foreach ($item in @(Get-BmsCommandsForSelectedCategory)) {
+        $button = New-Button -Text $item.Name -OnClick { Select-BmsCommandByName -Name ([string]$this.Tag) } -X 0 -Y 0 -Width 180 -Height 34
+        $button.Tag = $item.Name
+        $button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 8)
+        $script:pnlBmsCommandButtons.Controls.Add($button)
+    }
+}
+
+function Refresh-BmsCommandsUi {
+    Refresh-BmsCommandCategoryFilter
+    Refresh-BmsCommandList
+    Refresh-BmsCommandButtons
+}
+
+function Invoke-BmsCommandItem {
+    param($Command)
+
+    if (-not $Command) {
+        throw 'No BMS command is selected.'
+    }
+
+    $commandName = [string]$Command.Name
+    $commandType = [string]$Command.CommandType
+    $commandText = [string]$Command.CommandText
+
+    if ([string]::IsNullOrWhiteSpace($commandText)) {
+        throw ("Command '{0}' does not have any command text yet." -f $commandName)
+    }
+
+    if ($Command.ConfirmBeforeRun) {
+        $message = "Run BMS command '$commandName'?" + [Environment]::NewLine +
+            "Type: $commandType" + [Environment]::NewLine +
+            "Admin required: $(if ($Command.RequiresAdmin) { 'Yes' } else { 'No' })"
+        if (-not (Confirm-Action -Title 'Run BMS Command' -Message $message)) {
+            Add-Log -Area 'BMS Commands' -Level 'WARN' -Message ("Cancelled command: {0}" -f $commandName)
+            return
+        }
+    }
+
+    switch ($commandType.ToLowerInvariant()) {
+        'powershell' {
+            $args = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass')
+            if ($Command.KeepWindowOpen) {
+                $args += '-NoExit'
+            }
+            $args += @('-EncodedCommand', (Convert-TextToEncodedCommand -Text $commandText))
+
+            if ($Command.RequiresAdmin -and -not (Test-IsAdministrator)) {
+                Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $args
+            }
+            else {
+                Start-Process -FilePath 'powershell.exe' -ArgumentList $args
+            }
+        }
+        'cmd' {
+            $mode = if ($Command.KeepWindowOpen) { '/k' } else { '/c' }
+            $args = @($mode, $commandText)
+            if ($Command.RequiresAdmin -and -not (Test-IsAdministrator)) {
+                Start-Process -FilePath 'cmd.exe' -Verb RunAs -ArgumentList $args
+            }
+            else {
+                Start-Process -FilePath 'cmd.exe' -ArgumentList $args
+            }
+        }
+        'open' {
+            if ($Command.RequiresAdmin -and -not (Test-IsAdministrator)) {
+                Start-Process -FilePath $commandText -Verb RunAs
+            }
+            else {
+                Start-Process -FilePath $commandText
+            }
+        }
+        default {
+            throw ("Unsupported command type: {0}" -f $commandType)
+        }
+    }
+
+    Add-Log -Area 'BMS Commands' -Level 'OK' -Message ("Ran command: {0}" -f $commandName)
+}
+
+function Run-SelectedBmsCommand {
+    Invoke-UiAction -Name 'Run BMS Command' -Action {
+        $command = Get-BmsCommandByName -Name $script:CurrentBmsCommandName
+        Invoke-BmsCommandItem -Command $command
+    }
+}
+
+function New-BmsCommandItem {
+    if (-not (Assert-AdminMode -Feature 'create BMS commands')) {
+        return
+    }
+
+    $newName = 'New Command'
+    $counter = 1
+    while (@($script:BmsCommands | Where-Object { $_.Name -eq $newName }).Count -gt 0) {
+        $counter++
+        $newName = 'New Command {0}' -f $counter
+    }
+
+    $script:BmsCommands += [pscustomobject]@{
+        Name = $newName
+        Category = 'General'
+        Description = ''
+        CommandType = 'PowerShell'
+        CommandText = ''
+        RequiresAdmin = $false
+        ConfirmBeforeRun = $true
+        KeepWindowOpen = $true
+    }
+
+    Save-BmsCommands
+    Refresh-BmsCommandsUi
+    Select-BmsCommandByName -Name $newName
+}
+
+function Save-BmsCommandItem {
+    if (-not (Assert-AdminMode -Feature 'create or edit BMS commands')) {
+        return
+    }
+
+    $oldName = $script:CurrentBmsCommandName
+    $name = $script:txtBmsCommandName.Text.Trim()
+    $category = $script:txtBmsCommandCategory.Text.Trim()
+    $description = $script:txtBmsCommandDescription.Text.Trim()
+    $commandType = if ($script:cboBmsCommandType.SelectedItem) { [string]$script:cboBmsCommandType.SelectedItem } else { 'PowerShell' }
+    $commandText = $script:txtBmsCommandText.Text.Trim()
+    $requiresAdmin = [bool]$script:chkBmsCommandRequiresAdmin.Checked
+    $confirmBeforeRun = [bool]$script:chkBmsCommandConfirm.Checked
+    $keepWindowOpen = [bool]$script:chkBmsCommandKeepWindowOpen.Checked
+
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Command name is required.',
+            'BMS Commands',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($category)) {
+        $category = 'General'
+    }
+    if ([string]::IsNullOrWhiteSpace($commandText)) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Command text is required.',
+            'BMS Commands',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        return
+    }
+
+    $duplicate = ($script:BmsCommands | Where-Object { $_.Name -eq $name -and $_.Name -ne $oldName } | Select-Object -First 1)
+    if ($duplicate) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'A command with that name already exists.',
+            'BMS Commands',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        return
+    }
+
+    $item = Get-BmsCommandByName -Name $oldName
+    if (-not $item) {
+        $item = [pscustomobject]@{
+            Name = $name
+            Category = $category
+            Description = $description
+            CommandType = $commandType
+            CommandText = $commandText
+            RequiresAdmin = $requiresAdmin
+            ConfirmBeforeRun = $confirmBeforeRun
+            KeepWindowOpen = $keepWindowOpen
+        }
+        $script:BmsCommands += $item
+    }
+    else {
+        $item.Name = $name
+        $item.Category = $category
+        $item.Description = $description
+        $item.CommandType = $commandType
+        $item.CommandText = $commandText
+        $item.RequiresAdmin = $requiresAdmin
+        $item.ConfirmBeforeRun = $confirmBeforeRun
+        $item.KeepWindowOpen = $keepWindowOpen
+    }
+
+    $script:CurrentBmsCommandName = $name
+    Save-BmsCommands
+    Refresh-BmsCommandsUi
+    Select-BmsCommandByName -Name $name
+}
+
+function Delete-BmsCommandItem {
+    if (-not (Assert-AdminMode -Feature 'delete BMS commands')) {
+        return
+    }
+
+    $item = Get-BmsCommandByName -Name $script:CurrentBmsCommandName
+    if (-not $item) {
+        return
+    }
+
+    if (-not (Confirm-Action -Title 'Delete BMS Command' -Message ("Delete BMS command '{0}'?" -f $item.Name))) {
+        return
+    }
+
+    $script:BmsCommands = @($script:BmsCommands | Where-Object { $_.Name -ne $item.Name })
+    $script:CurrentBmsCommandName = $null
+    Save-BmsCommands
+    Clear-BmsCommandEditor
+    Refresh-BmsCommandsUi
 }
 
 function Protect-ToolkitSecret {
@@ -2957,18 +4227,17 @@ function Get-OpenAiApiKey {
 
 function Update-AiSettingsUi {
     if ((Get-Variable -Name lblAiKeyStatus -Scope Script -ErrorAction SilentlyContinue) -and $script:lblAiKeyStatus) {
-        $script:lblAiKeyStatus.Text = 'Search saved BMS flows, links, notes, and recent log activity from one place.'
-        $script:lblAiKeyStatus.ForeColor = [System.Drawing.Color]::FromArgb(80, 90, 105)
+        $script:lblAiKeyStatus.Text = 'Ask the assistant for online troubleshooting, or search saved BMS flows, important links, and recent log activity.'
+        $script:lblAiKeyStatus.ForeColor = if ((Get-Variable -Name ThemeColors -Scope Script -ErrorAction SilentlyContinue) -and $script:ThemeColors -and $script:ThemeColors.Muted) { $script:ThemeColors.Muted } else { [System.Drawing.Color]::FromArgb(80, 90, 105) }
     }
 
     if ((Get-Variable -Name lblAiAdminHint -Scope Script -ErrorAction SilentlyContinue) -and $script:lblAiAdminHint) {
         $script:lblAiAdminHint.Visible = $true
-        $script:lblAiAdminHint.Text = 'This search stays inside the toolkit and does not rely on external AI services.'
     }
 }
 
 function Save-AiSettings {
-    Add-Log -Area 'AI Copilot' -Level 'INFO' -Message 'AI settings UI is disabled in this build.'
+    Add-Log -Area 'AI Assistant' -Level 'INFO' -Message 'AI settings UI is disabled in this build.'
 }
 
 function Clear-StoredAiKey {
@@ -2977,7 +4246,7 @@ function Clear-StoredAiKey {
     }
     Save-Config
     Update-AiSettingsUi
-    Add-Log -Area 'AI Copilot' -Level 'WARN' -Message 'Removed the locally stored AI key value from the loaded config.'
+    Add-Log -Area 'AI Assistant' -Level 'WARN' -Message 'Removed the locally stored AI key value from the loaded config.'
 }
 
 function Export-ToolkitLog {
@@ -2995,6 +4264,148 @@ function Export-ToolkitLog {
     }
 }
 
+function Check-ToolkitUpdates {
+    param([switch]$Silent, $Release)
+
+    try {
+        $headers = @{ 'User-Agent' = 'TEC-Systems-Field-Toolkit' }
+        $release = if ($Release) { $Release } else { Invoke-RestMethod -Uri 'https://api.github.com/repos/TEC-Systems/Technician-Field-Tool-Kit/releases/latest' -Headers $headers -TimeoutSec 8 -ErrorAction Stop }
+        $latestText = [string]$release.tag_name -replace '^v', ''
+        $latest = [version]$latestText
+        $current = [version]$script:ToolkitVersion
+        if ($latest -le $current) {
+            if (-not $Silent) { [System.Windows.Forms.MessageBox]::Show('This toolkit is up to date.', 'Toolkit Updates') | Out-Null }
+            return
+        }
+        $setup = @($release.assets | Where-Object { $_.name -eq 'TEC-Systems-FieldToolkit-Setup.exe' } | Select-Object -First 1)
+        $sums = @($release.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' } | Select-Object -First 1)
+        if (-not $setup -or -not $sums) { throw 'The newest release does not contain a verified installer yet.' }
+        $message = "Version $latestText is available (installed: $($script:ToolkitVersion))."
+        $notes = [string]$release.body
+        if ($notes) {
+            if ($notes.Length -gt 900) { $notes = $notes.Substring(0, 900) + '...' }
+            $message += "`r`n`r`nWhat's new:`r`n$notes"
+        }
+        $message += "`r`n`r`nDownload and install it now?"
+        if ([System.Windows.Forms.MessageBox]::Show($message, 'Toolkit Update Available', 'YesNo', 'Information') -ne 'Yes') { return }
+        $folder = Join-Path -Path $env:TEMP -ChildPath ('TEC-FieldToolkit-Update-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        $setupPath = Join-Path -Path $folder -ChildPath 'TEC-Systems-FieldToolkit-Setup.exe'
+        $sumsPath = Join-Path -Path $folder -ChildPath 'SHA256SUMS.txt'
+        Invoke-WebRequest -Uri $setup.browser_download_url -Headers $headers -OutFile $setupPath -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        Invoke-WebRequest -Uri $sums.browser_download_url -Headers $headers -OutFile $sumsPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        $expected = @((Get-Content -LiteralPath $sumsPath) | Where-Object { $_ -match '^([a-fA-F0-9]{64})\s+TEC-Systems-FieldToolkit-Setup\.exe$' } | Select-Object -First 1)
+        if (-not $expected) { throw 'The release checksum file does not list the installer.' }
+        $expectedHash = ([regex]::Match($expected[0], '^[a-fA-F0-9]{64}')).Value
+        $actualHash = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash
+        if ($actualHash -ne $expectedHash) { throw 'Installer checksum mismatch. The update was not started.' }
+        Add-Log -Area 'Updates' -Level 'OK' -Message ("Verified version {0} installer." -f $latestText)
+        Start-Process -FilePath $setupPath | Out-Null
+        Exit-Toolkit
+    }
+    catch {
+        $message = $_.Exception.Message
+        if ($message -match '404|Not Found') { $message = 'No published installer release is available yet.' }
+        if (-not $Silent) {
+            Add-Log -Area 'Updates' -Level 'WARN' -Message $message
+            [System.Windows.Forms.MessageBox]::Show($message, 'Toolkit Updates') | Out-Null
+        }
+    }
+}
+
+function Start-ToolkitUpdateCheck {
+    if ($script:updateJob) { return }
+    $script:updateJob = Start-Job -ScriptBlock {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-RestMethod -Uri 'https://api.github.com/repos/TEC-Systems/Technician-Field-Tool-Kit/releases/latest' -Headers @{ 'User-Agent' = 'TEC-Systems-Field-Toolkit' } -TimeoutSec 8 -ErrorAction Stop
+        }
+        catch { }
+    }
+    $script:updateTimer.Start()
+}
+
+function Complete-ToolkitUpdateCheck {
+    if (-not $script:updateJob -or $script:updateJob.State -eq 'Running') { return }
+    $script:updateTimer.Stop()
+    try {
+        $release = @(Receive-Job -Job $script:updateJob -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($release) { Check-ToolkitUpdates -Silent -Release $release[0] }
+    }
+    finally {
+        Remove-Job -Job $script:updateJob -Force -ErrorAction SilentlyContinue
+        $script:updateJob = $null
+    }
+}
+
+function Add-ToolkitZipText {
+    param($Archive, [string]$Name, [string]$Content)
+
+    $entry = $Archive.CreateEntry($Name)
+    $stream = $entry.Open()
+    try {
+        $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+        try { $writer.Write($Content) } finally { $writer.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
+function Export-ToolkitSupportBundle {
+    Invoke-UiAction -Name 'Export Support Bundle' -Action {
+        $kind = [string]$script:cboBundleType.SelectedItem
+        if (-not (Confirm-Action -Title 'Export Diagnostic Data' -Message 'This package may contain computer names, IP addresses, usernames, and Windows event details. Review it before sharing. Continue?')) { return }
+        $dialog = New-Object System.Windows.Forms.SaveFileDialog
+        $dialog.Title = 'Save technician support bundle'
+        $dialog.Filter = 'ZIP package (*.zip)|*.zip'
+        $dialog.FileName = ('TEC_FieldToolkit_{0}_{1:yyyyMMdd_HHmmss}.zip' -f $kind, (Get-Date))
+        if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+        Add-Type -AssemblyName System.IO.Compression
+        $file = [System.IO.File]::Open($dialog.FileName, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+        try {
+            $archive = New-Object System.IO.Compression.ZipArchive($file, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+            try {
+                Add-ToolkitZipText -Archive $archive -Name 'README.txt' -Content ("TEC Systems Field Toolkit support bundle`r`nComputer: {0}`r`nCreated: {1:u}`r`nType: {2}`r`nReview contents before sharing.`r`n" -f $env:COMPUTERNAME, (Get-Date), $kind)
+                Add-ToolkitZipText -Archive $archive -Name 'toolkit.log' -Content ([System.IO.File]::ReadAllText($script:LogFile))
+                if ($kind -in @('Network', 'Both')) {
+                    foreach ($command in @(
+                        @{ Name = 'ipconfig-all.txt'; File = 'ipconfig.exe'; Args = @('/all') },
+                        @{ Name = 'route-print.txt'; File = 'route.exe'; Args = @('print') },
+                        @{ Name = 'arp-cache.txt'; File = 'arp.exe'; Args = @('-a') },
+                        @{ Name = 'netsh-ipv4.txt'; File = 'netsh.exe'; Args = @('interface', 'ipv4', 'show', 'config') }
+                    )) {
+                        try {
+                            $commandArgs = $command.Args
+                            $lines = & $command.File @commandArgs 2>&1 | Out-String
+                            Add-ToolkitZipText -Archive $archive -Name $command.Name -Content $lines
+                        }
+                        catch { Add-ToolkitZipText -Archive $archive -Name $command.Name -Content $_.Exception.Message }
+                    }
+                }
+                if ($kind -in @('Windows', 'Both')) {
+                    foreach ($eventLog in @('System', 'Application')) {
+                        try {
+                            $events = Get-WinEvent -LogName $eventLog -MaxEvents 150 -ErrorAction Stop |
+                                Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+                                ConvertTo-Csv -NoTypeInformation
+                            Add-ToolkitZipText -Archive $archive -Name ("events-{0}.csv" -f $eventLog.ToLowerInvariant()) -Content ($events -join "`r`n")
+                        }
+                        catch { Add-ToolkitZipText -Archive $archive -Name ("events-{0}.txt" -f $eventLog.ToLowerInvariant()) -Content $_.Exception.Message }
+                    }
+                    try {
+                        $system = Get-WmiObject Win32_OperatingSystem -ErrorAction Stop | Format-List Caption, Version, BuildNumber, LastBootUpTime | Out-String
+                        Add-ToolkitZipText -Archive $archive -Name 'windows-summary.txt' -Content $system
+                    }
+                    catch { Add-ToolkitZipText -Archive $archive -Name 'windows-summary.txt' -Content $_.Exception.Message }
+                }
+            }
+            finally { $archive.Dispose() }
+        }
+        finally { $file.Dispose() }
+        Add-Log -Area 'Support Bundle' -Level 'OK' -Message ("Exported {0} package: {1}" -f $kind, $dialog.FileName)
+    }
+}
+
 function Clear-VisibleLog {
     if (-not (Confirm-Action -Title 'Clear Visible Log' -Message 'Clear the on-screen technician log view? The saved log file will remain on disk.')) {
         return
@@ -3009,26 +4420,192 @@ function Refresh-ThemePalette {
 
     if ($DarkMode) {
         $script:ThemeColors = @{
-            Background = [System.Drawing.Color]::FromArgb(17, 24, 39)
-            Panel = [System.Drawing.Color]::FromArgb(31, 41, 55)
-            Surface = [System.Drawing.Color]::FromArgb(30, 41, 59)
-            Text = [System.Drawing.Color]::FromArgb(241, 245, 249)
-            Muted = [System.Drawing.Color]::FromArgb(148, 163, 184)
-            Accent = [System.Drawing.Color]::FromArgb(59, 130, 246)
-            ReadOnly = [System.Drawing.Color]::FromArgb(15, 23, 42)
+            IsDark = $true
+            Background = [System.Drawing.Color]::FromArgb(8, 14, 26)
+            Panel = [System.Drawing.Color]::FromArgb(15, 24, 42)
+            Surface = [System.Drawing.Color]::FromArgb(23, 35, 61)
+            SurfaceAlt = [System.Drawing.Color]::FromArgb(19, 30, 52)
+            Header = [System.Drawing.Color]::FromArgb(12, 22, 40)
+            Footer = [System.Drawing.Color]::FromArgb(10, 18, 33)
+            ReadOnly = [System.Drawing.Color]::FromArgb(12, 20, 36)
+            Text = [System.Drawing.Color]::FromArgb(237, 243, 255)
+            Muted = [System.Drawing.Color]::FromArgb(151, 166, 194)
+            Accent = [System.Drawing.Color]::FromArgb(79, 152, 255)
+            AccentHover = [System.Drawing.Color]::FromArgb(57, 134, 244)
+            AccentPressed = [System.Drawing.Color]::FromArgb(43, 114, 216)
+            Success = [System.Drawing.Color]::FromArgb(31, 154, 116)
+            SuccessHover = [System.Drawing.Color]::FromArgb(39, 174, 132)
+            SuccessPressed = [System.Drawing.Color]::FromArgb(24, 132, 98)
+            Warning = [System.Drawing.Color]::FromArgb(212, 132, 52)
+            WarningHover = [System.Drawing.Color]::FromArgb(227, 149, 69)
+            WarningPressed = [System.Drawing.Color]::FromArgb(186, 112, 36)
+            Secondary = [System.Drawing.Color]::FromArgb(55, 71, 102)
+            SecondaryHover = [System.Drawing.Color]::FromArgb(69, 88, 122)
+            SecondaryPressed = [System.Drawing.Color]::FromArgb(46, 60, 86)
+            Danger = [System.Drawing.Color]::FromArgb(154, 78, 96)
+            DangerHover = [System.Drawing.Color]::FromArgb(176, 92, 112)
+            DangerPressed = [System.Drawing.Color]::FromArgb(132, 64, 82)
+            Border = [System.Drawing.Color]::FromArgb(44, 60, 88)
         }
     }
     else {
         $script:ThemeColors = @{
+            IsDark = $false
             Background = [System.Drawing.Color]::FromArgb(241, 245, 249)
             Panel = [System.Drawing.Color]::White
             Surface = [System.Drawing.Color]::White
+            SurfaceAlt = [System.Drawing.Color]::White
+            Header = [System.Drawing.Color]::White
+            Footer = [System.Drawing.Color]::FromArgb(241, 245, 249)
             Text = [System.Drawing.Color]::FromArgb(33, 43, 54)
             Muted = [System.Drawing.Color]::FromArgb(92, 105, 120)
             Accent = [System.Drawing.Color]::FromArgb(17, 64, 255)
+            AccentHover = [System.Drawing.Color]::FromArgb(12, 47, 190)
+            AccentPressed = [System.Drawing.Color]::FromArgb(8, 36, 150)
+            Success = [System.Drawing.Color]::FromArgb(45, 130, 80)
+            SuccessHover = [System.Drawing.Color]::FromArgb(35, 102, 62)
+            SuccessPressed = [System.Drawing.Color]::FromArgb(26, 78, 48)
+            Warning = [System.Drawing.Color]::FromArgb(185, 95, 35)
+            WarningHover = [System.Drawing.Color]::FromArgb(150, 70, 25)
+            WarningPressed = [System.Drawing.Color]::FromArgb(125, 56, 18)
+            Secondary = [System.Drawing.Color]::FromArgb(80, 100, 125)
+            SecondaryHover = [System.Drawing.Color]::FromArgb(60, 78, 98)
+            SecondaryPressed = [System.Drawing.Color]::FromArgb(50, 67, 83)
+            Danger = [System.Drawing.Color]::FromArgb(95, 105, 120)
+            DangerHover = [System.Drawing.Color]::FromArgb(70, 80, 95)
+            DangerPressed = [System.Drawing.Color]::FromArgb(58, 67, 80)
             ReadOnly = [System.Drawing.Color]::White
+            Border = [System.Drawing.Color]::FromArgb(210, 218, 229)
         }
     }
+}
+
+function Get-ButtonThemeRole {
+    param(
+        [string]$Text,
+        [System.Drawing.Color]$BackColor
+    )
+
+    $label = ([string]$Text).ToLowerInvariant()
+    if ($label -match 'delete|clear|remove') {
+        return 'Danger'
+    }
+
+    switch ($BackColor.ToArgb()) {
+        ([System.Drawing.Color]::FromArgb(45, 130, 80).ToArgb()) { return 'Success' }
+        ([System.Drawing.Color]::FromArgb(185, 95, 35).ToArgb()) { return 'Warning' }
+        ([System.Drawing.Color]::FromArgb(80, 100, 125).ToArgb()) { return 'Secondary' }
+        ([System.Drawing.Color]::FromArgb(95, 105, 120).ToArgb()) { return 'Danger' }
+        default { return 'Accent' }
+    }
+}
+
+function Get-ButtonThemeStyle {
+    param(
+        [string]$Role,
+        $Button
+    )
+
+    $theme = $script:ThemeColors
+    $isDark = [bool]$theme.IsDark
+
+    if (-not $isDark) {
+        $baseBackColor = if ($Button.PSObject.Properties['BaseBackColor']) { [System.Drawing.Color]$Button.BaseBackColor } else { $theme.Accent }
+        $baseHoverColor = if ($Button.PSObject.Properties['BaseHoverColor']) { [System.Drawing.Color]$Button.BaseHoverColor } else { $theme.AccentHover }
+        return [pscustomobject]@{
+            BackColor = $baseBackColor
+            HoverColor = $baseHoverColor
+            PressedColor = $baseHoverColor
+            ForeColor = [System.Drawing.Color]::White
+            BorderColor = $baseBackColor
+            BorderSize = 0
+        }
+    }
+
+    switch ($Role) {
+        'Success' {
+            return [pscustomobject]@{
+                BackColor = $theme.Success
+                HoverColor = $theme.SuccessHover
+                PressedColor = $theme.SuccessPressed
+                ForeColor = [System.Drawing.Color]::White
+                BorderColor = $theme.Border
+                BorderSize = 1
+            }
+        }
+        'Warning' {
+            return [pscustomobject]@{
+                BackColor = $theme.Warning
+                HoverColor = $theme.WarningHover
+                PressedColor = $theme.WarningPressed
+                ForeColor = [System.Drawing.Color]::White
+                BorderColor = $theme.Border
+                BorderSize = 1
+            }
+        }
+        'Secondary' {
+            return [pscustomobject]@{
+                BackColor = $theme.Secondary
+                HoverColor = $theme.SecondaryHover
+                PressedColor = $theme.SecondaryPressed
+                ForeColor = [System.Drawing.Color]::White
+                BorderColor = $theme.Border
+                BorderSize = 1
+            }
+        }
+        'Danger' {
+            return [pscustomobject]@{
+                BackColor = $theme.Danger
+                HoverColor = $theme.DangerHover
+                PressedColor = $theme.DangerPressed
+                ForeColor = [System.Drawing.Color]::White
+                BorderColor = $theme.Border
+                BorderSize = 1
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                BackColor = $theme.Accent
+                HoverColor = $theme.AccentHover
+                PressedColor = $theme.AccentPressed
+                ForeColor = [System.Drawing.Color]::White
+                BorderColor = $theme.Border
+                BorderSize = 1
+            }
+        }
+    }
+}
+
+function Apply-ThemeToButton {
+    param($Button)
+
+    if (-not $Button) {
+        return
+    }
+
+    $role = if ($Button.PSObject.Properties['ThemeRole']) { [string]$Button.ThemeRole } else { 'Accent' }
+    $style = Get-ButtonThemeStyle -Role $role -Button $Button
+
+    if ($Button.PSObject.Properties['CurrentBackColor']) {
+        $Button.CurrentBackColor = $style.BackColor
+    }
+    else {
+        $Button | Add-Member -NotePropertyName CurrentBackColor -NotePropertyValue $style.BackColor -Force
+    }
+
+    if ($Button.PSObject.Properties['CurrentHoverColor']) {
+        $Button.CurrentHoverColor = $style.HoverColor
+    }
+    else {
+        $Button | Add-Member -NotePropertyName CurrentHoverColor -NotePropertyValue $style.HoverColor -Force
+    }
+
+    $Button.BackColor = $style.BackColor
+    $Button.ForeColor = $style.ForeColor
+    $Button.FlatAppearance.BorderSize = $style.BorderSize
+    $Button.FlatAppearance.BorderColor = $style.BorderColor
+    $Button.FlatAppearance.MouseOverBackColor = $style.HoverColor
+    $Button.FlatAppearance.MouseDownBackColor = $style.PressedColor
 }
 
 function Apply-ThemeToControl {
@@ -3060,8 +4637,16 @@ function Apply-ThemeToControl {
             $Control.BackColor = $theme.Panel
             $Control.ForeColor = $theme.Text
         }
-        'System.Windows.Forms.Label' {
+        'System.Windows.Forms.FlowLayoutPanel' {
+            $Control.BackColor = $theme.Panel
             $Control.ForeColor = $theme.Text
+        }
+        'System.Windows.Forms.Button' {
+            Apply-ThemeToButton -Button $Control
+        }
+        'System.Windows.Forms.Label' {
+            $tone = if ($Control.PSObject.Properties['ThemeTone']) { [string]$Control.ThemeTone } else { 'Normal' }
+            $Control.ForeColor = if ($tone -eq 'Muted') { $theme.Muted } else { $theme.Text }
             if ($Control.Parent) {
                 $Control.BackColor = $Control.Parent.BackColor
             }
@@ -3080,6 +4665,7 @@ function Apply-ThemeToControl {
         'System.Windows.Forms.ListBox' {
             $Control.BackColor = $theme.Surface
             $Control.ForeColor = $theme.Text
+            $Control.BorderStyle = 'FixedSingle'
         }
         'System.Windows.Forms.TreeView' {
             $Control.BackColor = $theme.Surface
@@ -3093,6 +4679,7 @@ function Apply-ThemeToControl {
         'System.Windows.Forms.ComboBox' {
             $Control.BackColor = $theme.Surface
             $Control.ForeColor = $theme.Text
+            $Control.FlatStyle = 'Flat'
         }
         'System.Windows.Forms.TabControl' {
             $Control.BackColor = $theme.Panel
@@ -3125,10 +4712,19 @@ function Apply-Theme {
     }
 
     if ((Get-Variable -Name header -Scope Script -ErrorAction SilentlyContinue) -and $script:header) {
-        $script:header.BackColor = $script:ThemeColors.Panel
+        $script:header.BackColor = $script:ThemeColors.Header
     }
     if ((Get-Variable -Name footer -Scope Script -ErrorAction SilentlyContinue) -and $script:footer) {
-        $script:footer.BackColor = $script:ThemeColors.Background
+        $script:footer.BackColor = $script:ThemeColors.Footer
+    }
+    if ((Get-Variable -Name leftPanel -Scope Script -ErrorAction SilentlyContinue) -and $script:leftPanel) {
+        $script:leftPanel.BackColor = $script:ThemeColors.Panel
+    }
+    if ((Get-Variable -Name rightPanel -Scope Script -ErrorAction SilentlyContinue) -and $script:rightPanel) {
+        $script:rightPanel.BackColor = $script:ThemeColors.SurfaceAlt
+    }
+    if ((Get-Variable -Name pnlLogActions -Scope Script -ErrorAction SilentlyContinue) -and $script:pnlLogActions) {
+        $script:pnlLogActions.BackColor = $script:ThemeColors.SurfaceAlt
     }
 
     if ((Get-Variable -Name lblTitle -Scope Script -ErrorAction SilentlyContinue) -and $script:lblTitle) {
@@ -3140,8 +4736,11 @@ function Apply-Theme {
     if ((Get-Variable -Name lblHost -Scope Script -ErrorAction SilentlyContinue) -and $script:lblHost) {
         $script:lblHost.ForeColor = $script:ThemeColors.Text
     }
-    if ((Get-Variable -Name lblNinja -Scope Script -ErrorAction SilentlyContinue) -and $script:lblNinja) {
-        $script:lblNinja.ForeColor = $script:ThemeColors.Muted
+    if ((Get-Variable -Name lblHeaderSearch -Scope Script -ErrorAction SilentlyContinue) -and $script:lblHeaderSearch) {
+        $script:lblHeaderSearch.ForeColor = $script:ThemeColors.Muted
+    }
+    if ((Get-Variable -Name lblLogTitle -Scope Script -ErrorAction SilentlyContinue) -and $script:lblLogTitle) {
+        $script:lblLogTitle.ForeColor = $script:ThemeColors.Text
     }
     if ((Get-Variable -Name btnThemeToggle -Scope Script -ErrorAction SilentlyContinue) -and $script:btnThemeToggle) {
         $script:btnThemeToggle.Text = if ($DarkMode) { 'Light Mode' } else { 'Dark Mode' }
@@ -3332,7 +4931,7 @@ function Invoke-OpenAiWebSearch {
                     $delay = $fallbackDelays[$attempt - 1]
                 }
 
-                Add-Log -Area 'AI Copilot' -Level 'WARN' -Message ("OpenAI rate limit hit. Waiting {0} seconds before retry {1} of {2}." -f $delay, ($attempt + 1), $maxAttempts)
+                Add-Log -Area 'AI Assistant' -Level 'WARN' -Message ("OpenAI rate limit hit. Waiting {0} seconds before retry {1} of {2}." -f $delay, ($attempt + 1), $maxAttempts)
                 Start-Sleep -Seconds $delay
                 continue
             }
@@ -3421,7 +5020,7 @@ function Invoke-ToolkitKnowledgeSearch {
         }
     }
 
-    if ($bmsMatches.Count -gt 0) {
+    if (@($bmsMatches).Count -gt 0) {
         $lines += 'BMS matches'
         $lines += ($bmsMatches | Select-Object -Unique | ForEach-Object { '- ' + $_ })
         $lines += ''
@@ -3437,23 +5036,9 @@ function Invoke-ToolkitKnowledgeSearch {
         }
     }
 
-    if ($linkMatches.Count -gt 0) {
-        $lines += 'Important links and docs'
+    if (@($linkMatches).Count -gt 0) {
+        $lines += 'Important links'
         $lines += ($linkMatches | Select-Object -Unique | ForEach-Object { '- ' + $_ })
-        $lines += ''
-    }
-
-    $notesText = ''
-    if ((Get-Variable -Name txtNotes -Scope Script -ErrorAction SilentlyContinue) -and $script:txtNotes) {
-        $notesText = [string]$script:txtNotes.Text
-    }
-    elseif ($script:Config -and $script:Config.PSObject.Properties['Notes']) {
-        $notesText = [string]$script:Config.Notes
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($notesText) -and $notesText.ToLowerInvariant().Contains($queryLower)) {
-        $lines += 'Technician notes'
-        $lines += '- The saved notes section contains this term.'
         $lines += ''
     }
 
@@ -3467,15 +5052,15 @@ function Invoke-ToolkitKnowledgeSearch {
         }
     }
 
-    if ($logMatches.Count -gt 0) {
+    if (@($logMatches).Count -gt 0) {
         $lines += 'Recent log matches'
         $lines += ($logMatches | Select-Object -Last 6 | ForEach-Object { '- ' + $_ })
         $lines += ''
     }
 
     $bulletLines = @($lines | Where-Object { $_ -match '^-' })
-    if ($bulletLines.Count -eq 0) {
-        $lines += 'No direct matches were found in saved flows, links, notes, or the current log.'
+    if (@($bulletLines).Count -eq 0) {
+        $lines += 'No direct matches were found in saved flows, important links, or the current log.'
         $lines += 'Try a shorter keyword, server name, site name, or issue phrase.'
     }
     else {
@@ -3483,11 +5068,11 @@ function Invoke-ToolkitKnowledgeSearch {
         if ($firstBmsMatch) {
             $lines += ('- Open BMS topic "{0}" and continue from the matched step.' -f $firstBmsMatch.Category)
         }
-        elseif ($linkMatches.Count -gt 0) {
+        elseif (@($linkMatches).Count -gt 0) {
             $lines += '- Open the matching link or document and confirm the latest site standard.'
         }
         else {
-            $lines += '- Review the matching log entries and notes, then continue troubleshooting from the closest matching step.'
+            $lines += '- Review the matching log entries, then continue troubleshooting from the closest matching step.'
         }
     }
 
@@ -3503,7 +5088,7 @@ function Invoke-ToolkitKnowledgeSearch {
 function Open-AiGoogleSearch {
     param([string]$Query)
 
-    Invoke-UiAction -Name 'Google Search' -Action {
+    Invoke-UiAction -Name 'Open Web Search' -Action {
         $searchText = $Query
         if ([string]::IsNullOrWhiteSpace($searchText) -and
             (Get-Variable -Name txtAiPrompt -Scope Script -ErrorAction SilentlyContinue) -and
@@ -3512,16 +5097,22 @@ function Open-AiGoogleSearch {
         }
 
         if ([string]::IsNullOrWhiteSpace($searchText)) {
-            throw 'Enter a question or keyword before using Google search.'
+            Add-Log -Area 'Open Web Search' -Level 'WARN' -Message 'Enter a question or keyword before opening web search.'
+            Set-MainStatus -Text 'Enter a search term first' -Color ([System.Drawing.Color]::FromArgb(190, 120, 45))
+            Schedule-StatusReset
+            return
         }
         if (-not (Test-InternetConnection)) {
-            throw 'Google search needs an internet connection.'
+            Add-Log -Area 'Open Web Search' -Level 'WARN' -Message 'Web search needs an internet connection.'
+            Set-MainStatus -Text 'Internet connection needed' -Color ([System.Drawing.Color]::FromArgb(190, 120, 45))
+            Schedule-StatusReset
+            return
         }
 
         $encoded = [System.Uri]::EscapeDataString($searchText)
         $url = 'https://www.google.com/search?q={0}' -f $encoded
         Start-Process -FilePath $url
-        Add-Log -Area 'AI Copilot' -Level 'OK' -Message ("Opened Google search for: {0}" -f $searchText)
+        Add-Log -Area 'AI Assistant' -Level 'OK' -Message ("Opened web search for: {0}" -f $searchText)
     }
 }
 
@@ -3560,6 +5151,122 @@ function Get-RecentToolkitLogText {
     return ($lines -join [Environment]::NewLine)
 }
 
+function Get-OnlineTroubleshootingUrl {
+    if (-not [string]::IsNullOrWhiteSpace($env:TEC_FIELD_TOOLKIT_BACKEND_URL)) {
+        return $env:TEC_FIELD_TOOLKIT_BACKEND_URL.Trim()
+    }
+    if ($script:Config -and $script:Config.PSObject.Properties['OnlineTroubleshootingUrl'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$script:Config.OnlineTroubleshootingUrl)) {
+        return ([string]$script:Config.OnlineTroubleshootingUrl).Trim()
+    }
+
+    return 'http://127.0.0.1:8787/troubleshoot'
+}
+
+function Get-OnlineTroubleshootingHealthUrl {
+    $backendUrl = Get-OnlineTroubleshootingUrl
+    if ([string]::IsNullOrWhiteSpace($backendUrl)) {
+        return ''
+    }
+
+    $trimmed = $backendUrl.Trim()
+    if ($trimmed -match '/troubleshoot/?$') {
+        return ($trimmed -replace '/troubleshoot/?$', '/health')
+    }
+
+    return ($trimmed.TrimEnd('/') + '/health')
+}
+
+function Refresh-OnlineTroubleshootingStatus {
+    if (-not ((Get-Variable -Name lblAiAdminHint -Scope Script -ErrorAction SilentlyContinue) -and $script:lblAiAdminHint)) {
+        return
+    }
+
+    $script:lblAiAdminHint.Text = 'Service: Checking online troubleshooting backend...'
+    $script:lblAiAdminHint.ForeColor = if ($script:ThemeColors -and $script:ThemeColors.Muted) { $script:ThemeColors.Muted } else { $colorMuted }
+    [System.Windows.Forms.Application]::DoEvents()
+
+    try {
+        $healthUrl = Get-OnlineTroubleshootingHealthUrl
+        if ([string]::IsNullOrWhiteSpace($healthUrl)) {
+            throw 'No backend health URL is configured.'
+        }
+
+        $health = Invoke-RestMethod -Method Get -Uri $healthUrl -TimeoutSec 2 -ErrorAction Stop
+        if ($health -and $health.ok) {
+            $modelText = if ($health.PSObject.Properties['model'] -and $health.model) { [string]$health.model } else { 'Unknown model' }
+            $script:lblAiAdminHint.Text = ('Service: Online | Model: {0}' -f $modelText)
+            $script:lblAiAdminHint.ForeColor = [System.Drawing.Color]::FromArgb(45, 130, 80)
+            return
+        }
+
+        throw 'Health check returned an unexpected response.'
+    }
+    catch {
+        $script:lblAiAdminHint.Text = 'Service: Offline | local toolkit guidance is still available'
+        $script:lblAiAdminHint.ForeColor = [System.Drawing.Color]::FromArgb(190, 120, 45)
+    }
+}
+
+function Invoke-OnlineTroubleshootingBackend {
+    param([string]$Prompt)
+
+    $backendUrl = Get-OnlineTroubleshootingUrl
+    if ([string]::IsNullOrWhiteSpace($backendUrl)) {
+        throw 'No online troubleshooting service URL is configured.'
+    }
+
+    $payload = [ordered]@{
+        issue = $Prompt
+        hostname = $env:COMPUTERNAME
+        internet_status = if ($script:lblInternet) { $script:lblInternet.Text } else { 'Unknown' }
+        bms_context = Get-BmsAiContextText
+        recent_log = Get-RecentToolkitLogText
+        adapter = if ((Get-Variable -Name cboAdapter -Scope Script -ErrorAction SilentlyContinue) -and $script:cboAdapter -and $script:cboAdapter.SelectedItem) { [string]$script:cboAdapter.SelectedItem } else { '' }
+    }
+
+    $json = $payload | ConvertTo-Json -Depth 6
+    return Invoke-RestMethod -Method Post -Uri $backendUrl -ContentType 'application/json' -Body $json -TimeoutSec 90 -ErrorAction Stop
+}
+
+function Format-OnlineTroubleshootingResponse {
+    param($Response)
+
+    if (-not $Response) {
+        return 'The online troubleshooting service returned an empty response.'
+    }
+
+    $lines = @()
+    if ($Response.answer) {
+        $lines += [string]$Response.answer
+    }
+    elseif ($Response.output_text) {
+        $lines += [string]$Response.output_text
+    }
+
+    $sources = @()
+    if ($Response.sources) {
+        foreach ($source in @($Response.sources)) {
+            if ($source -is [string]) {
+                $sources += $source
+            }
+            elseif ($source.PSObject.Properties['url']) {
+                $title = if ($source.PSObject.Properties['title'] -and $source.title) { [string]$source.title } else { [string]$source.url }
+                $sources += ('{0} - {1}' -f $title, [string]$source.url)
+            }
+        }
+    }
+
+    $sources = @($sources | Select-Object -Unique)
+    if ($sources.Count -gt 0) {
+        $lines += ''
+        $lines += 'Sources'
+        $lines += ($sources | ForEach-Object { '- ' + $_ })
+    }
+
+    return ($lines -join [Environment]::NewLine)
+}
+
 function Build-AiCopilotResponse {
     param([string]$Prompt)
 
@@ -3591,7 +5298,7 @@ function Build-AiCopilotResponse {
         $response += '2. Compare ping by hostname versus ping by IP.'
         $response += '3. Review DNS 1 / DNS 2 on the selected adapter.'
         $response += '4. If hostname fails but IP works, document the failing name and current DNS servers.'
-        $response += '5. Use Important Links and Docs for site-specific naming standards or server sheets.'
+        $response += '5. Use Important Links for site-specific naming standards or server sheets.'
     }
     elseif ($promptLower -match 'ip|adapter|network|subnet|gateway|dhcp') {
         $response += 'Focus: Adapter / IP profile'
@@ -3647,7 +5354,7 @@ function Build-AiCopilotResponse {
         $response += '2. Capture the exact symptom: not pingable, web not loading, point server unavailable, alarms not sending, or user access issue.'
         $response += '3. Confirm laptop network profile first, then verify server reachability, then application-specific checks.'
         $response += '4. If the issue does not fit the current flow, use Admin Mode later to add the missing branch so the next technician benefits.'
-        $response += '5. Capture a screenshot and note the failed step for escalation or documentation.'
+        $response += '5. Record the failed step and current server or network state in the technician log before escalation.'
     }
     elseif ($promptLower -match 'log|summary|what happened') {
         $response += 'Focus: Current toolkit activity'
@@ -3664,7 +5371,7 @@ function Build-AiCopilotResponse {
         $response += '1. Define the symptom in one sentence.'
         $response += '2. Confirm the correct network/IP profile.'
         $response += '3. Test reachability: gateway, target IP, target hostname, web, then RDP if relevant.'
-        $response += '4. Use the BMS flow for the structured branch and the log/screenshot tools to capture evidence.'
+        $response += '4. Use the BMS flow for the structured branch and the technician log to capture evidence.'
         $response += '5. If needed, convert the final resolution into a reusable BMS flow or Important Link entry.'
     }
 
@@ -3675,27 +5382,49 @@ function Build-AiCopilotResponse {
 }
 
 function Ask-AiCopilot {
-    Invoke-UiAction -Name 'AI Copilot' -Action {
+    Invoke-UiAction -Name 'AI Assistant' -Action {
         $prompt = $script:txtAiPrompt.Text.Trim()
         if ([string]::IsNullOrWhiteSpace($prompt)) {
-            throw 'Enter a search term or troubleshooting question.'
+            Add-Log -Area 'AI Assistant' -Level 'WARN' -Message 'Enter a troubleshooting question before asking the assistant.'
+            Set-MainStatus -Text 'Enter a troubleshooting question' -Color ([System.Drawing.Color]::FromArgb(190, 120, 45))
+            Schedule-StatusReset
+            return
         }
 
         Add-AiConversationMessage -Role 'Technician' -Text $prompt
-        $guidance = Build-AiCopilotResponse -Prompt $prompt
-        $knowledge = Invoke-ToolkitKnowledgeSearch -Prompt $prompt
-        $reply = @(
-            $guidance
-            ''
-            'Saved toolkit information'
-            $knowledge
-            ''
-            'Web search'
-            '- Use the Google search button for live web results when the saved toolkit data is not enough.'
-        ) -join [Environment]::NewLine
-        Add-AiConversationMessage -Role 'Copilot' -Text $reply
+
+        try {
+            $onlineResponse = Invoke-OnlineTroubleshootingBackend -Prompt $prompt
+            if ($onlineResponse.PSObject.Properties['ok'] -and -not [bool]$onlineResponse.ok) {
+                throw ([string]$onlineResponse.error)
+            }
+
+            $reply = Format-OnlineTroubleshootingResponse -Response $onlineResponse
+            if ([string]::IsNullOrWhiteSpace($reply)) {
+                throw 'The online troubleshooting service returned an empty answer.'
+            }
+
+            Add-AiConversationMessage -Role 'AI Assistant' -Text $reply
+            Add-Log -Area 'AI Assistant' -Level 'OK' -Message 'Returned online troubleshooting guidance from backend service.'
+            Refresh-OnlineTroubleshootingStatus
+        }
+        catch {
+            $guidance = Build-AiCopilotResponse -Prompt $prompt
+            $knowledge = Invoke-ToolkitKnowledgeSearch -Prompt $prompt
+            $reply = @(
+                'Online troubleshooting is currently unavailable, so the toolkit switched to local guidance.'
+                ''
+                $guidance
+                ''
+                'Saved toolkit information'
+                $knowledge
+            ) -join [Environment]::NewLine
+            Add-AiConversationMessage -Role 'AI Assistant' -Text $reply
+            Add-Log -Area 'AI Assistant' -Level 'WARN' -Message ('Online troubleshooting fallback used: {0}' -f $_.Exception.Message)
+            Refresh-OnlineTroubleshootingStatus
+        }
+
         $script:txtAiPrompt.Clear()
-        Add-Log -Area 'AI Copilot' -Level 'OK' -Message 'Generated local troubleshooting guidance and searched saved toolkit knowledge.'
     }
 }
 
@@ -3746,9 +5475,27 @@ function New-Button {
     $button.ForeColor = [System.Drawing.Color]::White
     $button.Font = $fontButton
     $button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $button | Add-Member -NotePropertyName ThemeRole -NotePropertyValue (Get-ButtonThemeRole -Text $Text -BackColor $BackColor) -Force
+    $button | Add-Member -NotePropertyName BaseBackColor -NotePropertyValue $BackColor -Force
+    $button | Add-Member -NotePropertyName BaseHoverColor -NotePropertyValue $HoverColor -Force
+    $button | Add-Member -NotePropertyName CurrentBackColor -NotePropertyValue $BackColor -Force
+    $button | Add-Member -NotePropertyName CurrentHoverColor -NotePropertyValue $HoverColor -Force
     $button.Add_Click($OnClick)
-    $button.Add_MouseEnter({ $this.BackColor = $HoverColor }.GetNewClosure())
-    $button.Add_MouseLeave({ $this.BackColor = $BackColor }.GetNewClosure())
+    $button.Add_MouseEnter({
+        if ($this.PSObject.Properties['CurrentHoverColor']) {
+            $this.BackColor = [System.Drawing.Color]$this.CurrentHoverColor
+        }
+    })
+    $button.Add_MouseLeave({
+        if ($this.PSObject.Properties['CurrentBackColor']) {
+            $this.BackColor = [System.Drawing.Color]$this.CurrentBackColor
+        }
+    })
+
+    if ((Get-Variable -Name ThemeColors -Scope Script -ErrorAction SilentlyContinue) -and $script:ThemeColors) {
+        Apply-ThemeToButton -Button $button
+    }
+
     return $button
 }
 
@@ -3760,7 +5507,149 @@ function New-Label {
     $label.Location = New-Object System.Drawing.Point($X, $Y)
     $label.Size = New-Object System.Drawing.Size($Width, 22)
     $label.ForeColor = $colorMuted
+    $label | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
     return $label
+}
+
+function Get-AllChildControls {
+    param($Root)
+
+    $all = @()
+    if (-not $Root) {
+        return $all
+    }
+
+    foreach ($child in @($Root.Controls)) {
+        $all += $child
+        $all += Get-AllChildControls -Root $child
+    }
+
+    return $all
+}
+
+function Apply-ToolTipsByButtonText {
+    param(
+        $Root,
+        [hashtable]$Descriptions
+    )
+
+    if (-not $Root -or -not $Descriptions -or -not $script:toolTip) {
+        return
+    }
+
+    foreach ($control in @(Get-AllChildControls -Root $Root)) {
+        if ($control -is [System.Windows.Forms.Button]) {
+            $label = [string]$control.Text
+            if ($Descriptions.ContainsKey($label)) {
+                $script:toolTip.SetToolTip($control, [string]$Descriptions[$label])
+            }
+        }
+    }
+}
+
+function Apply-TroubleshootingButtonToolTips {
+    if (-not $script:toolTip) {
+        return
+    }
+
+    $common = @{
+        'DNS Lookup' = 'Run a DNS name lookup to confirm whether a hostname resolves and which DNS server is answering.'
+        'ARP Cache' = 'Show the ARP table so you can see recent IP-to-MAC mappings on the local network.'
+        'Route Table' = 'Display local routing entries to confirm the system knows where traffic is supposed to go.'
+        'DNS Cache' = 'Review the local resolver cache to see what Windows recently resolved and stored.'
+        'Netstat' = 'List active connections and listening ports so you can confirm services, sessions, and listeners.'
+        'Firewall' = 'Summarize firewall state and profiles to check whether Windows filtering may be blocking traffic.'
+        'Update Status' = 'Check Windows Update and related services for common update or patching issues.'
+        'Adapter Details' = 'Show NIC status, configured IP, mask, gateway, DNS, MAC address, and DHCP state.'
+        'Open Webpage' = 'Open the current target in a browser to verify HTTP or HTTPS access quickly.'
+    }
+
+    $windowsDescriptions = @{
+        'Ping Terminal' = 'Open a live terminal ping against the current target. Use this when you want to watch replies and packet loss in real time.'
+        'System Summary' = 'Collect quick host details like model, OS, BIOS, uptime, and core system information.'
+        'Network Summary' = 'Log a compact network overview, including active adapters, IP information, and reachability context.'
+        'IPConfig /all' = 'Run the full Windows IP configuration output to inspect adapters, DHCP, DNS, suffixes, and leases.'
+        'Disk Summary' = 'Review drive usage and basic storage health so you can rule out disk-related issues.'
+        'Service Check' = 'Check important Windows services to confirm whether key services are stopped, missing, or unhealthy.'
+        'Event Errors' = 'Pull recent Windows event log errors to spot system or application problems quickly.'
+        'Problem Devices' = 'List hardware devices that Windows reports as having driver or Device Manager issues.'
+        'Flush DNS' = 'Clear the local DNS resolver cache before testing name resolution again.'
+        'Network Settings' = 'Open Windows Network Connections (`ncpa.cpl`) so you can inspect or change adapter settings.'
+        'Open RDP' = 'Launch Remote Desktop using the current RDP target.'
+        'Services' = 'Open the Services console to inspect service state, startup type, dependencies, and recovery options.'
+        'Event Viewer' = 'Open Event Viewer for a deeper look at system, application, and custom log errors.'
+        'Device Manager' = 'Open Device Manager to inspect adapters, drivers, hidden devices, and hardware problem codes.'
+        'Computer Mgmt' = 'Open Computer Management for Event Viewer, Shared Folders, Services, and Device Manager in one place.'
+        'Local Users' = 'Open Local Users and Groups so you can review or manage local accounts and group membership.'
+        'Programs' = 'Open Programs and Features to review installed software or remove problem applications.'
+        'System Props' = 'Open classic system properties for computer name, domain, hardware, performance, and remote settings.'
+        'Task Manager' = 'Open Task Manager for process, performance, startup, and user-session troubleshooting.'
+        'Command Prompt' = 'Open a CMD console for quick command-line diagnostics and vendor utilities.'
+        'PowerShell' = 'Open a PowerShell console for script-based diagnostics and administrative checks.'
+        'Task Scheduler' = 'Open Task Scheduler to review scheduled jobs, triggers, failures, and service account context.'
+        'Firewall Console' = 'Open the advanced firewall console for rule-level inspection, profiles, and logging.'
+        'Credential Mgr' = 'Open Credential Manager to inspect saved Windows, web, or RDP credentials.'
+        'Shared Folders' = 'Open the Shared Folders console to review active shares, sessions, and open files.'
+        'Windows Update' = 'Open Windows Update settings to review pending updates, failures, and restart requirements.'
+        'Remote Desktop' = 'Open Remote Desktop system settings to confirm whether this laptop allows inbound RDP.'
+        'Printers' = 'Open Devices and Printers to inspect printers, drivers, default devices, and print queues.'
+    }
+
+    $networkDescriptions = @{
+        'Ping Device' = 'Ping the entered device or host to confirm basic Layer 3 reachability.'
+        'Ping Gateway' = 'Ping the default gateway to verify the local subnet and upstream network path.'
+        'Tracert' = 'Trace the path to the destination hop by hop to find where traffic stops or changes path.'
+        'PathPing' = 'Combine route tracing and packet-loss testing for a deeper path-quality check.'
+        'Ping Switch' = 'Ping the switch management IP to confirm management-plane connectivity.'
+        'Switch Ports' = 'Test common management ports like HTTP, HTTPS, SSH, and SNMP to see what the switch is exposing.'
+        'Open Web UI' = 'Open the switch management page in a browser using the selected HTTP or HTTPS scheme.'
+        'SSH Terminal' = 'Launch an SSH session to the switch if OpenSSH is available on the laptop.'
+        'Baseline Snapshot' = 'Capture a quick network baseline so you have a before-state for troubleshooting notes.'
+        'Link Status' = 'Log adapter media state and connection details to confirm whether the laptop actually has link.'
+        'Neighbors' = 'Show neighbor information to help identify devices discovered on the local network.'
+        'Network Summary' = 'Log a compact overview of current adapters, IP addresses, gateways, and DNS.'
+        'IPConfig /all' = 'Show full Windows network configuration, including DHCP leases and DNS suffixes.'
+        'Flush DNS' = 'Clear the Windows DNS resolver cache before another name-resolution test.'
+        'Network Settings' = 'Open Network Connections to inspect or change adapter configuration.'
+        'Inspect Selected Adapter' = 'Show local NIC VLAN settings; the actual switch-port VLAN still needs switch-side confirmation.'
+        'Export ZIP' = 'Package selected network or Windows diagnostics and toolkit logs for review before sharing.'
+        'Managed Switch' = 'Load a playbook for switch models that expose VLANs, trunks, management IPs, and configurable ports.'
+        'Unmanaged Switch' = 'Load a playbook focused on simple switches where link, cable, power, and upstream path are the main checks.'
+        'MS/TP and IP' = 'Load a field checklist for mixed MS/TP and IP troubleshooting, including controllers, trunks, addressing, and gateways.'
+        'No Link Light' = 'Walk through a fast physical-layer checklist when there is no carrier or no visible link.'
+        'Wrong VLAN / IP' = 'Use a guided check for subnet mismatches, VLAN assignment problems, or wrong addressing.'
+        'Intermittent' = 'Load a playbook for issues that come and go, including packet loss, spanning tree, power, and upstream instability.'
+    }
+
+    foreach ($key in $common.Keys) {
+        $windowsDescriptions[$key] = $common[$key]
+        $networkDescriptions[$key] = $common[$key]
+    }
+
+    if ((Get-Variable -Name tabTrouble -Scope Script -ErrorAction SilentlyContinue) -and $script:tabTrouble) {
+        Apply-ToolTipsByButtonText -Root $script:tabTrouble -Descriptions $windowsDescriptions
+    }
+    if ((Get-Variable -Name tabNetwork -Scope Script -ErrorAction SilentlyContinue) -and $script:tabNetwork) {
+        Apply-ToolTipsByButtonText -Root $script:tabNetwork -Descriptions $networkDescriptions
+    }
+    if ((Get-Variable -Name tabIp -Scope Script -ErrorAction SilentlyContinue) -and $script:tabIp) {
+        Apply-ToolTipsByButtonText -Root $script:tabIp -Descriptions @{
+            'Refresh' = 'Refresh all network adapters, including disconnected interfaces and stored IPv4 configurations.'
+            'Details' = 'Write the selected adapter status, IP configuration, MAC, and DHCP state to the technician log.'
+            'Load Profile' = 'Fill the IP fields and select the adapter saved in the chosen profile.'
+            'Save Profile' = 'Save or update this named adapter, IP, gateway, and DNS profile for later use.'
+            'Delete Profile' = 'Delete the selected saved profile without changing Windows adapter settings.'
+            'Apply Static IP' = 'Confirm and apply the entered static IPv4 settings. Windows administrator rights are required.'
+            'Set DHCP' = 'Confirm and return the selected adapter to automatic IPv4 and DNS settings.'
+        }
+    }
+    if ((Get-Variable -Name tabScan -Scope Script -ErrorAction SilentlyContinue) -and $script:tabScan) {
+        Apply-ToolTipsByButtonText -Root $script:tabScan -Descriptions @{
+            'Scan' = 'Scan the selected IPv4 range using ping and common TCP service probes. Limited to 1,024 addresses.'
+            'Stop' = 'Stop the current scan without changing the network.'
+            'Export CSV' = 'Save found IPs, hostnames, ping times, MAC addresses where visible, and open common ports.'
+        }
+    }
 }
 
 function New-TextBox {
@@ -3775,15 +5664,354 @@ function New-TextBox {
 }
 
 # -------------------------------
+function ConvertTo-ScannerIpNumber {
+    param([string]$Address)
+    if ($Address -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { throw 'Enter a full dotted IPv4 address.' }
+    Test-IPv4AddressText -Value $Address -FieldName 'Scan address'
+    $bytes = [System.Net.IPAddress]::Parse($Address).GetAddressBytes()
+    return ([uint64]$bytes[0] * 16777216 + [uint64]$bytes[1] * 65536 + [uint64]$bytes[2] * 256 + [uint64]$bytes[3])
+}
+
+function ConvertFrom-ScannerIpNumber {
+    param([uint64]$Number)
+    return ('{0}.{1}.{2}.{3}' -f (($Number -shr 24) -band 255), (($Number -shr 16) -band 255), (($Number -shr 8) -band 255), ($Number -band 255))
+}
+
+function Select-ScannerAdapter {
+    if ($script:cboScanAdapter.SelectedIndex -lt 0) { return }
+    $adapter = $script:AdapterList[$script:cboScanAdapter.SelectedIndex]
+    if ($adapter.Status -ne 'Connected' -or $adapter.IPText -eq 'No IP') {
+        $script:lblScanScope.Text = 'This adapter is not connected. Select a connected adapter or enter a range manually.'
+        return
+    }
+    try {
+        $ip = ($adapter.IPText -split ',')[0].Trim()
+        $mask = ($adapter.MaskText -split ',')[0].Trim()
+        $ipNumber = ConvertTo-ScannerIpNumber $ip
+        $maskNumber = ConvertTo-ScannerIpNumber $mask
+        $network = $ipNumber -band $maskNumber
+        $broadcast = $network -bor ([uint64]4294967295 -bxor $maskNumber)
+        $first = $network + 1
+        $last = $broadcast - 1
+        if ($last -lt $first) { $first = $ipNumber; $last = $ipNumber }
+        if (($last - $first + 1) -gt 254) {
+            $first = [Math]::Max($first, $ipNumber - 126)
+            $last = [Math]::Min($last, $first + 253)
+            $script:lblScanScope.Text = ('{0}: large subnet; showing 254 addresses near this laptop. Edit the range to scan another slice.' -f $adapter.Name)
+        }
+        else { $script:lblScanScope.Text = ('{0}: connected | {1} / {2}' -f $adapter.Name, $ip, $mask) }
+        $script:txtScanStart.Text = ConvertFrom-ScannerIpNumber $first
+        $script:txtScanEnd.Text = ConvertFrom-ScannerIpNumber $last
+    }
+    catch {
+        $script:lblScanScope.Text = 'Could not determine a range from this adapter. Enter a start and end IP manually.'
+        Add-Log -Area 'IP Scanner' -Level 'WARN' -Message $_.Exception.Message
+    }
+}
+
+function Refresh-ScannerAdapters {
+    if (-not $script:cboScanAdapter) { return }
+    $previous = $script:cboScanAdapter.SelectedIndex
+    $script:cboScanAdapter.Items.Clear()
+    foreach ($adapter in $script:AdapterList) {
+        [void]$script:cboScanAdapter.Items.Add(('{0} [{1}] - {2}' -f $adapter.Name, $adapter.Status, $adapter.IPText))
+    }
+    if ($script:cboScanAdapter.Items.Count -gt 0) {
+        if ($previous -ge 0 -and $previous -lt $script:cboScanAdapter.Items.Count) { $script:cboScanAdapter.SelectedIndex = $previous }
+        else {
+            $connected = @($script:AdapterList | Where-Object { $_.Status -eq 'Connected' -and $_.IPText -match '^\d+\.' } | Select-Object -First 1)
+            $script:cboScanAdapter.SelectedIndex = if ($connected.Count -gt 0) { [array]::IndexOf($script:AdapterList, $connected[0]) } else { 0 }
+        }
+    }
+}
+
+function Start-LanScan {
+    Invoke-UiAction -Name 'IP Scanner' -Action {
+        $first = ConvertTo-ScannerIpNumber $script:txtScanStart.Text.Trim()
+        $last = ConvertTo-ScannerIpNumber $script:txtScanEnd.Text.Trim()
+        if ($last -lt $first) { throw 'The end address must be after the start address.' }
+        $count = [int64]($last - $first + 1)
+        if ($count -gt 1024) { throw 'Enter no more than 1,024 IP addresses per scan.' }
+        if ($script:scanJob -and $script:scanJob.State -eq 'Running') { throw 'A scan is already running.' }
+        $script:lvScan.Items.Clear()
+        $script:scanProcessed = 0
+        $script:scanTotal = $count
+        $script:scanJob = Start-Job -ArgumentList $first, $last -ScriptBlock {
+            param([uint64]$rangeStart, [uint64]$rangeEnd)
+            $ports = @(80, 443, 445, 3389, 22)
+            for ($batch = $rangeStart; $batch -le $rangeEnd; $batch += 16) {
+                $hosts = @()
+                for ($number = $batch; $number -le [Math]::Min($batch + 15, $rangeEnd); $number++) {
+                    $ip = '{0}.{1}.{2}.{3}' -f (($number -shr 24) -band 255), (($number -shr 16) -band 255), (($number -shr 8) -band 255), ($number -band 255)
+                    $ping = New-Object System.Net.NetworkInformation.Ping
+                    $clients = @()
+                    foreach ($port in $ports) {
+                        $client = New-Object System.Net.Sockets.TcpClient
+                        try { $clients += [pscustomobject]@{ Port = $port; Client = $client; Task = $client.BeginConnect($ip, $port, $null, $null) } }
+                        catch { $client.Dispose() }
+                    }
+                    $hosts += [pscustomobject]@{ IP = $ip; Ping = $ping; PingTask = $ping.SendPingAsync($ip, 450); Clients = $clients }
+                }
+                foreach ($hostItem in $hosts) {
+                    $reply = ''
+                    $openPorts = @()
+                    try {
+                        if ($hostItem.PingTask.Wait(500) -and $hostItem.PingTask.Result.Status -eq 'Success') {
+                            $reply = ('{0} ms' -f $hostItem.PingTask.Result.RoundtripTime)
+                        }
+                    }
+                    catch { }
+                    finally { $hostItem.Ping.Dispose() }
+                    foreach ($probe in $hostItem.Clients) {
+                        try {
+                            if ($probe.Task.AsyncWaitHandle.WaitOne(250)) {
+                                $probe.Client.EndConnect($probe.Task)
+                                if ($probe.Client.Connected) { $openPorts += $probe.Port }
+                            }
+                        }
+                        catch { }
+                        finally { $probe.Client.Close() }
+                    }
+                    if ($reply -or $openPorts.Count -gt 0) {
+                        $name = ''
+                        $mac = ''
+                        try {
+                            $dnsTask = [System.Net.Dns]::GetHostEntryAsync($hostItem.IP)
+                            if ($dnsTask.Wait(350)) { $name = $dnsTask.Result.HostName }
+                        }
+                        catch { }
+                        try {
+                            $arpLines = @(& arp.exe -a $hostItem.IP 2>$null)
+                            foreach ($line in $arpLines) {
+                                if ($line -match ('^\s*' + [regex]::Escape($hostItem.IP) + '\s+([0-9a-fA-F-]{17})\s+')) { $mac = $matches[1]; break }
+                            }
+                        }
+                        catch { }
+                        [pscustomobject]@{ Kind = 'Host'; IP = $hostItem.IP; HostName = $name; Ping = $reply; Mac = $mac; Ports = ($openPorts -join ', ') }
+                    }
+                }
+                [pscustomobject]@{ Kind = 'Progress'; Scanned = [int]([Math]::Min($batch + 15, $rangeEnd) - $rangeStart + 1) }
+            }
+        }
+        $script:lblScanStatus.Text = 'Scanning...'
+        $script:btnScan.Enabled = $false
+        $script:scanTimer.Start()
+        Add-Log -Area 'IP Scanner' -Level 'INFO' -Message ('Scanning {0}-{1} ({2} addresses).' -f $script:txtScanStart.Text, $script:txtScanEnd.Text, $count)
+    }
+}
+
+function Complete-LanScan {
+    if (-not $script:scanJob) { return }
+    $finished = $script:scanJob.State -ne 'Running'
+    try {
+        $results = @(Receive-Job -Job $script:scanJob -ErrorAction Stop)
+        foreach ($result in $results) {
+            if ($result.Kind -eq 'Progress') {
+                $script:scanProcessed = [int]$result.Scanned
+            }
+            elseif ($result.Kind -eq 'Host') {
+                $row = New-Object System.Windows.Forms.ListViewItem([string]$result.IP)
+                [void]$row.SubItems.Add([string]$result.HostName)
+                [void]$row.SubItems.Add([string]$result.Ping)
+                [void]$row.SubItems.Add([string]$result.Mac)
+                [void]$row.SubItems.Add([string]$result.Ports)
+                [void]$script:lvScan.Items.Add($row)
+            }
+        }
+        if ($finished) {
+            $script:lblScanStatus.Text = ('{0} devices found' -f $script:lvScan.Items.Count)
+            Add-Log -Area 'IP Scanner' -Level 'OK' -Message ('{0} devices found. ICMP and common TCP services were checked.' -f $script:lvScan.Items.Count)
+        }
+        else {
+            $script:lblScanStatus.Text = ('Scanning {0}/{1} | {2} devices' -f $script:scanProcessed, $script:scanTotal, $script:lvScan.Items.Count)
+        }
+    }
+    catch {
+        $finished = $true
+        $script:lblScanStatus.Text = 'Scan failed'
+        Add-Log -Area 'IP Scanner' -Level 'ERROR' -Message $_.Exception.Message
+    }
+    finally {
+        if ($finished) {
+            $script:scanTimer.Stop()
+            Remove-Job -Job $script:scanJob -Force -ErrorAction SilentlyContinue
+            $script:scanJob = $null
+            $script:btnScan.Enabled = $true
+        }
+    }
+}
+
+function Stop-LanScan {
+    if ($script:scanJob) {
+        Stop-Job -Job $script:scanJob -ErrorAction SilentlyContinue
+        $script:scanTimer.Stop()
+        Remove-Job -Job $script:scanJob -Force -ErrorAction SilentlyContinue
+        $script:scanJob = $null
+        $script:btnScan.Enabled = $true
+        $script:lblScanStatus.Text = 'Scan stopped'
+    }
+}
+
+function Export-LanScan {
+    if ($script:lvScan.Items.Count -eq 0) { throw 'There are no scan results to export.' }
+    $dialog = New-Object System.Windows.Forms.SaveFileDialog
+    $dialog.Filter = 'CSV files (*.csv)|*.csv'
+    $dialog.FileName = ('IP_Scan_{0:yyyyMMdd_HHmmss}.csv' -f (Get-Date))
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $rows = foreach ($item in $script:lvScan.Items) {
+        [pscustomobject]@{ IPAddress = $item.Text; HostName = $item.SubItems[1].Text; Ping = $item.SubItems[2].Text; MacAddress = $item.SubItems[3].Text; OpenPorts = $item.SubItems[4].Text }
+    }
+    $rows | Export-Csv -LiteralPath $dialog.FileName -NoTypeInformation -Encoding UTF8
+    Add-Log -Area 'IP Scanner' -Level 'OK' -Message ("Exported scan results to {0}" -f $dialog.FileName)
+}
+
+function Show-VlanClues {
+    Invoke-UiAction -Name 'VLAN Clues' -Action {
+        $name = Get-SelectedAdapterName
+        $adapter = @($script:AdapterList | Where-Object { $_.Name -eq $name } | Select-Object -First 1)
+        $lines = @("Adapter: $name", "Link: $($adapter.Status)", "Address: $($adapter.IPText)")
+        try {
+            $properties = @(Get-NetAdapterAdvancedProperty -Name $name -ErrorAction Stop |
+                Where-Object { $_.RegistryKeyword -match 'vlan' -or $_.DisplayName -match 'vlan' })
+            foreach ($property in $properties) {
+                $lines += ('NIC setting: {0} = {1}' -f $property.DisplayName, $property.DisplayValue)
+            }
+        }
+        catch { $lines += 'NIC VLAN setting: unavailable' }
+        $lines += 'Switch access VLAN: unconfirmed from this laptop.'
+        $lines += 'Check managed switch port configuration, LLDP/CDP inventory, or your network team for the actual port VLAN.'
+        $script:txtVlanClues.Text = $lines -join [Environment]::NewLine
+        Add-Log -Area 'VLAN' -Level 'INFO' -Message ('Displayed VLAN clues for {0}; switch port VLAN remains unconfirmed.' -f $name)
+    }
+}
+
+function Search-ToolkitLog {
+    param([string]$Query)
+    $hits = @($script:lvLog.Items | Where-Object {
+        $_.Text -like "*$Query*" -or @($_.SubItems | Where-Object { $_.Text -like "*$Query*" }).Count -gt 0
+    })
+    if ($hits.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('No matching entries in the current technician log.', 'Toolkit Search') | Out-Null
+        return
+    }
+    foreach ($item in @($script:lvLog.SelectedItems)) { $item.Selected = $false }
+    $hits[0].Selected = $true
+    $hits[0].EnsureVisible()
+    $script:lvLog.Focus()
+    Set-MainStatus -Text ('{0} log matches' -f $hits.Count) -Color ([System.Drawing.Color]::FromArgb(45, 130, 80))
+}
+
+function Restore-ToolkitFromTray {
+    if (-not $script:form.Visible) { $script:form.Show() }
+    $script:form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+    $script:form.Activate()
+}
+
+function Exit-Toolkit {
+    $script:ExitRequested = $true
+    $script:form.Close()
+}
+
+function Select-FeedbackScreenshot {
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Filter = 'Images (*.png;*.jpg;*.jpeg)|*.png;*.jpg;*.jpeg'
+    $dialog.Title = 'Choose a screenshot for feedback'
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $script:txtFeedbackScreenshot.Text = $dialog.FileName
+    }
+}
+
+function Submit-ToolkitFeedback {
+    Invoke-UiAction -Name 'Feedback' -Action {
+        $message = $script:txtFeedback.Text.Trim()
+        if ($message.Length -lt 10) { throw 'Describe your feedback in at least 10 characters.' }
+        $screenshot = $script:txtFeedbackScreenshot.Text.Trim()
+        if ($screenshot) {
+            if (-not (Test-Path -LiteralPath $screenshot -PathType Leaf)) { throw 'The selected screenshot file was not found.' }
+            if ([System.IO.Path]::GetExtension($screenshot).ToLowerInvariant() -notin @('.png', '.jpg', '.jpeg')) { throw 'Choose a PNG or JPEG screenshot.' }
+            if ((Get-Item -LiteralPath $screenshot).Length -gt 15MB) { throw 'The screenshot exceeds the 15 MB attachment limit.' }
+        }
+        if (-not (Test-InternetConnection)) { throw 'Connect to the internet before sending feedback.' }
+        $category = [string]$script:cboFeedbackCategory.SelectedItem
+        $subject = 'TEC Systems Field Toolkit Feedback - ' + $category
+        $body = "Category: $category`r`nComputer: $env:COMPUTERNAME`r`nToolkit version: $script:ToolkitVersion`r`n`r`n$message"
+        $confirmation = 'Send this feedback to IT@tec-system.com?'
+        if ($screenshot) { $confirmation += "`r`n`r`nScreenshot: $screenshot" }
+        if ([System.Windows.Forms.MessageBox]::Show($confirmation, 'Confirm Feedback', 'YesNo', 'Question') -ne 'Yes') { return }
+
+        try {
+            $outlook = New-Object -ComObject Outlook.Application -ErrorAction Stop
+            $mail = $outlook.CreateItem(0)
+            $mail.To = 'IT@tec-system.com'
+            $mail.Subject = $subject
+            $mail.Body = $body
+            if ($screenshot) { [void]$mail.Attachments.Add($screenshot) }
+            $mail.Send()
+            Add-Log -Area 'Feedback' -Level 'OK' -Message 'Feedback submitted to classic Outlook. Delivery depends on Outlook connectivity and account settings.'
+            [System.Windows.Forms.MessageBox]::Show('Feedback was submitted to classic Outlook. Check Outbox/Sent Items to confirm delivery.', 'Feedback', 'OK', 'Information') | Out-Null
+            $script:txtFeedback.Clear()
+            $script:txtFeedbackScreenshot.Clear()
+            return
+        }
+        catch {
+            Add-Log -Area 'Feedback' -Level 'WARN' -Message ('Classic Outlook automation unavailable: {0}' -f $_.Exception.Message)
+        }
+
+        $uri = 'mailto:IT@tec-system.com?subject=' + [uri]::EscapeDataString($subject) + '&body=' + [uri]::EscapeDataString($body)
+        Start-Process $uri -ErrorAction Stop
+        $notice = 'A mail draft was opened. Review it and click Send in your mail app.'
+        if ($screenshot) { $notice += "`r`n`r`nNew Outlook cannot attach this file through local automation. Attach it manually before sending:`r`n$screenshot" }
+        [System.Windows.Forms.MessageBox]::Show($notice, 'Finish Sending Feedback', 'OK', 'Information') | Out-Null
+        Add-Log -Area 'Feedback' -Level 'INFO' -Message 'Opened default mail draft; technician must send it.'
+    }
+}
+
 # Build Form
 # -------------------------------
 $form = New-Object System.Windows.Forms.Form
+$script:form = $form
 $form.Text = $script:AppName
+$packagedIconPath = Join-Path -Path $PSScriptRoot -ChildPath 'assets\TEC Systems Field Toolkit.ico'
+$launcherIconPath = Join-Path -Path $PSScriptRoot -ChildPath 'TEC-Systems-FieldToolkit.exe'
+if (Test-Path -LiteralPath $packagedIconPath) {
+    $form.Icon = New-Object System.Drawing.Icon($packagedIconPath)
+}
+elseif (Test-Path -LiteralPath $launcherIconPath) {
+    $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($launcherIconPath)
+}
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object System.Drawing.Size(1280, 780)
 $form.MinimumSize = New-Object System.Drawing.Size(1120, 680)
 $form.BackColor = $colorBackground
 $form.Font = $fontMain
+
+$script:trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$openTrayItem = New-Object System.Windows.Forms.ToolStripMenuItem('Open Toolkit')
+$openTrayItem.Add_Click({ Restore-ToolkitFromTray })
+[void]$script:trayMenu.Items.Add($openTrayItem)
+$updateTrayItem = New-Object System.Windows.Forms.ToolStripMenuItem('Check Updates')
+$updateTrayItem.Add_Click({ Restore-ToolkitFromTray; Check-ToolkitUpdates })
+[void]$script:trayMenu.Items.Add($updateTrayItem)
+[void]$script:trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+$exitTrayItem = New-Object System.Windows.Forms.ToolStripMenuItem('Exit')
+$exitTrayItem.Add_Click({ Exit-Toolkit })
+[void]$script:trayMenu.Items.Add($exitTrayItem)
+$script:trayIcon = New-Object System.Windows.Forms.NotifyIcon
+$script:trayIcon.Icon = $form.Icon
+$script:trayIcon.Text = $script:AppName
+$script:trayIcon.ContextMenuStrip = $script:trayMenu
+$script:trayIcon.Add_DoubleClick({ Restore-ToolkitFromTray })
+$form.Add_Resize({
+    if ($script:form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+        $script:form.Hide()
+    }
+})
+
+$script:toolTip = New-Object System.Windows.Forms.ToolTip
+$script:toolTip.AutoPopDelay = 12000
+$script:toolTip.InitialDelay = 400
+$script:toolTip.ReshowDelay = 200
+$script:toolTip.ShowAlways = $true
 
 $header = New-Object System.Windows.Forms.Panel
 $header.Location = New-Object System.Drawing.Point(0, 0)
@@ -3814,6 +6042,7 @@ $lblManaged.Text = $script:ManagedBy
 $lblManaged.Location = New-Object System.Drawing.Point(342, 54)
 $lblManaged.Size = New-Object System.Drawing.Size(260, 22)
 $lblManaged.ForeColor = $colorMuted
+$lblManaged | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
 $header.Controls.Add($lblManaged)
 
 $lblHost = New-Object System.Windows.Forms.Label
@@ -3824,15 +6053,6 @@ $lblHost.Anchor = 'Top, Right'
 $lblHost.TextAlign = 'MiddleRight'
 $lblHost.ForeColor = $colorText
 $header.Controls.Add($lblHost)
-
-$lblNinja = New-Object System.Windows.Forms.Label
-$lblNinja.Text = Get-NinjaOneInfo
-$lblNinja.Location = New-Object System.Drawing.Point(1030, 40)
-$lblNinja.Size = New-Object System.Drawing.Size(210, 22)
-$lblNinja.Anchor = 'Top, Right'
-$lblNinja.TextAlign = 'MiddleRight'
-$lblNinja.ForeColor = $colorMuted
-$header.Controls.Add($lblNinja)
 
 $lblAdmin = New-Object System.Windows.Forms.Label
 $lblAdmin.Text = if (Test-IsAdministrator) { 'Mode: Administrator' } else { 'Mode: Standard User' }
@@ -3846,25 +6066,35 @@ $header.Controls.Add($lblAdmin)
 $script:lblAdminEditor = New-Object System.Windows.Forms.Label
 $script:lblAdminEditor.Text = 'Editor: Locked'
 $script:lblAdminEditor.Location = New-Object System.Drawing.Point(342, 78)
-$script:lblAdminEditor.Size = New-Object System.Drawing.Size(126, 22)
+$script:lblAdminEditor.Size = New-Object System.Drawing.Size(104, 22)
 $script:lblAdminEditor.Anchor = 'Top, Left'
 $script:lblAdminEditor.ForeColor = [System.Drawing.Color]::FromArgb(190, 120, 45)
 $header.Controls.Add($script:lblAdminEditor)
+$script:lblAdminEditor.Visible = $false
 
-$script:btnAdminMode = New-Button -Text 'Unlock Editor' -OnClick { Toggle-AdminMode } -X 474 -Y 70 -Width 122 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))
+$script:btnAdminMode = New-Button -Text 'Unlock Editor' -OnClick { Toggle-AdminMode } -X 452 -Y 70 -Width 120 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))
 $script:btnAdminMode.Anchor = 'Top, Left'
 $header.Controls.Add($script:btnAdminMode)
+$script:btnAdminMode.Visible = $false
+
+$script:btnChangeAdminPassword = New-Button -Text 'Change Password' -OnClick { Change-AdminPassword } -X 582 -Y 70 -Width 136 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(45, 130, 80)) -HoverColor ([System.Drawing.Color]::FromArgb(35, 102, 62))
+$script:btnChangeAdminPassword.Anchor = 'Top, Left'
+$script:btnChangeAdminPassword.Enabled = $false
+$script:btnChangeAdminPassword.Visible = $false
+$header.Controls.Add($script:btnChangeAdminPassword)
+$script:btnChangeAdminPassword.Visible = $false
 
 $script:lblHeaderSearch = New-Object System.Windows.Forms.Label
-$script:lblHeaderSearch.Text = 'Toolkit Search'
-$script:lblHeaderSearch.Location = New-Object System.Drawing.Point(610, 54)
-$script:lblHeaderSearch.Size = New-Object System.Drawing.Size(120, 18)
+$script:lblHeaderSearch.Text = 'Search log'
+$script:lblHeaderSearch.Location = New-Object System.Drawing.Point(658, 54)
+$script:lblHeaderSearch.Size = New-Object System.Drawing.Size(110, 18)
 $script:lblHeaderSearch.ForeColor = $colorMuted
+$script:lblHeaderSearch | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
 $header.Controls.Add($script:lblHeaderSearch)
 
 $script:txtHeaderSearch = New-Object System.Windows.Forms.TextBox
-$script:txtHeaderSearch.Location = New-Object System.Drawing.Point(610, 74)
-$script:txtHeaderSearch.Size = New-Object System.Drawing.Size(176, 24)
+$script:txtHeaderSearch.Location = New-Object System.Drawing.Point(658, 74)
+$script:txtHeaderSearch.Size = New-Object System.Drawing.Size(126, 24)
 $script:txtHeaderSearch.Anchor = 'Top, Left'
 $script:txtHeaderSearch.BorderStyle = 'FixedSingle'
 $header.Controls.Add($script:txtHeaderSearch)
@@ -3878,17 +6108,16 @@ $script:txtHeaderSearch.Add_KeyDown({
 $script:btnHeaderSearch = New-Button -Text 'Search' -OnClick {
     $query = $script:txtHeaderSearch.Text.Trim()
     if (-not [string]::IsNullOrWhiteSpace($query)) {
-        $script:tabsMain.SelectedTab = $tabAi
-        $script:txtAiPrompt.Text = $query
-        Ask-AiCopilot
+        Search-ToolkitLog -Query $query
     }
-} -X 794 -Y 70 -Width 74 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(45, 130, 80)) -HoverColor ([System.Drawing.Color]::FromArgb(35, 102, 62))
+} -X 792 -Y 70 -Width 62 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(45, 130, 80)) -HoverColor ([System.Drawing.Color]::FromArgb(35, 102, 62))
 $script:btnHeaderSearch.Anchor = 'Top, Left'
 $header.Controls.Add($script:btnHeaderSearch)
 
-$script:btnThemeToggle = New-Button -Text 'Dark Mode' -OnClick { Toggle-DarkMode } -X 876 -Y 70 -Width 94 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))
+$script:btnThemeToggle = New-Button -Text 'Dark Mode' -OnClick { Toggle-DarkMode } -X 862 -Y 70 -Width 86 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))
 $script:btnThemeToggle.Anchor = 'Top, Left'
 $header.Controls.Add($script:btnThemeToggle)
+Update-HeaderToolbarLayout
 
 $script:splitMain = New-Object System.Windows.Forms.SplitContainer
 $script:splitMain.Location = New-Object System.Drawing.Point(18, 122)
@@ -3902,17 +6131,18 @@ $script:splitMain.Panel1MinSize = 700
 $script:splitMain.Panel2MinSize = 260
 $form.Controls.Add($script:splitMain)
 
-$leftPanel = $script:splitMain.Panel1
-$leftPanel.BackColor = $colorPanel
-$leftPanel.Padding = New-Object System.Windows.Forms.Padding(0)
+$script:leftPanel = $script:splitMain.Panel1
+$script:leftPanel.BackColor = $colorPanel
+$script:leftPanel.Padding = New-Object System.Windows.Forms.Padding(0)
 
-$rightPanel = $script:splitMain.Panel2
-$rightPanel.BackColor = $colorPanel
-$rightPanel.Padding = New-Object System.Windows.Forms.Padding(0)
+$script:rightPanel = $script:splitMain.Panel2
+$script:rightPanel.BackColor = $colorPanel
+$script:rightPanel.Padding = New-Object System.Windows.Forms.Padding(0)
 
 $tabs = New-Object System.Windows.Forms.TabControl
+$script:tabs = $tabs
 $tabs.Dock = 'Fill'
-$leftPanel.Controls.Add($tabs)
+$script:leftPanel.Controls.Add($tabs)
 $script:tabsMain = $tabs
 
 # Troubleshooting tab
@@ -3920,6 +6150,7 @@ $tabTrouble = New-Object System.Windows.Forms.TabPage
 $tabTrouble.Text = 'Windows Troubleshooting'
 $tabTrouble.BackColor = $colorPanel
 $tabTrouble.AutoScroll = $true
+$script:tabTrouble = $tabTrouble
 $tabs.TabPages.Add($tabTrouble)
 
 $tabTrouble.Controls.Add((New-Label -Text 'Host / IP' -X 18 -Y 18 -Width 120))
@@ -3936,22 +6167,13 @@ $script:chkContinuousPing.Size = New-Object System.Drawing.Size(160, 24)
 $script:chkContinuousPing.ForeColor = $colorText
 $tabTrouble.Controls.Add($script:chkContinuousPing)
 
-$tabTrouble.Controls.Add((New-Label -Text 'Fast checks' -X 18 -Y 106 -Width 160))
+$tabTrouble.Controls.Add((New-Label -Text 'Windows checks' -X 18 -Y 106 -Width 160))
 $tabTrouble.Controls.Add((New-Button -Text 'System Summary' -OnClick { Show-SystemSummary } -X 18 -Y 130 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Network Summary' -OnClick { Show-NetworkSummary } -X 162 -Y 130 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'IPConfig /all' -OnClick { Show-IpConfigAll } -X 306 -Y 130 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Route Table' -OnClick { Show-RouteTable } -X 450 -Y 130 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Disk Summary' -OnClick { Show-DiskSummary } -X 594 -Y 130 -Width 112))
-$tabTrouble.Controls.Add((New-Button -Text 'Service Check' -OnClick { Show-ServiceQuickCheck } -X 18 -Y 170 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Event Errors' -OnClick { Show-RecentEventErrors } -X 162 -Y 170 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Problem Devices' -OnClick { Show-ProblemDevices } -X 306 -Y 170 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Flush DNS' -OnClick { Flush-DnsCache } -X 450 -Y 170 -Width 132 -BackColor ([System.Drawing.Color]::FromArgb(185, 95, 35)) -HoverColor ([System.Drawing.Color]::FromArgb(150, 70, 25))))
-$tabTrouble.Controls.Add((New-Button -Text 'Network Settings' -OnClick { Open-NetworkSettings } -X 594 -Y 170 -Width 112))
-$tabTrouble.Controls.Add((New-Button -Text 'DNS Cache' -OnClick { Show-DnsCacheEntries } -X 18 -Y 210 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Netstat' -OnClick { Show-NetstatSummary } -X 162 -Y 210 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Firewall' -OnClick { Show-FirewallProfiles } -X 306 -Y 210 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Update Status' -OnClick { Show-WindowsUpdateStatus } -X 450 -Y 210 -Width 132))
-$tabTrouble.Controls.Add((New-Button -Text 'Adapter Details' -OnClick { Show-AdapterDetails } -X 594 -Y 210 -Width 112))
+$tabTrouble.Controls.Add((New-Button -Text 'Disk Summary' -OnClick { Show-DiskSummary } -X 162 -Y 130 -Width 132))
+$tabTrouble.Controls.Add((New-Button -Text 'Service Check' -OnClick { Show-ServiceQuickCheck } -X 306 -Y 130 -Width 132))
+$tabTrouble.Controls.Add((New-Button -Text 'Event Errors' -OnClick { Show-RecentEventErrors } -X 450 -Y 130 -Width 132))
+$tabTrouble.Controls.Add((New-Button -Text 'Problem Devices' -OnClick { Show-ProblemDevices } -X 594 -Y 130 -Width 112))
+$tabTrouble.Controls.Add((New-Button -Text 'Update Status' -OnClick { Show-WindowsUpdateStatus } -X 18 -Y 170 -Width 132))
 
 $tabTrouble.Controls.Add((New-Label -Text 'Open tools' -X 18 -Y 260 -Width 160))
 $script:pnlTroubleTools = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -4000,6 +6222,8 @@ $tabTrouble.Controls.Add((New-Button -Text 'Open RDP' -OnClick { Open-Rdp } -X 4
 $tabNetwork = New-Object System.Windows.Forms.TabPage
 $tabNetwork.Text = 'Network Troubleshooting'
 $tabNetwork.BackColor = $colorPanel
+$tabNetwork.AutoScroll = $true
+$script:tabNetwork = $tabNetwork
 $tabs.TabPages.Add($tabNetwork)
 
 $grpNetDevice = New-Object System.Windows.Forms.GroupBox
@@ -4068,7 +6292,7 @@ $grpSwitch.Controls.Add((New-Button -Text 'SSH Terminal' -OnClick { Open-SwitchS
 $grpCapture = New-Object System.Windows.Forms.GroupBox
 $grpCapture.Text = 'Quick Capture'
 $grpCapture.Location = New-Object System.Drawing.Point(18, 262)
-$grpCapture.Size = New-Object System.Drawing.Size(340, 248)
+$grpCapture.Size = New-Object System.Drawing.Size(340, 328)
 $grpCapture.ForeColor = $colorText
 $tabNetwork.Controls.Add($grpCapture)
 
@@ -4081,7 +6305,10 @@ $grpCapture.Controls.Add((New-Button -Text 'Route Table' -OnClick { Show-RouteTa
 $grpCapture.Controls.Add((New-Button -Text 'DNS Cache' -OnClick { Show-DnsCacheEntries } -X 14 -Y 152 -Width 146 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
 $grpCapture.Controls.Add((New-Button -Text 'Netstat' -OnClick { Show-NetstatSummary } -X 174 -Y 152 -Width 146 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
 $grpCapture.Controls.Add((New-Button -Text 'Firewall' -OnClick { Show-FirewallProfiles } -X 14 -Y 192 -Width 146 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
-$grpCapture.Controls.Add((New-Button -Text 'Update Status' -OnClick { Show-WindowsUpdateStatus } -X 174 -Y 192 -Width 146 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
+$grpCapture.Controls.Add((New-Button -Text 'Network Summary' -OnClick { Show-NetworkSummary } -X 174 -Y 192 -Width 146))
+$grpCapture.Controls.Add((New-Button -Text 'IPConfig /all' -OnClick { Show-IpConfigAll } -X 14 -Y 232 -Width 146))
+$grpCapture.Controls.Add((New-Button -Text 'Network Settings' -OnClick { Open-NetworkSettings } -X 174 -Y 232 -Width 146))
+$grpCapture.Controls.Add((New-Button -Text 'Flush DNS' -OnClick { Flush-DnsCache } -X 14 -Y 272 -Width 146 -BackColor ([System.Drawing.Color]::FromArgb(185, 95, 35)) -HoverColor ([System.Drawing.Color]::FromArgb(150, 70, 25))))
 
 $grpPlaybook = New-Object System.Windows.Forms.GroupBox
 $grpPlaybook.Text = 'Field Playbooks'
@@ -4112,6 +6339,7 @@ Show-NetworkPlaybook -Topic ''
 $tabBms = New-Object System.Windows.Forms.TabPage
 $tabBms.Text = 'BMS Troubleshooting'
 $tabBms.BackColor = $colorPanel
+$script:tabBms = $tabBms
 $tabs.TabPages.Add($tabBms)
 
 $script:splitBms = New-Object System.Windows.Forms.SplitContainer
@@ -4167,6 +6395,7 @@ $script:lblBmsActiveStep.Text = 'Step:'
 $script:lblBmsActiveStep.Location = New-Object System.Drawing.Point(14, 40)
 $script:lblBmsActiveStep.Size = New-Object System.Drawing.Size(460, 22)
 $script:lblBmsActiveStep.ForeColor = $colorMuted
+$script:lblBmsActiveStep | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
 $script:tabBmsTroubleshoot.Controls.Add($script:lblBmsActiveStep)
 
 $script:txtBmsRunPrompt = New-Object System.Windows.Forms.TextBox
@@ -4181,6 +6410,8 @@ $script:tabBmsTroubleshoot.Controls.Add($script:txtBmsRunPrompt)
 
 $script:btnBmsResetToStart = New-Button -Text 'Restart Flow' -OnClick { Reset-BmsToStartStep } -X 14 -Y 166 -Width 120 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))
 $script:tabBmsTroubleshoot.Controls.Add($script:btnBmsResetToStart)
+$script:btnBmsBack = New-Button -Text 'Back' -OnClick { Go-BackBmsStep } -X 144 -Y 166 -Width 90 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))
+$script:tabBmsTroubleshoot.Controls.Add($script:btnBmsBack)
 
 $script:tabBmsTroubleshoot.Controls.Add((New-Label -Text 'Choose the next action' -X 14 -Y 208 -Width 180))
 $script:pnlBmsButtons = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -4218,6 +6449,7 @@ $script:lblBmsBuilderIntro.Text = 'Build the technician path as topic > step > c
 $script:lblBmsBuilderIntro.Location = New-Object System.Drawing.Point(14, 30)
 $script:lblBmsBuilderIntro.Size = New-Object System.Drawing.Size(470, 36)
 $script:lblBmsBuilderIntro.ForeColor = $colorMuted
+$script:lblBmsBuilderIntro | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
 $script:pnlBmsBuilder.Controls.Add($script:lblBmsBuilderIntro)
 
 $script:pnlBmsBuilder.Controls.Add((New-Label -Text 'Topic name' -X 14 -Y 78 -Width 160))
@@ -4230,7 +6462,6 @@ $script:btnSaveBmsTopic = New-Button -Text 'Save Topic' -OnClick { Save-BmsCateg
 $script:pnlBmsBuilder.Controls.Add($script:btnSaveBmsTopic)
 $script:btnDeleteBmsTopic = New-Button -Text 'Delete Topic' -OnClick { Delete-BmsCategory } -X 408 -Y 98 -Width 80 -BackColor ([System.Drawing.Color]::FromArgb(95, 105, 120)) -HoverColor ([System.Drawing.Color]::FromArgb(70, 80, 95))
 $script:pnlBmsBuilder.Controls.Add($script:btnDeleteBmsTopic)
-
 $script:pnlBmsBuilder.Controls.Add((New-Label -Text 'Steps in this topic' -X 14 -Y 148 -Width 180))
 $script:lstBmsSteps = New-Object System.Windows.Forms.ListBox
 $script:lstBmsSteps.Location = New-Object System.Drawing.Point(14, 172)
@@ -4296,13 +6527,188 @@ $script:txtBmsButtonNotes.ScrollBars = 'Vertical'
 $script:txtBmsButtonNotes.Font = $fontMain
 $script:pnlBmsBuilder.Controls.Add($script:txtBmsButtonNotes)
 
-# Important links and docs tab
+# BMS commands tab
+$tabBmsCommands = New-Object System.Windows.Forms.TabPage
+$tabBmsCommands.Text = 'BMS Commands'
+$tabBmsCommands.BackColor = $colorPanel
+$tabs.TabPages.Add($tabBmsCommands)
+
+$script:splitBmsCommands = New-Object System.Windows.Forms.SplitContainer
+$script:splitBmsCommands.Location = New-Object System.Drawing.Point(8, 8)
+$script:splitBmsCommands.Size = New-Object System.Drawing.Size(708, 486)
+$script:splitBmsCommands.Anchor = 'Top, Bottom, Left, Right'
+$script:splitBmsCommands.SplitterDistance = 210
+$script:splitBmsCommands.Panel1MinSize = 190
+$script:splitBmsCommands.Panel2MinSize = 440
+$tabBmsCommands.Controls.Add($script:splitBmsCommands)
+
+$script:splitBmsCommands.Panel1.Controls.Add((New-Label -Text 'Command category' -X 10 -Y 12 -Width 150))
+$script:cboBmsCommandCategoryFilter = New-Object System.Windows.Forms.ComboBox
+$script:cboBmsCommandCategoryFilter.Location = New-Object System.Drawing.Point(10, 38)
+$script:cboBmsCommandCategoryFilter.Size = New-Object System.Drawing.Size(186, 24)
+$script:cboBmsCommandCategoryFilter.DropDownStyle = 'DropDownList'
+$script:cboBmsCommandCategoryFilter.Add_SelectedIndexChanged({
+    Refresh-BmsCommandList
+    Refresh-BmsCommandButtons
+})
+$script:splitBmsCommands.Panel1.Controls.Add($script:cboBmsCommandCategoryFilter)
+
+$script:splitBmsCommands.Panel1.Controls.Add((New-Label -Text 'Saved commands' -X 10 -Y 76 -Width 150))
+$script:lstBmsCommandItems = New-Object System.Windows.Forms.ListBox
+$script:lstBmsCommandItems.Location = New-Object System.Drawing.Point(10, 102)
+$script:lstBmsCommandItems.Size = New-Object System.Drawing.Size(186, 322)
+$script:lstBmsCommandItems.Font = $fontMain
+$script:lstBmsCommandItems.Add_SelectedIndexChanged({ Select-BmsCommandItem })
+$script:splitBmsCommands.Panel1.Controls.Add($script:lstBmsCommandItems)
+
+$script:splitBmsCommands.Panel1.Controls.Add((New-Button -Text 'Refresh' -OnClick { Refresh-BmsCommandsUi } -X 10 -Y 436 -Width 88 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
+$script:splitBmsCommands.Panel1.Controls.Add((New-Button -Text 'Run Selected' -OnClick { Run-SelectedBmsCommand } -X 108 -Y 436 -Width 88 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(45, 130, 80)) -HoverColor ([System.Drawing.Color]::FromArgb(35, 102, 62))))
+
+$script:tabsBmsCommandModes = New-Object System.Windows.Forms.TabControl
+$script:tabsBmsCommandModes.Dock = 'Fill'
+$script:splitBmsCommands.Panel2.Controls.Add($script:tabsBmsCommandModes)
+
+$script:tabBmsCommandRun = New-Object System.Windows.Forms.TabPage
+$script:tabBmsCommandRun.Text = 'Run Commands'
+$script:tabBmsCommandRun.BackColor = $colorPanel
+[void]$script:tabsBmsCommandModes.TabPages.Add($script:tabBmsCommandRun)
+
+$script:lblBmsCommandName = New-Object System.Windows.Forms.Label
+$script:lblBmsCommandName.Text = 'Command:'
+$script:lblBmsCommandName.Location = New-Object System.Drawing.Point(14, 14)
+$script:lblBmsCommandName.Size = New-Object System.Drawing.Size(460, 22)
+$script:lblBmsCommandName.ForeColor = $colorText
+$script:lblBmsCommandName.Font = $fontSection
+$script:tabBmsCommandRun.Controls.Add($script:lblBmsCommandName)
+
+$script:lblBmsCommandMeta = New-Object System.Windows.Forms.Label
+$script:lblBmsCommandMeta.Text = 'Category: | Type: | Admin: | Confirm:'
+$script:lblBmsCommandMeta.Location = New-Object System.Drawing.Point(14, 40)
+$script:lblBmsCommandMeta.Size = New-Object System.Drawing.Size(460, 22)
+$script:lblBmsCommandMeta.ForeColor = $colorMuted
+$script:lblBmsCommandMeta | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
+$script:tabBmsCommandRun.Controls.Add($script:lblBmsCommandMeta)
+
+$script:tabBmsCommandRun.Controls.Add((New-Label -Text 'Description' -X 14 -Y 72 -Width 160))
+$script:txtBmsCommandDescriptionView = New-Object System.Windows.Forms.TextBox
+$script:txtBmsCommandDescriptionView.Location = New-Object System.Drawing.Point(14, 96)
+$script:txtBmsCommandDescriptionView.Size = New-Object System.Drawing.Size(458, 72)
+$script:txtBmsCommandDescriptionView.Multiline = $true
+$script:txtBmsCommandDescriptionView.ScrollBars = 'Vertical'
+$script:txtBmsCommandDescriptionView.Font = $fontMain
+$script:txtBmsCommandDescriptionView.ReadOnly = $true
+$script:txtBmsCommandDescriptionView.BackColor = [System.Drawing.Color]::White
+$script:tabBmsCommandRun.Controls.Add($script:txtBmsCommandDescriptionView)
+
+$script:tabBmsCommandRun.Controls.Add((New-Label -Text 'Command buttons' -X 14 -Y 180 -Width 160))
+$script:pnlBmsCommandButtons = New-Object System.Windows.Forms.FlowLayoutPanel
+$script:pnlBmsCommandButtons.Location = New-Object System.Drawing.Point(14, 204)
+$script:pnlBmsCommandButtons.Size = New-Object System.Drawing.Size(458, 116)
+$script:pnlBmsCommandButtons.Anchor = 'Top, Left, Right'
+$script:pnlBmsCommandButtons.AutoScroll = $true
+$script:pnlBmsCommandButtons.WrapContents = $true
+$script:tabBmsCommandRun.Controls.Add($script:pnlBmsCommandButtons)
+
+$script:btnRunSelectedBmsCommand = New-Button -Text 'Run Selected Command' -OnClick { Run-SelectedBmsCommand } -X 14 -Y 330 -Width 170 -Height 34 -BackColor ([System.Drawing.Color]::FromArgb(45, 130, 80)) -HoverColor ([System.Drawing.Color]::FromArgb(35, 102, 62))
+$script:tabBmsCommandRun.Controls.Add($script:btnRunSelectedBmsCommand)
+$script:tabBmsCommandRun.Controls.Add((New-Button -Text 'Refresh Commands' -OnClick { Refresh-BmsCommandsUi } -X 196 -Y 330 -Width 140 -Height 34 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
+
+$script:tabBmsCommandRun.Controls.Add((New-Label -Text 'Command preview' -X 14 -Y 376 -Width 160))
+$script:txtBmsCommandPreview = New-Object System.Windows.Forms.TextBox
+$script:txtBmsCommandPreview.Location = New-Object System.Drawing.Point(14, 400)
+$script:txtBmsCommandPreview.Size = New-Object System.Drawing.Size(458, 82)
+$script:txtBmsCommandPreview.Multiline = $true
+$script:txtBmsCommandPreview.ScrollBars = 'Vertical'
+$script:txtBmsCommandPreview.Font = $fontMain
+$script:txtBmsCommandPreview.ReadOnly = $true
+$script:txtBmsCommandPreview.BackColor = [System.Drawing.Color]::White
+$script:tabBmsCommandRun.Controls.Add($script:txtBmsCommandPreview)
+
+$script:tabBmsCommandEditor = New-Object System.Windows.Forms.TabPage
+$script:tabBmsCommandEditor.Text = 'Command Editor'
+$script:tabBmsCommandEditor.BackColor = $colorPanel
+
+$script:pnlBmsCommandEditor = New-Object System.Windows.Forms.Panel
+$script:pnlBmsCommandEditor.Dock = 'Fill'
+$script:pnlBmsCommandEditor.AutoScroll = $true
+$script:tabBmsCommandEditor.Controls.Add($script:pnlBmsCommandEditor)
+
+$script:pnlBmsCommandEditor.Controls.Add((New-Label -Text 'Button name' -X 14 -Y 16 -Width 160))
+$script:txtBmsCommandName = New-TextBox -X 14 -Y 40 -Width 214 -Text ''
+$script:pnlBmsCommandEditor.Controls.Add($script:txtBmsCommandName)
+$script:btnNewBmsCommand = New-Button -Text 'New' -OnClick { New-BmsCommandItem } -X 242 -Y 36 -Width 70
+$script:pnlBmsCommandEditor.Controls.Add($script:btnNewBmsCommand)
+$script:btnSaveBmsCommand = New-Button -Text 'Save' -OnClick { Save-BmsCommandItem } -X 318 -Y 36 -Width 70
+$script:pnlBmsCommandEditor.Controls.Add($script:btnSaveBmsCommand)
+$script:btnDeleteBmsCommand = New-Button -Text 'Delete' -OnClick { Delete-BmsCommandItem } -X 394 -Y 36 -Width 78 -BackColor ([System.Drawing.Color]::FromArgb(95, 105, 120)) -HoverColor ([System.Drawing.Color]::FromArgb(70, 80, 95))
+$script:pnlBmsCommandEditor.Controls.Add($script:btnDeleteBmsCommand)
+
+$script:pnlBmsCommandEditor.Controls.Add((New-Label -Text 'Category' -X 14 -Y 86 -Width 160))
+$script:txtBmsCommandCategory = New-TextBox -X 14 -Y 110 -Width 214 -Text 'General'
+$script:pnlBmsCommandEditor.Controls.Add($script:txtBmsCommandCategory)
+
+$script:pnlBmsCommandEditor.Controls.Add((New-Label -Text 'Command type' -X 242 -Y 86 -Width 120))
+$script:cboBmsCommandType = New-Object System.Windows.Forms.ComboBox
+$script:cboBmsCommandType.Location = New-Object System.Drawing.Point(242, 110)
+$script:cboBmsCommandType.Size = New-Object System.Drawing.Size(130, 24)
+$script:cboBmsCommandType.DropDownStyle = 'DropDownList'
+[void]$script:cboBmsCommandType.Items.Add('PowerShell')
+[void]$script:cboBmsCommandType.Items.Add('CMD')
+[void]$script:cboBmsCommandType.Items.Add('Open')
+$script:cboBmsCommandType.SelectedIndex = 0
+$script:pnlBmsCommandEditor.Controls.Add($script:cboBmsCommandType)
+
+$script:pnlBmsCommandEditor.Controls.Add((New-Label -Text 'Description for technicians' -X 14 -Y 154 -Width 220))
+$script:txtBmsCommandDescription = New-Object System.Windows.Forms.TextBox
+$script:txtBmsCommandDescription.Location = New-Object System.Drawing.Point(14, 178)
+$script:txtBmsCommandDescription.Size = New-Object System.Drawing.Size(458, 92)
+$script:txtBmsCommandDescription.Multiline = $true
+$script:txtBmsCommandDescription.ScrollBars = 'Vertical'
+$script:txtBmsCommandDescription.Font = $fontMain
+$script:pnlBmsCommandEditor.Controls.Add($script:txtBmsCommandDescription)
+
+$script:pnlBmsCommandEditor.Controls.Add((New-Label -Text 'Command or target' -X 14 -Y 286 -Width 180))
+$script:txtBmsCommandText = New-Object System.Windows.Forms.TextBox
+$script:txtBmsCommandText.Location = New-Object System.Drawing.Point(14, 310)
+$script:txtBmsCommandText.Size = New-Object System.Drawing.Size(458, 118)
+$script:txtBmsCommandText.Multiline = $true
+$script:txtBmsCommandText.ScrollBars = 'Vertical'
+$script:txtBmsCommandText.Font = $fontMain
+$script:pnlBmsCommandEditor.Controls.Add($script:txtBmsCommandText)
+
+$script:chkBmsCommandRequiresAdmin = New-Object System.Windows.Forms.CheckBox
+$script:chkBmsCommandRequiresAdmin.Text = 'Requires admin'
+$script:chkBmsCommandRequiresAdmin.Location = New-Object System.Drawing.Point(14, 442)
+$script:chkBmsCommandRequiresAdmin.Size = New-Object System.Drawing.Size(130, 24)
+$script:chkBmsCommandRequiresAdmin.ForeColor = $colorText
+$script:pnlBmsCommandEditor.Controls.Add($script:chkBmsCommandRequiresAdmin)
+
+$script:chkBmsCommandConfirm = New-Object System.Windows.Forms.CheckBox
+$script:chkBmsCommandConfirm.Text = 'Confirm before run'
+$script:chkBmsCommandConfirm.Location = New-Object System.Drawing.Point(156, 442)
+$script:chkBmsCommandConfirm.Size = New-Object System.Drawing.Size(150, 24)
+$script:chkBmsCommandConfirm.Checked = $true
+$script:chkBmsCommandConfirm.ForeColor = $colorText
+$script:pnlBmsCommandEditor.Controls.Add($script:chkBmsCommandConfirm)
+
+$script:chkBmsCommandKeepWindowOpen = New-Object System.Windows.Forms.CheckBox
+$script:chkBmsCommandKeepWindowOpen.Text = 'Keep terminal open'
+$script:chkBmsCommandKeepWindowOpen.Location = New-Object System.Drawing.Point(316, 442)
+$script:chkBmsCommandKeepWindowOpen.Size = New-Object System.Drawing.Size(156, 24)
+$script:chkBmsCommandKeepWindowOpen.Checked = $true
+$script:chkBmsCommandKeepWindowOpen.ForeColor = $colorText
+$script:pnlBmsCommandEditor.Controls.Add($script:chkBmsCommandKeepWindowOpen)
+
+$script:pnlBmsCommandEditor.Controls.Add((New-Label -Text 'Use PowerShell for scripts, CMD for command lines, and Open for URLs, files, or consoles.' -X 14 -Y 474 -Width 458))
+
+# Important links tab
 $tabLinks = New-Object System.Windows.Forms.TabPage
-$tabLinks.Text = 'Important Links and Docs'
+$tabLinks.Text = 'Important Links'
 $tabLinks.BackColor = $colorPanel
+$script:tabLinks = $tabLinks
 $tabs.TabPages.Add($tabLinks)
 
-$tabLinks.Controls.Add((New-Label -Text 'Saved links and docs' -X 18 -Y 18 -Width 180))
+$tabLinks.Controls.Add((New-Label -Text 'Saved important links' -X 18 -Y 18 -Width 180))
 $script:lstImportantLinks = New-Object System.Windows.Forms.ListBox
 $script:lstImportantLinks.Location = New-Object System.Drawing.Point(18, 44)
 $script:lstImportantLinks.Size = New-Object System.Drawing.Size(260, 378)
@@ -4325,7 +6731,7 @@ $tabLinks.Controls.Add((New-Label -Text 'Title' -X 314 -Y 84 -Width 140))
 $script:txtLinkTitle = New-TextBox -X 314 -Y 108 -Width 392 -Text ''
 $tabLinks.Controls.Add($script:txtLinkTitle)
 
-$tabLinks.Controls.Add((New-Label -Text 'URL / file path / document target' -X 314 -Y 150 -Width 240))
+$tabLinks.Controls.Add((New-Label -Text 'URL or file path' -X 314 -Y 150 -Width 180))
 $script:txtLinkTarget = New-TextBox -X 314 -Y 174 -Width 392 -Text ''
 $tabLinks.Controls.Add($script:txtLinkTarget)
 
@@ -4338,18 +6744,19 @@ $script:txtLinkNotes.ScrollBars = 'Vertical'
 $script:txtLinkNotes.Font = $fontMain
 $tabLinks.Controls.Add($script:txtLinkNotes)
 
-$script:btnSaveLink = New-Button -Text 'Save Link / Doc' -OnClick { Save-LinkItem } -X 314 -Y 434 -Width 150
+$script:btnSaveLink = New-Button -Text 'Save Link' -OnClick { Save-LinkItem } -X 314 -Y 434 -Width 150
 $tabLinks.Controls.Add($script:btnSaveLink)
 
-# AI Copilot tab
+# AI Assistant tab
 $tabAi = New-Object System.Windows.Forms.TabPage
-$tabAi.Text = 'AI Copilot'
+$tabAi.Text = 'AI Assistant'
 $tabAi.BackColor = $colorPanel
 $tabAi.AutoScroll = $true
+$script:tabAi = $tabAi
 $tabs.TabPages.Add($tabAi)
 
 $lblAiTitle = New-Object System.Windows.Forms.Label
-$lblAiTitle.Text = 'Knowledge Search'
+$lblAiTitle.Text = 'Online Troubleshooting'
 $lblAiTitle.Location = New-Object System.Drawing.Point(18, 16)
 $lblAiTitle.Size = New-Object System.Drawing.Size(220, 24)
 $lblAiTitle.Font = $fontSection
@@ -4357,25 +6764,28 @@ $lblAiTitle.ForeColor = $colorText
 $tabAi.Controls.Add($lblAiTitle)
 
 $lblAiInfo = New-Object System.Windows.Forms.Label
-$lblAiInfo.Text = 'Search saved BMS flows, important links, notes, and the current technician log from one place.'
+$lblAiInfo.Text = 'Type an issue and let the toolkit search online through your backend, then return an explanation, fix steps, commands to try, and source links.'
 $lblAiInfo.Location = New-Object System.Drawing.Point(18, 44)
 $lblAiInfo.Size = New-Object System.Drawing.Size(688, 22)
 $lblAiInfo.ForeColor = $colorMuted
+$lblAiInfo | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
 $tabAi.Controls.Add($lblAiInfo)
 
 $script:lblAiKeyStatus = New-Object System.Windows.Forms.Label
-$script:lblAiKeyStatus.Text = 'Type a server name, issue, category, or keyword to find related saved information.'
+$script:lblAiKeyStatus.Text = 'Ask a question for online troubleshooting, or search your saved toolkit knowledge.'
 $script:lblAiKeyStatus.Location = New-Object System.Drawing.Point(18, 68)
 $script:lblAiKeyStatus.Size = New-Object System.Drawing.Size(520, 18)
 $script:lblAiKeyStatus.ForeColor = $colorMuted
+$script:lblAiKeyStatus | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
 $tabAi.Controls.Add($script:lblAiKeyStatus)
 
 $script:lblAiAdminHint = New-Object System.Windows.Forms.Label
-$script:lblAiAdminHint.Text = 'Use the header search or search from here.'
+$script:lblAiAdminHint.Text = 'Service: Checking online troubleshooting backend...'
 $script:lblAiAdminHint.Location = New-Object System.Drawing.Point(490, 68)
 $script:lblAiAdminHint.Size = New-Object System.Drawing.Size(216, 18)
 $script:lblAiAdminHint.TextAlign = 'MiddleRight'
 $script:lblAiAdminHint.ForeColor = $colorMuted
+$script:lblAiAdminHint | Add-Member -NotePropertyName ThemeTone -NotePropertyValue 'Muted' -Force
 $tabAi.Controls.Add($script:lblAiAdminHint)
 
 $script:txtAiConversation = New-Object System.Windows.Forms.TextBox
@@ -4388,16 +6798,17 @@ $script:txtAiConversation.ReadOnly = $true
 $script:txtAiConversation.BackColor = [System.Drawing.Color]::White
 $tabAi.Controls.Add($script:txtAiConversation)
 
-$tabAi.Controls.Add((New-Label -Text 'Search the toolkit' -X 18 -Y 296 -Width 180))
+$tabAi.Controls.Add((New-Label -Text 'Troubleshooting question' -X 18 -Y 296 -Width 180))
 $script:txtAiPrompt = New-Object System.Windows.Forms.TextBox
 $script:txtAiPrompt.Location = New-Object System.Drawing.Point(18, 320)
-$script:txtAiPrompt.Size = New-Object System.Drawing.Size(420, 26)
+$script:txtAiPrompt.Size = New-Object System.Drawing.Size(300, 26)
 $script:txtAiPrompt.Font = $fontMain
 $tabAi.Controls.Add($script:txtAiPrompt)
-$tabAi.Controls.Add((New-Button -Text 'Copilot' -OnClick { Ask-AiCopilot } -X 450 -Y 316 -Width 112))
-$tabAi.Controls.Add((New-Button -Text 'Google Search' -OnClick { Open-AiGoogleSearch -Query $script:txtAiPrompt.Text.Trim() } -X 572 -Y 316 -Width 134 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
+$tabAi.Controls.Add((New-Button -Text 'Ask Assistant' -OnClick { Ask-AiCopilot } -X 330 -Y 316 -Width 108))
+$tabAi.Controls.Add((New-Button -Text 'Check Service' -OnClick { Refresh-OnlineTroubleshootingStatus } -X 446 -Y 316 -Width 118 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
+$tabAi.Controls.Add((New-Button -Text 'Open Web Search' -OnClick { Open-AiGoogleSearch -Query $script:txtAiPrompt.Text.Trim() } -X 572 -Y 316 -Width 134 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))))
 
-$tabAi.Controls.Add((New-Label -Text 'Quick searches' -X 18 -Y 360 -Width 120))
+$tabAi.Controls.Add((New-Label -Text 'Quick prompts' -X 18 -Y 360 -Width 120))
 $tabAi.Controls.Add((New-Button -Text 'Ping / reachability' -OnClick { Ask-AiQuick -Prompt 'ping server unreachable' } -X 18 -Y 386 -Width 150 -Height 34 -BackColor ([System.Drawing.Color]::FromArgb(45, 130, 80)) -HoverColor ([System.Drawing.Color]::FromArgb(35, 102, 62))))
 $tabAi.Controls.Add((New-Button -Text 'IP profiles' -OnClick { Ask-AiQuick -Prompt 'ip profile adapter gateway dns' } -X 178 -Y 386 -Width 120 -Height 34))
 $tabAi.Controls.Add((New-Button -Text 'Current BMS topic' -OnClick { Ask-AiQuick -Prompt 'current bms topic' } -X 308 -Y 386 -Width 150 -Height 34))
@@ -4408,17 +6819,20 @@ $tabAi.Controls.Add((New-Button -Text 'RDP help' -OnClick { Ask-AiQuick -Prompt 
 $tabIp = New-Object System.Windows.Forms.TabPage
 $tabIp.Text = 'IP Shifter'
 $tabIp.BackColor = $colorPanel
+$script:tabIp = $tabIp
 $tabs.TabPages.Add($tabIp)
 
 $script:lvProfiles = New-Object System.Windows.Forms.ListView
 $script:lvProfiles.Location = New-Object System.Drawing.Point(18, 18)
-$script:lvProfiles.Size = New-Object System.Drawing.Size(330, 382)
+$script:lvProfiles.Size = New-Object System.Drawing.Size(340, 382)
 $script:lvProfiles.View = 'Details'
 $script:lvProfiles.FullRowSelect = $true
 $script:lvProfiles.GridLines = $true
-[void]$script:lvProfiles.Columns.Add('Profile', 120)
-[void]$script:lvProfiles.Columns.Add('IP', 105)
-[void]$script:lvProfiles.Columns.Add('Gateway', 105)
+[void]$script:lvProfiles.Columns.Add('Profile', 110)
+[void]$script:lvProfiles.Columns.Add('Adapter', 110)
+[void]$script:lvProfiles.Columns.Add('IP', 120)
+[void]$script:lvProfiles.Columns.Add('Mask', 120)
+[void]$script:lvProfiles.Columns.Add('Gateway', 120)
 $script:lvProfiles.Add_DoubleClick({ Load-SelectedProfile })
 $tabIp.Controls.Add($script:lvProfiles)
 
@@ -4458,43 +6872,146 @@ $tabIp.Controls.Add($script:txtDns2)
 
 $tabIp.Controls.Add((New-Button -Text 'Load Profile' -OnClick { Load-SelectedProfile } -X 18 -Y 418 -Width 130))
 $tabIp.Controls.Add((New-Button -Text 'Save Profile' -OnClick { Save-IpProfile } -X 164 -Y 418 -Width 130))
+$tabIp.Controls.Add((New-Button -Text 'Delete Profile' -OnClick { Remove-IpProfile } -X 18 -Y 458 -Width 130 -BackColor ([System.Drawing.Color]::FromArgb(95, 105, 120)) -HoverColor ([System.Drawing.Color]::FromArgb(70, 80, 95))))
 $btnApply = New-Button -Text 'Apply Static IP' -OnClick { Apply-StaticIp } -X 380 -Y 418 -Width 150 -BackColor ([System.Drawing.Color]::FromArgb(185, 95, 35)) -HoverColor ([System.Drawing.Color]::FromArgb(150, 70, 25))
 $tabIp.Controls.Add($btnApply)
 $btnDhcp = New-Button -Text 'Set DHCP' -OnClick { Apply-Dhcp } -X 546 -Y 418 -Width 120 -BackColor ([System.Drawing.Color]::FromArgb(80, 100, 125)) -HoverColor ([System.Drawing.Color]::FromArgb(60, 78, 98))
 $tabIp.Controls.Add($btnDhcp)
 
-# Notes tab
-$tabNotes = New-Object System.Windows.Forms.TabPage
-$tabNotes.Text = 'Notes and Screenshots'
-$tabNotes.BackColor = $colorPanel
-$tabs.TabPages.Add($tabNotes)
+# IP scanner and field diagnostics
+$tabScan = New-Object System.Windows.Forms.TabPage
+$tabScan.Text = 'IP Scanner'
+$tabScan.BackColor = $colorPanel
+$script:tabScan = $tabScan
+$tabScan.AutoScroll = $true
 
-$tabNotes.Controls.Add((New-Label -Text 'Technician notes' -X 18 -Y 18 -Width 180))
-$script:txtNotes = New-Object System.Windows.Forms.TextBox
-$script:txtNotes.Location = New-Object System.Drawing.Point(18, 44)
-$script:txtNotes.Size = New-Object System.Drawing.Size(450, 360)
-$script:txtNotes.Multiline = $true
-$script:txtNotes.ScrollBars = 'Vertical'
-$script:txtNotes.Font = $fontMain
-$script:txtNotes.Text = $script:Config.Notes
-$tabNotes.Controls.Add($script:txtNotes)
-$tabNotes.Controls.Add((New-Button -Text 'Save Notes' -OnClick { Save-TechnicianNotes } -X 18 -Y 418 -Width 130))
+$tabScan.Controls.Add((New-Label -Text 'Network adapter' -X 18 -Y 16 -Width 220))
+$script:cboScanAdapter = New-Object System.Windows.Forms.ComboBox
+$script:cboScanAdapter.Location = New-Object System.Drawing.Point(18, 38)
+$script:cboScanAdapter.Size = New-Object System.Drawing.Size(690, 24)
+$script:cboScanAdapter.DropDownStyle = 'DropDownList'
+$script:cboScanAdapter.Add_SelectedIndexChanged({ Select-ScannerAdapter })
+$tabScan.Controls.Add($script:cboScanAdapter)
+$script:lblScanScope = New-Label -Text 'Select an adapter to fill the local network range.' -X 18 -Y 68 -Width 690
+$tabScan.Controls.Add($script:lblScanScope)
+$tabScan.Controls.Add((New-Label -Text 'Start IP' -X 18 -Y 98 -Width 120))
+$script:txtScanStart = New-TextBox -X 18 -Y 122 -Width 156 -Text ''
+$tabScan.Controls.Add($script:txtScanStart)
+$tabScan.Controls.Add((New-Label -Text 'End IP' -X 190 -Y 98 -Width 120))
+$script:txtScanEnd = New-TextBox -X 190 -Y 122 -Width 156 -Text ''
+$tabScan.Controls.Add($script:txtScanEnd)
+$script:btnScan = New-Button -Text 'Scan' -OnClick { Start-LanScan } -X 362 -Y 120 -Width 88
+$tabScan.Controls.Add($script:btnScan)
+$tabScan.Controls.Add((New-Button -Text 'Stop' -OnClick { Stop-LanScan } -X 458 -Y 120 -Width 74 -BackColor ([System.Drawing.Color]::FromArgb(95, 105, 120)) -HoverColor ([System.Drawing.Color]::FromArgb(70, 80, 95))))
+$tabScan.Controls.Add((New-Button -Text 'Export CSV' -OnClick { Invoke-UiAction -Name 'Export IP Scan' -Action { Export-LanScan } } -X 540 -Y 120 -Width 110))
+$script:lblScanStatus = New-Label -Text 'Ready | Ping and common TCP services' -X 18 -Y 164 -Width 660
+$script:scanProcessed = 0
+$tabScan.Controls.Add($script:lblScanStatus)
+$script:lvScan = New-Object System.Windows.Forms.ListView
+$script:lvScan.Location = New-Object System.Drawing.Point(18, 194)
+$script:lvScan.Size = New-Object System.Drawing.Size(690, 326)
+$script:lvScan.Anchor = 'Top, Bottom, Left, Right'
+$script:lvScan.View = 'Details'
+$script:lvScan.FullRowSelect = $true
+$script:lvScan.GridLines = $true
+[void]$script:lvScan.Columns.Add('IP address', 126)
+[void]$script:lvScan.Columns.Add('Hostname', 198)
+[void]$script:lvScan.Columns.Add('Ping', 70)
+[void]$script:lvScan.Columns.Add('MAC address', 128)
+[void]$script:lvScan.Columns.Add('Open TCP ports', 132)
+$tabScan.Controls.Add($script:lvScan)
+$scanMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$scanResultsList = $script:lvScan
+foreach ($action in @(
+    @{ Text = 'Ping'; Prefix = 'ping.exe' },
+    @{ Text = 'Remote Desktop'; Prefix = 'mstsc.exe' },
+    @{ Text = 'Open HTTP'; Prefix = 'http://' },
+    @{ Text = 'Open HTTPS'; Prefix = 'https://' },
+    @{ Text = 'Open Share'; Prefix = '\\' }
+)) {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem($action.Text)
+    $prefix = [string]$action.Prefix
+    $item.Add_Click({
+        if ($scanResultsList.SelectedItems.Count -eq 0) { return }
+        $ip = $scanResultsList.SelectedItems[0].Text
+        if ($prefix -eq 'ping.exe') { Start-Process 'cmd.exe' -ArgumentList @('/k', "ping $ip -t") }
+        elseif ($prefix -eq 'mstsc.exe') { Start-Process 'mstsc.exe' -ArgumentList @('/v:' + $ip) }
+        else { Start-Process ($prefix + $ip) }
+    }.GetNewClosure())
+    [void]$scanMenu.Items.Add($item)
+}
+$script:lvScan.ContextMenuStrip = $scanMenu
+$script:scanJob = $null
+$script:scanTimer = New-Object System.Windows.Forms.Timer
+$script:scanTimer.Interval = 500
+$script:scanTimer.Add_Tick({ Complete-LanScan })
 
-$tabNotes.Controls.Add((New-Label -Text 'Screenshot path' -X 494 -Y 18 -Width 160))
-$script:txtScreenshotPath = New-TextBox -X 494 -Y 44 -Width 190 -Text ''
-$script:txtScreenshotPath.ReadOnly = $true
-$tabNotes.Controls.Add($script:txtScreenshotPath)
-$tabNotes.Controls.Add((New-Button -Text 'Take Screenshot' -OnClick { Capture-Screenshot } -X 494 -Y 84 -Width 150))
+$tabNetwork.Controls.Add((New-Label -Text 'VLAN clues' -X 18 -Y 608 -Width 220))
+$tabNetwork.Controls.Add((New-Button -Text 'Inspect Selected Adapter' -OnClick { Show-VlanClues } -X 18 -Y 634 -Width 240))
+$script:txtVlanClues = New-Object System.Windows.Forms.TextBox
+$script:txtVlanClues.Location = New-Object System.Drawing.Point(18, 674)
+$script:txtVlanClues.Size = New-Object System.Drawing.Size(688, 112)
+$script:txtVlanClues.Multiline = $true
+$script:txtVlanClues.ScrollBars = 'Vertical'
+$script:txtVlanClues.ReadOnly = $true
+$script:txtVlanClues.Text = 'Select an adapter in IP Shifter, then inspect it here. The switch port VLAN must be confirmed at the managed switch.'
+$tabNetwork.Controls.Add($script:txtVlanClues)
+
+$tabNetwork.Controls.Add((New-Label -Text 'Support bundle' -X 376 -Y 608 -Width 220))
+$script:cboBundleType = New-Object System.Windows.Forms.ComboBox
+$script:cboBundleType.Location = New-Object System.Drawing.Point(376, 638)
+$script:cboBundleType.Size = New-Object System.Drawing.Size(190, 24)
+$script:cboBundleType.DropDownStyle = 'DropDownList'
+[void]$script:cboBundleType.Items.Add('Network')
+[void]$script:cboBundleType.Items.Add('Windows')
+[void]$script:cboBundleType.Items.Add('Both')
+$script:cboBundleType.SelectedIndex = 0
+$tabNetwork.Controls.Add($script:cboBundleType)
+$tabNetwork.Controls.Add((New-Button -Text 'Export ZIP' -OnClick { Export-ToolkitSupportBundle } -X 574 -Y 636 -Width 130))
+$tabNetwork.Controls.Add((New-Label -Text 'Includes logs and diagnostic snapshots. Review before sharing.' -X 376 -Y 676 -Width 330))
 
 # Preferred tab order
 $tabs.TabPages.Clear()
 [void]$tabs.TabPages.Add($tabTrouble)
-[void]$tabs.TabPages.Add($tabNetwork)
 [void]$tabs.TabPages.Add($tabIp)
-[void]$tabs.TabPages.Add($tabBms)
-[void]$tabs.TabPages.Add($tabLinks)
-[void]$tabs.TabPages.Add($tabAi)
-[void]$tabs.TabPages.Add($tabNotes)
+[void]$tabs.TabPages.Add($tabNetwork)
+[void]$tabs.TabPages.Add($tabScan)
+$tabFeedback = New-Object System.Windows.Forms.TabPage
+$tabFeedback.Text = 'Feedback'
+$tabFeedback.BackColor = $colorPanel
+$tabFeedback.AutoScroll = $true
+$tabFeedback.Controls.Add((New-Label -Text 'Feedback for TEC Systems IT' -X 18 -Y 22 -Width 300))
+$tabFeedback.Controls.Add((New-Label -Text 'Category' -X 18 -Y 64 -Width 130))
+$script:cboFeedbackCategory = New-Object System.Windows.Forms.ComboBox
+$script:cboFeedbackCategory.Location = New-Object System.Drawing.Point(18, 88)
+$script:cboFeedbackCategory.Size = New-Object System.Drawing.Size(240, 24)
+$script:cboFeedbackCategory.DropDownStyle = 'DropDownList'
+foreach ($name in @('Idea', 'Bug', 'Usability', 'Other')) { [void]$script:cboFeedbackCategory.Items.Add($name) }
+$script:cboFeedbackCategory.SelectedIndex = 0
+$tabFeedback.Controls.Add($script:cboFeedbackCategory)
+$tabFeedback.Controls.Add((New-Label -Text 'Your feedback' -X 18 -Y 132 -Width 180))
+$script:txtFeedback = New-Object System.Windows.Forms.TextBox
+$script:txtFeedback.Location = New-Object System.Drawing.Point(18, 158)
+$script:txtFeedback.Size = New-Object System.Drawing.Size(680, 160)
+$script:txtFeedback.Multiline = $true
+$script:txtFeedback.ScrollBars = 'Vertical'
+$script:txtFeedback.Anchor = 'Top, Left, Right'
+$tabFeedback.Controls.Add($script:txtFeedback)
+$tabFeedback.Controls.Add((New-Label -Text 'Screenshot (optional)' -X 18 -Y 334 -Width 220))
+$script:txtFeedbackScreenshot = New-TextBox -X 18 -Y 360 -Width 484 -Text ''
+$script:txtFeedbackScreenshot.ReadOnly = $true
+$tabFeedback.Controls.Add($script:txtFeedbackScreenshot)
+$tabFeedback.Controls.Add((New-Button -Text 'Choose File' -OnClick { Select-FeedbackScreenshot } -X 510 -Y 356 -Width 92))
+$tabFeedback.Controls.Add((New-Button -Text 'Capture' -OnClick { Capture-Screenshot } -X 610 -Y 356 -Width 88))
+$tabFeedback.Controls.Add((New-Button -Text 'Clear Screenshot' -OnClick { $script:txtFeedbackScreenshot.Clear() } -X 18 -Y 396 -Width 140 -BackColor ([System.Drawing.Color]::FromArgb(95, 105, 120)) -HoverColor ([System.Drawing.Color]::FromArgb(70, 80, 95))))
+$tabFeedback.Controls.Add((New-Label -Text 'Classic Outlook attaches the image. Other mail apps open a draft; attach it there before sending.' -X 18 -Y 442 -Width 680))
+$tabFeedback.Controls.Add((New-Button -Text 'Send Feedback' -OnClick { Submit-ToolkitFeedback } -X 18 -Y 474 -Width 156 -BackColor ([System.Drawing.Color]::FromArgb(45, 130, 80)) -HoverColor ([System.Drawing.Color]::FromArgb(35, 102, 62))))
+[void]$tabs.TabPages.Add($tabFeedback)
+$tabs.Add_SelectedIndexChanged({
+    if ($tabs.SelectedTab -eq $tabNetwork) {
+        $tabNetwork.AutoScrollPosition = New-Object System.Drawing.Point(0, 0)
+    }
+})
 
 # Always-visible log side panel
 $lblLogTitle = New-Object System.Windows.Forms.Label
@@ -4503,7 +7020,7 @@ $lblLogTitle.Location = New-Object System.Drawing.Point(14, 14)
 $lblLogTitle.Size = New-Object System.Drawing.Size(220, 24)
 $lblLogTitle.Font = $fontSection
 $lblLogTitle.ForeColor = $colorText
-$rightPanel.Controls.Add($lblLogTitle)
+$script:rightPanel.Controls.Add($lblLogTitle)
 
 $script:lvLog = New-Object System.Windows.Forms.ListView
 $script:lvLog.Location = New-Object System.Drawing.Point(14, 46)
@@ -4516,19 +7033,19 @@ $script:lvLog.GridLines = $true
 [void]$script:lvLog.Columns.Add('Level', 60)
 [void]$script:lvLog.Columns.Add('Area', 100)
 [void]$script:lvLog.Columns.Add('Message', 520)
-$rightPanel.Controls.Add($script:lvLog)
+$script:rightPanel.Controls.Add($script:lvLog)
 
-$pnlLogActions = New-Object System.Windows.Forms.Panel
-$pnlLogActions.Location = New-Object System.Drawing.Point(10, 510)
-$pnlLogActions.Size = New-Object System.Drawing.Size(340, 40)
-$pnlLogActions.Anchor = 'Left, Right, Bottom'
-$rightPanel.Controls.Add($pnlLogActions)
+$script:pnlLogActions = New-Object System.Windows.Forms.Panel
+$script:pnlLogActions.Location = New-Object System.Drawing.Point(10, 510)
+$script:pnlLogActions.Size = New-Object System.Drawing.Size(340, 40)
+$script:pnlLogActions.Anchor = 'Left, Right, Bottom'
+$script:rightPanel.Controls.Add($script:pnlLogActions)
 
-$pnlLogActions.Controls.Add((New-Button -Text 'Copy Path' -OnClick { [System.Windows.Forms.Clipboard]::SetText($script:LogFile); Add-Log -Area 'Log' -Level 'OK' -Message 'Copied log path.' } -X 0 -Y 2 -Width 96 -Height 30))
+$script:pnlLogActions.Controls.Add((New-Button -Text 'Copy Path' -OnClick { [System.Windows.Forms.Clipboard]::SetText($script:LogFile); Add-Log -Area 'Log' -Level 'OK' -Message 'Copied log path.' } -X 0 -Y 2 -Width 96 -Height 30))
 $script:btnExportLog = New-Button -Text 'Export Log' -OnClick { Export-ToolkitLog } -X 104 -Y 2 -Width 104 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(45, 130, 80)) -HoverColor ([System.Drawing.Color]::FromArgb(35, 102, 62))
-$pnlLogActions.Controls.Add($script:btnExportLog)
+$script:pnlLogActions.Controls.Add($script:btnExportLog)
 $script:btnClearLog = New-Button -Text 'Clear Log' -OnClick { Clear-VisibleLog } -X 216 -Y 2 -Width 104 -Height 30 -BackColor ([System.Drawing.Color]::FromArgb(95, 105, 120)) -HoverColor ([System.Drawing.Color]::FromArgb(70, 80, 95))
-$pnlLogActions.Controls.Add($script:btnClearLog)
+$script:pnlLogActions.Controls.Add($script:btnClearLog)
 
 # Footer
 $footer = New-Object System.Windows.Forms.Panel
@@ -4541,9 +7058,14 @@ $form.Controls.Add($footer)
 $script:lblStatus = New-Object System.Windows.Forms.Label
 $script:lblStatus.Text = 'Ready'
 $script:lblStatus.Location = New-Object System.Drawing.Point(0, 6)
-$script:lblStatus.Size = New-Object System.Drawing.Size(420, 22)
+$script:lblStatus.Size = New-Object System.Drawing.Size(300, 22)
+$script:lblStatus.AutoEllipsis = $true
 $script:lblStatus.ForeColor = [System.Drawing.Color]::FromArgb(45, 130, 80)
 $footer.Controls.Add($script:lblStatus)
+
+$script:btnToolkitUpdates = New-Button -Text 'Check Updates' -OnClick { Check-ToolkitUpdates } -X 320 -Y 2 -Width 132 -Height 30
+$footer.Controls.Add($script:btnToolkitUpdates)
+$script:toolTip.SetToolTip($script:btnToolkitUpdates, 'Check GitHub Releases for a newer toolkit installer.')
 
 $script:progress = New-Object System.Windows.Forms.ProgressBar
 $script:progress.Location = New-Object System.Drawing.Point(640, 8)
@@ -4566,34 +7088,71 @@ $script:internetTimer = New-Object System.Windows.Forms.Timer
 $script:internetTimer.Interval = 30000
 $script:internetTimer.Add_Tick({ Update-InternetStatus })
 
+$script:adminStatusTimer = New-Object System.Windows.Forms.Timer
+$script:adminStatusTimer.Interval = 1000
+$script:adminStatusTimer.Add_Tick({
+    if (-not $script:IsAdminMode) {
+        Update-AdminModeUi
+    }
+})
+
+$script:statusResetTimer = New-Object System.Windows.Forms.Timer
+$script:statusResetTimer.Interval = 3500
+$script:statusResetTimer.Add_Tick({
+    $script:statusResetTimer.Stop()
+    Set-MainStatus -Text 'Ready' -Color ([System.Drawing.Color]::FromArgb(45, 130, 80))
+})
+
+$script:updateTimer = New-Object System.Windows.Forms.Timer
+$script:updateTimer.Interval = 500
+$script:updateTimer.Add_Tick({ Complete-ToolkitUpdateCheck })
+$script:updateJob = $null
+
 # -------------------------------
 # Start Application
 # -------------------------------
 $form.Add_Shown({
+    $script:trayIcon.Visible = $true
     Refresh-Adapters
     Refresh-Profiles
-    Load-BmsFlows
-    Load-ImportantLinks
-    Refresh-BmsCategoryList
-    Refresh-LinkList
+    Restore-PendingNetworkDraft
     Update-AdminModeUi
     Apply-Theme -DarkMode ([bool]$script:Config.DarkMode)
-    Add-AiConversationMessage -Role 'Toolkit Search' -Text 'Search your saved BMS flows, important links, notes, and current log from here.'
+    Apply-TroubleshootingButtonToolTips
     Add-Log -Area 'Startup' -Level 'OK' -Message $script:AppName
     Add-Log -Area 'Startup' -Level 'INFO' -Message $script:ManagedBy
     Add-Log -Area 'Startup' -Level 'INFO' -Message ('Hostname: {0}' -f $env:COMPUTERNAME)
     Add-Log -Area 'Startup' -Level 'INFO' -Message ('Log file: {0}' -f $script:LogFile)
-    Add-Log -Area 'Startup' -Level 'INFO' -Message $lblNinja.Text
     Update-InternetStatus
     $script:internetTimer.Start()
+    $script:adminStatusTimer.Start()
+    Start-ToolkitUpdateCheck
 })
 
 $form.Add_FormClosing({
-    Save-TechnicianNotes
+    param($sender, $eventArgs)
+    if (-not $script:ExitRequested -and $eventArgs.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
+        $eventArgs.Cancel = $true
+        $script:form.Hide()
+        return
+    }
+    if ($script:trayIcon) { $script:trayIcon.Visible = $false; $script:trayIcon.Dispose() }
+    if ($script:trayMenu) { $script:trayMenu.Dispose() }
     if ($script:internetTimer) {
         $script:internetTimer.Stop()
         $script:internetTimer.Dispose()
     }
+    if ($script:adminStatusTimer) {
+        $script:adminStatusTimer.Stop()
+        $script:adminStatusTimer.Dispose()
+    }
+    if ($script:statusResetTimer) {
+        $script:statusResetTimer.Stop()
+        $script:statusResetTimer.Dispose()
+    }
+    if ($script:updateTimer) { $script:updateTimer.Stop(); $script:updateTimer.Dispose() }
+    if ($script:updateJob) { Stop-Job -Job $script:updateJob -ErrorAction SilentlyContinue; Remove-Job -Job $script:updateJob -Force -ErrorAction SilentlyContinue; $script:updateJob = $null }
+    if ($script:scanTimer) { Stop-LanScan; $script:scanTimer.Dispose() }
 })
 
-[void]$form.ShowDialog()
+if (-not $TestMode) { [System.Windows.Forms.Application]::Run($form) }
