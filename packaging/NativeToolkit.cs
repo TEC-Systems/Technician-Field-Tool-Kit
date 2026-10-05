@@ -352,6 +352,7 @@ internal sealed class ToolkitWindow : Form
         }
         header.Controls.Add(new Label { Text = Product, Left = 340, Top = 18, Width = 320, Height = 32, Font = new Font("Segoe UI", 15f, FontStyle.Bold) });
         header.Controls.Add(L("Managed by TEC Systems IT", 342, 53, 250));
+        header.Controls.Add(L("Version " + version, 342, 76, 200));
         header.Controls.Add(L("Search log", 670, 51, 120));
         searchBox = T(670, 75, 138, "");
         header.Controls.Add(searchBox);
@@ -1733,6 +1734,8 @@ internal sealed class ToolkitWindow : Form
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
                 throw new InvalidOperationException("Release checksum line ending handling failed.");
             if (tabs.TabPages.Count != 6) throw new InvalidOperationException("Expected six active tabs.");
+            if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
+                throw new InvalidOperationException("Current toolkit version is not visible in the header.");
             if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner")
                 throw new InvalidOperationException("IP Scanner must be next to IP Shifter.");
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
