@@ -66,6 +66,9 @@ internal static class ToolkitSetup
                     }
                 }
                 catch (ArgumentException) { /* The toolkit already exited. */ }
+                InstallPayload(null);
+                Process.Start(Path.Combine(InstallFolder, ExeName));
+                return 0;
             }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -123,16 +126,7 @@ internal static class ToolkitSetup
         install.Click += (sender, e) => {
              install.Enabled = false;
              try {
-                  if (Process.GetProcessesByName("TEC-Systems-FieldToolkit").Length > 0)
-                      throw new IOException("The toolkit is still running. Click the notification-area arrow near the clock, right-click the TEC icon, choose Exit Toolkit, then click Update again. Closing the window alone is not enough.");
-                 ExtractPayload(InstallFolder);
-                 string legacyScript = Path.Combine(InstallFolder, "TEC-Systems-FieldToolkit.ps1");
-                 if (File.Exists(legacyScript)) File.Delete(legacyScript);
-                File.Copy(Application.ExecutablePath, Path.Combine(InstallFolder, UninstallName), true);
-                CreateShortcut(StartShortcut, Path.Combine(InstallFolder, ExeName));
-                if (desktop.Checked) CreateShortcut(DesktopShortcut, Path.Combine(InstallFolder, ExeName));
-                else if (File.Exists(DesktopShortcut)) File.Delete(DesktopShortcut);
-                RegisterUninstall(PayloadVersion());
+                InstallPayload(desktop.Checked);
                 MessageBox.Show("The toolkit is ready.", ProductName, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 if (launch.Checked) Process.Start(Path.Combine(InstallFolder, ExeName));
                 form.Close();
@@ -144,6 +138,39 @@ internal static class ToolkitSetup
         };
         form.Controls.AddRange(new Control[] { title, managed, version, destination, exitSteps, desktop, launch, install });
         return form;
+    }
+
+    private static void InstallPayload(bool? desktopShortcut)
+    {
+        if (IsInstalledToolkitRunning())
+            throw new IOException("The installed toolkit is still running on this laptop. Click the notification-area arrow near the clock, right-click the TEC icon, choose Exit Toolkit, then try again. Closing the window alone is not enough.");
+        ExtractPayload(InstallFolder);
+        string legacyScript = Path.Combine(InstallFolder, "TEC-Systems-FieldToolkit.ps1");
+        if (File.Exists(legacyScript)) File.Delete(legacyScript);
+        File.Copy(Application.ExecutablePath, Path.Combine(InstallFolder, UninstallName), true);
+        CreateShortcut(StartShortcut, Path.Combine(InstallFolder, ExeName));
+        if (desktopShortcut == true) CreateShortcut(DesktopShortcut, Path.Combine(InstallFolder, ExeName));
+        else if (desktopShortcut == false && File.Exists(DesktopShortcut)) File.Delete(DesktopShortcut);
+        RegisterUninstall(PayloadVersion());
+    }
+
+    private static bool IsInstalledToolkitRunning()
+    {
+        string installedExe = Path.Combine(InstallFolder, ExeName);
+        foreach (Process process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(ExeName)))
+        {
+            using (process)
+            {
+                try
+                {
+                    if (string.Equals(process.MainModule.FileName, installedExe, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                catch (System.ComponentModel.Win32Exception) { /* An inaccessible process cannot be this user's install. */ }
+                catch (InvalidOperationException) { /* The process exited during the check. */ }
+            }
+        }
+        return false;
     }
 
     private static string StartShortcut {

@@ -5,6 +5,12 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish the version in version.txt as a new release'
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: write
@@ -14,12 +20,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate version tag
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/') || inputs.publish_release
         shell: pwsh
         run: |
           $expected = 'v' + (Get-Content version.txt -First 1).Trim()
-          if ('${{ github.ref_name }}' -ne $expected) { throw "Tag must be $expected" }
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            if ('${{ github.ref }}' -ne 'refs/heads/main') { throw 'Publish releases only from main.' }
+            if (git ls-remote --tags origin "refs/tags/$expected") { throw "Release tag $expected already exists." }
+          }
+          elseif ('${{ github.ref_name }}' -ne $expected) { throw "Tag must be $expected" }
       - name: Build and verify installer
         shell: powershell
         run: .\packaging\Build-Installer.ps1
@@ -32,10 +42,12 @@ jobs:
             dist/SHA256SUMS.txt
             dist/app-icon.png
             dist/tray-icon.png
-      - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.publish_release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create '${{ github.ref_name }}' dist/TEC-Systems-FieldToolkit-Setup.exe dist/TEC-Systems-FieldToolkit-Install.zip dist/SHA256SUMS.txt --title 'TEC Systems Field Toolkit ${{ github.ref_name }}' --generate-notes
+          $tag = 'v' + (Get-Content version.txt -First 1).Trim()
+          gh release create $tag dist/TEC-Systems-FieldToolkit-Setup.exe dist/TEC-Systems-FieldToolkit-Install.zip dist/SHA256SUMS.txt --target '${{ github.sha }}' --title "TEC Systems Field Toolkit $tag" --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish $tag." }

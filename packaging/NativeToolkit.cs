@@ -24,6 +24,14 @@ using Microsoft.Win32;
 
 internal static class NativeToolkit
 {
+    internal const int RestoreMessage = 0x8000 + 175;
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string className, string windowName);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+
     [STAThread]
     private static int Main(string[] args)
     {
@@ -31,10 +39,26 @@ internal static class NativeToolkit
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            using (ToolkitWindow window = new ToolkitWindow())
+            bool selfTest = args.Length > 0 && args[0] == "/self-test";
+            if (selfTest)
             {
-                if (args.Length > 0 && args[0] == "/self-test") return window.SelfTest();
-                Application.Run(window);
+                using (ToolkitWindow testWindow = new ToolkitWindow()) return testWindow.SelfTest();
+            }
+            bool firstInstance;
+            using (Mutex instance = new Mutex(true, @"Local\TEC-Systems-FieldToolkit", out firstInstance))
+            {
+                if (!firstInstance)
+                {
+                    IntPtr existing = FindWindow(null, "TEC Systems Field Toolkit");
+                    if (existing == IntPtr.Zero || !PostMessage(existing, RestoreMessage, IntPtr.Zero, IntPtr.Zero))
+                        MessageBox.Show("The toolkit is already running in this Windows session. Open it from the TEC notification-area icon.", "TEC Systems Field Toolkit", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return 0;
+                }
+                try
+                {
+                    using (ToolkitWindow window = new ToolkitWindow()) Application.Run(window);
+                }
+                finally { instance.ReleaseMutex(); }
             }
             return 0;
         }
@@ -85,6 +109,7 @@ internal sealed class ScanHost
     public string Hostname = "";
     public string Ping = "";
     public string Mac = "";
+    public string Manufacturer = "";
     public string Ports = "";
 }
 
@@ -111,6 +136,7 @@ internal sealed class ToolkitWindow : Form
     private static readonly Color Cobalt = Color.FromArgb(0, 67, 230);
     private static readonly Color Green = Color.FromArgb(31, 128, 78);
     private static readonly Color Slate = Color.FromArgb(75, 94, 116);
+    private static readonly Dictionary<string, string> MacVendors = LoadMacVendors();
     private readonly string folder;
     private readonly string configPath;
     private readonly string logPath;
@@ -433,6 +459,16 @@ internal sealed class ToolkitWindow : Form
         if (!Visible) Show();
         WindowState = FormWindowState.Normal;
         Activate();
+    }
+
+    protected override void WndProc(ref Message message)
+    {
+        if (message.Msg == NativeToolkit.RestoreMessage)
+        {
+            RestoreFromTray();
+            return;
+        }
+        base.WndProc(ref message);
     }
 
     private void ExitToolkit() { exitRequested = true; Close(); }
@@ -1252,17 +1288,27 @@ internal sealed class ToolkitWindow : Form
         page.Controls.Add(L("End IP", 190, 98, 120)); scanEnd = T(190, 122, 156, ""); page.Controls.Add(scanEnd);
         scanButton = B(page, "Scan", 362, 120, 88, StartScan, "Scan up to 1,024 IPs with ping and common TCP probes.", Cobalt);
         B(page, "Stop", 458, 120, 74, delegate { stopScan = true; }, "Stop the current scan.", Slate);
-        B(page, "Export CSV", 540, 120, 110, ExportScan, "Save discovered IPs, hostnames, ping times, MAC addresses, and ports.", Green);
+        B(page, "Export CSV", 540, 120, 110, ExportScan, "Save discovered IPs, hostnames, ping times, MAC owners, and ports.", Green);
         scanStatus = L("Ready | Ping and common TCP services", 18, 164, 660); page.Controls.Add(scanStatus);
         scanView = new ListView { Left = 18, Top = 194, Width = 690, Height = 326, View = View.Details, FullRowSelect = true, GridLines = true, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right };
-        scanView.Columns.Add("IP address", 126); scanView.Columns.Add("Hostname", 198); scanView.Columns.Add("Ping", 70); scanView.Columns.Add("MAC address", 128); scanView.Columns.Add("Open TCP ports", 132);
+        scanView.Columns.Add("IP address", 110); scanView.Columns.Add("Hostname", 145); scanView.Columns.Add("Ping", 58); scanView.Columns.Add("MAC address", 125); scanView.Columns.Add("Manufacturer", 155); scanView.Columns.Add("Open TCP ports", 95);
+        scanView.SizeChanged += delegate { UpdateScanColumns(); };
         page.Controls.Add(scanView);
+        tips.SetToolTip(scanView, "Manufacturer is the registered MAC-prefix owner, which may differ from the device brand. Some devices do not publish a hostname or expose a MAC to this laptop.");
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add("Ping", null, delegate { if (scanView.SelectedItems.Count > 0) PingTerminal(scanView.SelectedItems[0].Text, true); });
         menu.Items.Add("Remote Desktop", null, delegate { if (scanView.SelectedItems.Count > 0) OpenRdp(scanView.SelectedItems[0].Text); });
         menu.Items.Add("Open HTTP", null, delegate { if (scanView.SelectedItems.Count > 0) OpenWeb("http://" + scanView.SelectedItems[0].Text); });
         menu.Items.Add("Open HTTPS", null, delegate { if (scanView.SelectedItems.Count > 0) OpenWeb("https://" + scanView.SelectedItems[0].Text); });
         scanView.ContextMenuStrip = menu;
+    }
+
+    private void UpdateScanColumns()
+    {
+        if (scanView == null) return;
+        int extra = Math.Max(0, scanView.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 688);
+        scanView.Columns[1].Width = 145 + extra / 2;
+        scanView.Columns[4].Width = 155 + extra - extra / 2;
     }
 
     private static uint IpNumber(string value) { byte[] bytes = IPAddress.Parse(ValidateIpv4(value, "Scan IP", false)).GetAddressBytes(); return (uint)((uint)bytes[0] << 24 | (uint)bytes[1] << 16 | (uint)bytes[2] << 8 | bytes[3]); }
@@ -1310,14 +1356,120 @@ internal sealed class ToolkitWindow : Form
         foreach (int port in new[] { 22, 80, 443, 445, 3389 }) if (ProbePort(ip, port, 150)) ports.Add(port);
         if (host.Ping.Length == 0 && ports.Count == 0) return null;
         host.Ports = String.Join(", ", ports.Select(p => p.ToString()).ToArray());
-        try { IAsyncResult task = Dns.BeginGetHostEntry(ip, null, null); if (task.AsyncWaitHandle.WaitOne(300)) host.Hostname = Dns.EndGetHostEntry(task).HostName; } catch { }
+        try { IAsyncResult task = Dns.BeginGetHostEntry(ip, null, null); if (task.AsyncWaitHandle.WaitOne(1200)) host.Hostname = Dns.EndGetHostEntry(task).HostName; } catch { }
+        if (host.Hostname == ip || host.Hostname.Length == 0) host.Hostname = QueryNetBiosName(ip);
         try {
             string arp = CaptureCommand("arp.exe", "-a " + ip);
             Match match = Regex.Match(arp, @"(?m)^\s*" + Regex.Escape(ip) + @"\s+([0-9a-fA-F-]{17})\s+");
-            if (match.Success) host.Mac = match.Groups[1].Value;
+            if (match.Success) { host.Mac = match.Groups[1].Value; host.Manufacturer = LookupManufacturer(host.Mac); }
         }
         catch { }
         return host;
+    }
+
+    private static string QueryNetBiosName(string ip)
+    {
+        byte[] query = new byte[50];
+        query[0] = 0x54; query[1] = 0x45; query[5] = 1;
+        query[12] = 32; query[13] = (byte)'C'; query[14] = (byte)'K';
+        for (int i = 15; i <= 44; i++) query[i] = (byte)'A';
+        query[47] = 0x21; query[49] = 1;
+        try
+        {
+            using (UdpClient client = new UdpClient())
+            {
+                client.Client.ReceiveTimeout = 700;
+                client.Connect(ip, 137);
+                client.Send(query, query.Length);
+                IPEndPoint endpoint = null;
+                return ParseNodeStatusName(client.Receive(ref endpoint), 0x5445);
+            }
+        }
+        catch (SocketException) { return ""; }
+        catch (ObjectDisposedException) { return ""; }
+    }
+
+    private static int SkipDnsName(byte[] response, int offset)
+    {
+        while (offset < response.Length)
+        {
+            int length = response[offset];
+            if (length == 0) return offset + 1;
+            if ((length & 0xC0) == 0xC0) return offset + 2 <= response.Length ? offset + 2 : -1;
+            if (length > 63 || offset + 1 + length > response.Length) return -1;
+            offset += 1 + length;
+        }
+        return -1;
+    }
+
+    private static int Word(byte[] bytes, int offset) { return (bytes[offset] << 8) | bytes[offset + 1]; }
+
+    private static string ParseNodeStatusName(byte[] response, int requestId)
+    {
+        if (response.Length < 12 || Word(response, 0) != requestId || (response[2] & 0x80) == 0 || (response[3] & 0x0F) != 0) return "";
+        int offset = 12;
+        for (int i = 0; i < Word(response, 4); i++)
+        {
+            offset = SkipDnsName(response, offset);
+            if (offset < 0 || offset + 4 > response.Length) return "";
+            offset += 4;
+        }
+        string serverName = "";
+        for (int i = 0; i < Word(response, 6); i++)
+        {
+            offset = SkipDnsName(response, offset);
+            if (offset < 0 || offset + 10 > response.Length) return "";
+            int type = Word(response, offset), size = Word(response, offset + 8), data = offset + 10;
+            if (data + size > response.Length) return "";
+            if (type == 0x21 && size > 0)
+            {
+                int count = response[data];
+                if (1 + count * 18 > size) return "";
+                for (int nameIndex = 0; nameIndex < count; nameIndex++)
+                {
+                    int name = data + 1 + nameIndex * 18;
+                    if ((Word(response, name + 16) & 0x8000) != 0) continue;
+                    string value = Encoding.ASCII.GetString(response, name, 15).TrimEnd(' ', '\0');
+                    if (value.Length == 0 || value == "*") continue;
+                    if (response[name + 15] == 0) return value;
+                    if (response[name + 15] == 0x20 && serverName.Length == 0) serverName = value;
+                }
+            }
+            offset = data + size;
+        }
+        return serverName;
+    }
+
+    private static Dictionary<string, string> LoadMacVendors()
+    {
+        Dictionary<string, string> vendors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        using (Stream stream = typeof(ToolkitWindow).Assembly.GetManifestResourceStream("MacVendors"))
+        {
+            if (stream == null) throw new InvalidDataException("The bundled manufacturer registry is missing.");
+            using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    int separator = line.IndexOf('\t');
+                    if (separator > 0 && separator + 1 < line.Length) vendors[line.Substring(0, separator)] = line.Substring(separator + 1);
+                }
+            }
+        }
+        return vendors;
+    }
+
+    private static string LookupManufacturer(string mac)
+    {
+        string digits = Regex.Replace(mac, "[^0-9A-Fa-f]", "").ToUpperInvariant();
+        if (digits.Length != 12) return "";
+        int firstByte = Convert.ToInt32(digits.Substring(0, 2), 16);
+        if ((firstByte & 1) != 0) return "Multicast";
+        if ((firstByte & 2) != 0) return "Locally assigned";
+        string vendor;
+        foreach (int length in new[] { 9, 7, 6 })
+            if (MacVendors.TryGetValue(digits.Substring(0, length), out vendor)) return vendor;
+        return "Not listed";
     }
 
     private void StartScan()
@@ -1349,7 +1501,7 @@ internal sealed class ToolkitWindow : Form
     {
         if (IsDisposed) return;
         ListViewItem row = new ListViewItem(host.IP);
-        row.SubItems.Add(host.Hostname); row.SubItems.Add(host.Ping); row.SubItems.Add(host.Mac); row.SubItems.Add(host.Ports);
+        row.SubItems.Add(host.Hostname); row.SubItems.Add(host.Ping); row.SubItems.Add(host.Mac); row.SubItems.Add(host.Manufacturer); row.SubItems.Add(host.Ports);
         scanView.Items.Add(row);
     }
     private void ScanProgress(int done, int count) { if (!IsDisposed) scanStatus.Text = "Scanning " + done + "/" + count + " | " + scanView.Items.Count + " devices"; }
@@ -1362,7 +1514,7 @@ internal sealed class ToolkitWindow : Form
             if (dialog.ShowDialog(this) != DialogResult.OK) return;
             using (StreamWriter writer = new StreamWriter(dialog.FileName, false, Encoding.UTF8))
             {
-                writer.WriteLine("IPAddress,Hostname,Ping,MacAddress,OpenPorts");
+                writer.WriteLine("IPAddress,Hostname,Ping,MacAddress,Manufacturer,OpenPorts");
                 foreach (ListViewItem row in scanView.Items) writer.WriteLine(String.Join(",", row.SubItems.Cast<ListViewItem.ListViewSubItem>().Select(c => "\"" + c.Text.Replace("\"", "\"\"") + "\"").ToArray()));
             }
             Log("IP Scanner", "OK", "Exported " + dialog.FileName);
@@ -1450,7 +1602,7 @@ internal sealed class ToolkitWindow : Form
     private void OfferUpdate(Dictionary<string, object> release, string latest)
     {
         if (IsDisposed) return;
-        if (MessageBox.Show(this, "Version " + latest + " is available (installed: " + version + ").\r\n\r\nDownload the update now? The toolkit will exit fully, then Setup will open. Your saved profiles and logs will stay in place.", "Toolkit Update Available", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
+        if (MessageBox.Show(this, "Version " + latest + " is available (installed: " + version + ").\r\n\r\nUpdate now? The toolkit will exit, update in place, and reopen. Your saved profiles and logs will stay in place.", "Toolkit Update Available", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
         ThreadPool.QueueUserWorkItem(delegate {
             try
             {
@@ -1526,6 +1678,25 @@ internal sealed class ToolkitWindow : Form
             if (!feedbackPage.Controls.Cast<Control>().Any(c => c.Text == Mailbox)) throw new InvalidOperationException("Feedback email address is missing.");
             if (feedbackPage.Controls.Cast<Control>().Any(c => c.Text.IndexOf("Screenshot", StringComparison.OrdinalIgnoreCase) >= 0)) throw new InvalidOperationException("Old screenshot controls remain.");
             if (IpText(IpNumber("192.168.10.42")) != "192.168.10.42") throw new InvalidOperationException("IPv4 conversion failed.");
+            if (MacVendors.Count < 50000 || !LookupManufacturer("00-00-0C-00-00-01").StartsWith("Cisco", StringComparison.OrdinalIgnoreCase) ||
+                LookupManufacturer("02-00-00-00-00-01") != "Locally assigned")
+                throw new InvalidOperationException("Offline manufacturer lookup failed.");
+            TabPage scannerPage = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "IP Scanner");
+            if (scanView.Columns.Count != 6 || scanView.Columns[4].Text != "Manufacturer")
+                throw new InvalidOperationException("IP Scanner manufacturer column is missing.");
+            AddScanHost(new ScanHost { IP = "192.0.2.1", Hostname = "TEST-HOST", Mac = "00-00-0C-00-00-01", Manufacturer = "Cisco Systems, Inc" });
+            if (scanView.Items[0].SubItems.Count != 6 || scanView.Items[0].SubItems[1].Text != "TEST-HOST" ||
+                scanView.Items[0].SubItems[4].Text != "Cisco Systems, Inc")
+                throw new InvalidOperationException("IP Scanner result columns are misaligned.");
+            scanView.Items.Clear();
+            byte[] nodeStatus = new byte[43];
+            nodeStatus[0] = 0x54; nodeStatus[1] = 0x45; nodeStatus[2] = 0x80; nodeStatus[7] = 1;
+            nodeStatus[12] = 0xC0; nodeStatus[13] = 0x0C; nodeStatus[15] = 0x21; nodeStatus[17] = 1;
+            nodeStatus[23] = 19; nodeStatus[24] = 1;
+            for (int i = 25; i < 40; i++) nodeStatus[i] = (byte)' ';
+            Encoding.ASCII.GetBytes("EBISERV").CopyTo(nodeStatus, 25);
+            if (ParseNodeStatusName(nodeStatus, 0x5445) != "EBISERV" || ParseNodeStatusName(new byte[3], 0x5445) != "")
+                throw new InvalidOperationException("NetBIOS hostname parsing failed.");
             if (typeof(ToolkitWindow).Assembly.GetReferencedAssemblies().Any(a => a.Name == "System.Management.Automation")) throw new InvalidOperationException("PowerShell runtime reference found.");
             Show(); Application.DoEvents();
             tabs.SelectedTab = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "IP Shifter");
