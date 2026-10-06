@@ -39,6 +39,8 @@ The Feedback tab displays `IT@tec-system.com`. Technicians can copy the address 
 
 For reliable unattended sending across mixed Outlook versions, TEC Systems IT would need to provide an authenticated company mail service or Microsoft Graph integration. No credentials are stored in this toolkit.
 
+The **test** tab includes **Open Test Window**, which displays the installed version so technicians can confirm an update arrived.
+
 ## Verification
 
 The build runs `TEC-Systems-FieldToolkit.exe /self-test` to check native startup, visible tabs, tray close/restore/exit, and the absence of a PowerShell assembly reference. The setup also runs `/verify` against its embedded payload. Neither check sends feedback or changes adapter settings. `tests/Smoke-Toolkit.ps1` tests only the legacy script.

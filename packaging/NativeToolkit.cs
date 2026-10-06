@@ -385,7 +385,7 @@ internal sealed class ToolkitWindow : Form
         BuildNetworkPage(Page("Network Troubleshooting"));
         BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
-        Page("test");
+        BuildTestPage(Page("test"));
         BuildLogPanel();
         internetTimer = new System.Windows.Forms.Timer { Interval = 30000 };
         internetTimer.Tick += delegate { UpdateInternet(); };
@@ -1604,6 +1604,30 @@ internal sealed class ToolkitWindow : Form
         }
     }
 
+    private void BuildTestPage(TabPage page)
+    {
+        page.Controls.Add(L("Update test - version " + version, 24, 28, 560));
+        page.Controls.Add(L("Open the test window to confirm this update is installed.", 24, 64, 620));
+        B(page, "Open Test Window", 24, 110, 180, delegate {
+            using (Form window = CreateTestWindow()) window.ShowDialog(this);
+        }, "Show the installed version in a test window.", Cobalt);
+    }
+
+    private Form CreateTestWindow()
+    {
+        Form window = new Form {
+            Text = "TEC Systems - Update Test", ClientSize = new Size(440, 180),
+            StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false, MinimizeBox = false
+        };
+        window.Controls.Add(L("Update installed successfully: version " + version, 24, 28, 392));
+        window.Controls.Add(L("The test window is working.", 24, 64, 392));
+        Button close = B(window, "Close", 24, 112, 110, delegate { window.Close(); }, "Close this test window.", Slate);
+        window.AcceptButton = close;
+        window.CancelButton = close;
+        return window;
+    }
+
     private void BuildFeedbackPage(TabPage page)
     {
         page.Controls.Add(new Label {
@@ -1801,6 +1825,19 @@ internal sealed class ToolkitWindow : Form
                 throw new InvalidOperationException("NetBIOS hostname parsing failed.");
             if (typeof(ToolkitWindow).Assembly.GetReferencedAssemblies().Any(a => a.Name == "System.Management.Automation")) throw new InvalidOperationException("PowerShell runtime reference found.");
             Show(); Application.DoEvents();
+            TabPage testPage = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "test");
+            if (!testPage.Controls.Cast<Control>().OfType<Button>().Any(button => button.Text == "Open Test Window"))
+                throw new InvalidOperationException("Update test window button is missing.");
+            using (Form updateTest = CreateTestWindow())
+            {
+                updateTest.Show(this); Application.DoEvents();
+                if (!updateTest.Visible || !updateTest.Controls.Cast<Control>().Any(control => control.Text == "Update installed successfully: version " + version))
+                    throw new InvalidOperationException("Update test window did not show the installed version.");
+                updateTest.Controls.Cast<Control>().OfType<Button>().First(button => button.Text == "Close").PerformClick();
+                Application.DoEvents();
+                if (updateTest.Visible) throw new InvalidOperationException("Update test window did not close.");
+            }
+
             foreach (string caption in new[] { "Save Site", "Delete Site" })
             {
                 Control siteButton = windowsPage.Controls.Cast<Control>().First(control => control.Text == caption);
