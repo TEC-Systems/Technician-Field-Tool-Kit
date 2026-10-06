@@ -205,6 +205,42 @@ internal sealed class ScanHost
     public string Ports = "";
 }
 
+internal sealed class ScanResultsComparer : IComparer
+{
+    public readonly int Column;
+    public readonly bool Descending;
+    public ScanResultsComparer(int column, bool descending) { Column = column; Descending = descending; }
+
+    private static int CompareIp(string left, string right)
+    {
+        IPAddress first, second;
+        if (!IPAddress.TryParse(left, out first) || !IPAddress.TryParse(right, out second))
+            return StringComparer.OrdinalIgnoreCase.Compare(left, right);
+        byte[] a = first.GetAddressBytes(), b = second.GetAddressBytes();
+        for (int i = 0; i < Math.Min(a.Length, b.Length); i++)
+            if (a[i] != b[i]) return a[i].CompareTo(b[i]);
+        return a.Length.CompareTo(b.Length);
+    }
+
+    private static int ComparePing(string left, string right)
+    {
+        long a, b;
+        if (!Int64.TryParse(left.Replace(" ms", "").Trim(), out a)) return Int64.TryParse(right.Replace(" ms", "").Trim(), out b) ? 1 : 0;
+        if (!Int64.TryParse(right.Replace(" ms", "").Trim(), out b)) return -1;
+        return a.CompareTo(b);
+    }
+
+    public int Compare(object first, object second)
+    {
+        ListViewItem a = (ListViewItem)first, b = (ListViewItem)second;
+        string left = a.SubItems[Column].Text, right = b.SubItems[Column].Text;
+        int order = Column == 0 ? CompareIp(left, right) : Column == 2 ? ComparePing(left, right) :
+            StringComparer.CurrentCultureIgnoreCase.Compare(left, right);
+        if (Descending) order = -order;
+        return order != 0 ? order : CompareIp(a.Text, b.Text);
+    }
+}
+
 internal sealed class ToolkitTabs : TabControl
 {
     public bool DarkTheme;
@@ -272,9 +308,6 @@ internal sealed class ToolkitWindow : Form
     private TextBox pingTarget;
     private CheckBox continuousPing;
     private RdpManager rdpManager;
-    private TextBox rdpTarget;
-    private TextBox rdpSiteName;
-    private ComboBox rdpSiteChoice;
     private TextBox networkTarget;
     private TextBox switchTarget;
     private ComboBox switchScheme;
@@ -295,6 +328,8 @@ internal sealed class ToolkitWindow : Form
     private Label scanScope;
     private Label scanStatus;
     private ListView scanView;
+    private int scanSortColumn = -1;
+    private bool scanSortDescending;
     private Button scanButton;
 
     public ToolkitWindow(bool startup = false)
@@ -482,7 +517,7 @@ internal sealed class ToolkitWindow : Form
         BuildNetworkPage(Page("Network Troubleshooting"));
         BuildBmsPage(Page("BMS Tools"));
         TabPage rdpPage = Page("RDP");
-        rdpManager = new RdpManager(rdpSites, delegate { SaveSettings(); RefreshRdpSites(null); }, folder);
+        rdpManager = new RdpManager(rdpSites, SaveSettings, folder);
         rdpPage.Controls.Add(rdpManager);
         BuildFeedbackPage(Page("Feedback"));
         BuildLogPanel();
@@ -894,74 +929,6 @@ internal sealed class ToolkitWindow : Form
             { "Printers", "control.exe", "printers" }, { "IPConfig /all", "cmd.exe", "/k ipconfig /all" }
         };
         for (int i = 0; i < specs.GetLength(0); i++) { string name = specs[i, 0], exe = specs[i, 1], arg = specs[i, 2]; B(tools, name, 0, 0, 126, delegate { OpenTool(name, exe, arg); }, "Open " + name + " for Windows troubleshooting.", Slate).Margin = new Padding(0, 0, 8, 8); }
-        page.Controls.Add(L("Saved RDP sites", 18, 380, 200));
-        rdpSiteChoice = new ComboBox { Left = 18, Top = 405, Width = 354, DropDownStyle = ComboBoxStyle.DropDownList };
-        rdpSiteChoice.SelectedIndexChanged += delegate { LoadSelectedRdpSite(); };
-        page.Controls.Add(rdpSiteChoice);
-        B(page, "Open RDP", 388, 401, 118, delegate { OpenRdp(rdpTarget.Text); }, "Connect to the selected or entered server using Remote Desktop. Credentials are not saved.", Cobalt);
-        B(page, "New", 518, 401, 100, NewRdpSite, "Clear the RDP fields to enter a new site.", Slate);
-        page.Controls.Add(L("Site name", 18, 444, 120)); rdpSiteName = T(18, 468, 270, ""); page.Controls.Add(rdpSiteName);
-        page.Controls.Add(L("Server IP / hostname", 304, 444, 220)); rdpTarget = T(304, 468, 270, ""); page.Controls.Add(rdpTarget);
-        B(page, "Save Site", 18, 500, 130, SaveRdpSite, "Save or update this site's RDP destination on this laptop. Passwords are never stored.", Green);
-        B(page, "Delete Site", 164, 500, 130, DeleteRdpSite, "Remove the selected saved RDP site after confirmation.", Slate);
-        RefreshRdpSites(null);
-    }
-
-    private void RefreshRdpSites(RdpSiteProfile selected)
-    {
-        rdpSiteChoice.BeginUpdate();
-        rdpSiteChoice.Items.Clear();
-        foreach (RdpSiteProfile site in rdpSites.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)) rdpSiteChoice.Items.Add(site);
-        rdpSiteChoice.SelectedItem = selected;
-        rdpSiteChoice.EndUpdate();
-        if (rdpManager != null) rdpManager.Reload();
-    }
-
-    private void LoadSelectedRdpSite()
-    {
-        RdpSiteProfile site = rdpSiteChoice.SelectedItem as RdpSiteProfile;
-        if (site == null) return;
-        rdpSiteName.Text = site.Name;
-        rdpTarget.Text = site.Host;
-    }
-
-    private void NewRdpSite()
-    {
-        rdpSiteChoice.SelectedIndex = -1;
-        rdpSiteName.Clear();
-        rdpTarget.Clear();
-        rdpSiteName.Focus();
-    }
-
-    private void SaveRdpSite()
-    {
-        string name = rdpSiteName.Text.Trim(), host = rdpTarget.Text.Trim();
-        if (name.Length == 0) throw new InvalidOperationException("Enter a site name.");
-        if (!ValidTarget(host)) throw new InvalidOperationException("Enter a valid server IP address or hostname.");
-        RdpSiteProfile selected = rdpSiteChoice.SelectedItem as RdpSiteProfile;
-        if (rdpSites.Any(p => !Object.ReferenceEquals(p, selected) && p.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException("An RDP site with that name already exists. Select it to edit, or use a different name.");
-        if (selected == null) { selected = new RdpSiteProfile(); rdpSites.Add(selected); }
-        selected.Name = name;
-        if (!selected.Host.Equals(host, StringComparison.OrdinalIgnoreCase)) selected.ProtectedPassword = "";
-        selected.Host = host;
-        SaveSettings();
-        RdpManager.DeleteConnectionFile(folder, selected.Id);
-        RefreshRdpSites(selected);
-        Log("RDP", "OK", "Saved site: " + name + " (" + host + ")");
-    }
-
-    private void DeleteRdpSite()
-    {
-        RdpSiteProfile selected = rdpSiteChoice.SelectedItem as RdpSiteProfile;
-        if (selected == null) throw new InvalidOperationException("Select a saved RDP site to delete.");
-        if (MessageBox.Show(this, "Delete saved RDP site '" + selected.Name + "'?", "Delete RDP Site", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-        rdpSites.Remove(selected);
-        SaveSettings();
-        RdpManager.DeleteConnectionFile(folder, selected.Id);
-        NewRdpSite();
-        RefreshRdpSites(null);
-        Log("RDP", "OK", "Deleted site: " + selected.Name);
     }
 
     private void SystemSummary()
@@ -1417,6 +1384,7 @@ internal sealed class ToolkitWindow : Form
         scanView = new ListView { Left = 18, Top = 194, Width = 690, Height = 326, View = View.Details, FullRowSelect = true, GridLines = true, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right };
         scanView.Columns.Add("IP address", 110); scanView.Columns.Add("Hostname", 145); scanView.Columns.Add("Ping", 58); scanView.Columns.Add("MAC address", 125); scanView.Columns.Add("Manufacturer", 155); scanView.Columns.Add("Open TCP ports", 95);
         scanView.SizeChanged += delegate { UpdateScanColumns(); };
+        scanView.ColumnClick += delegate(object sender, ColumnClickEventArgs args) { SortScanResults(args.Column); };
         page.Controls.Add(scanView);
         tips.SetToolTip(scanView, "Manufacturer is the registered MAC-prefix owner, which may differ from the device brand. Some devices do not publish a hostname or expose a MAC to this laptop.");
         ContextMenuStrip menu = new ContextMenuStrip();
@@ -1619,6 +1587,18 @@ internal sealed class ToolkitWindow : Form
             catch (Exception error) { Log("IP Scanner", "ERROR", error.Message); }
             finally { if (!IsDisposed && IsHandleCreated) BeginInvoke(new Action(delegate { scanRunning = false; scanButton.Enabled = true; scanStatus.Text = stopScan ? "Scan stopped" : scanView.Items.Count + " devices found"; Log("IP Scanner", "OK", scanStatus.Text); })); }
         });
+    }
+
+    private void SortScanResults(int column)
+    {
+        if (column < 0 || column >= scanView.Columns.Count) return;
+        scanSortDescending = scanSortColumn == column && !scanSortDescending;
+        scanSortColumn = column;
+        foreach (ColumnHeader header in scanView.Columns)
+            header.Text = header.Text.TrimEnd(' ', '▲', '▼');
+        scanView.Columns[column].Text += scanSortDescending ? " ▼" : " ▲";
+        scanView.ListViewItemSorter = new ScanResultsComparer(column, scanSortDescending);
+        scanView.Sort();
     }
 
     private void AddScanHost(ScanHost host)
@@ -1832,10 +1812,9 @@ internal sealed class ToolkitWindow : Form
                 throw new InvalidOperationException("IP Scanner must be next to IP Shifter.");
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
             TabPage windowsPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Windows Troubleshooting");
-            if (windowsPage.Controls.Cast<Control>().Any(c => c.Text == "Open Webpage" || c.Text == "Web URL") ||
-                rdpSiteChoice == null || rdpSiteName == null || rdpTarget == null ||
-                !windowsPage.Controls.Cast<Control>().Any(c => c.Text == "Save Site"))
-                throw new InvalidOperationException("Windows RDP site controls are missing or the old webpage control remains.");
+            if (windowsPage.Controls.Cast<Control>().Any(c => c.Text == "Open Webpage" || c.Text == "Web URL" ||
+                c.Text == "Saved RDP sites" || c.Text == "Save Site" || c.Text == "Delete Site" || c.Text == "Site name"))
+                throw new InvalidOperationException("Windows Troubleshooting still contains removed RDP site controls.");
             FlowLayoutPanel windowsTools = windowsPage.Controls.Cast<Control>().OfType<FlowLayoutPanel>().First();
             if (!windowsTools.Controls.Cast<Control>().Any(c => c.Text == "IPConfig /all"))
                 throw new InvalidOperationException("Command Prompt IPConfig /all shortcut is missing.");
@@ -1877,6 +1856,21 @@ internal sealed class ToolkitWindow : Form
                 scanView.Items[0].SubItems[4].Text != "Cisco Systems, Inc")
                 throw new InvalidOperationException("IP Scanner result columns are misaligned.");
             scanView.Items.Clear();
+            AddScanHost(new ScanHost { IP = "192.168.1.10", Hostname = "zulu", Ping = "12 ms" });
+            AddScanHost(new ScanHost { IP = "192.168.1.2", Hostname = "Alpha", Ping = "3 ms" });
+            SortScanResults(0);
+            if (scanView.Items[0].Text != "192.168.1.2") throw new InvalidOperationException("IP Scanner IP sort is not numeric.");
+            SortScanResults(0);
+            if (scanView.Items[0].Text != "192.168.1.10") throw new InvalidOperationException("IP Scanner reverse IP sort failed.");
+            SortScanResults(1);
+            if (scanView.Items[0].SubItems[1].Text != "Alpha") throw new InvalidOperationException("IP Scanner A-Z hostname sort failed.");
+            SortScanResults(1);
+            if (scanView.Items[0].SubItems[1].Text != "zulu") throw new InvalidOperationException("IP Scanner Z-A hostname sort failed.");
+            SortScanResults(2);
+            if (scanView.Items[0].SubItems[2].Text != "3 ms") throw new InvalidOperationException("IP Scanner ping sort is not numeric.");
+            AddScanHost(new ScanHost { IP = "192.168.1.3", Hostname = "Bravo", Ping = "1 ms" });
+            if (scanView.Items[0].SubItems[2].Text != "1 ms") throw new InvalidOperationException("New scan result ignored the selected sort.");
+            scanView.ListViewItemSorter = null; scanView.Items.Clear();
             byte[] nodeStatus = new byte[43];
             nodeStatus[0] = 0x54; nodeStatus[1] = 0x45; nodeStatus[2] = 0x80; nodeStatus[7] = 1;
             nodeStatus[12] = 0xC0; nodeStatus[13] = 0x0C; nodeStatus[15] = 0x21; nodeStatus[17] = 1;
@@ -1887,22 +1881,6 @@ internal sealed class ToolkitWindow : Form
                 throw new InvalidOperationException("NetBIOS hostname parsing failed.");
             if (typeof(ToolkitWindow).Assembly.GetReferencedAssemblies().Any(a => a.Name == "System.Management.Automation")) throw new InvalidOperationException("PowerShell runtime reference found.");
             Show(); Application.DoEvents();
-            foreach (string caption in new[] { "Save Site", "Delete Site" })
-            {
-                Control siteButton = windowsPage.Controls.Cast<Control>().First(control => control.Text == caption);
-                if (!windowsPage.ClientRectangle.Contains(siteButton.Bounds))
-                    throw new InvalidOperationException(caption + " is clipped at the startup window size.");
-            }
-            RdpSiteProfile testRdp = new RdpSiteProfile { Name = "Self-test site", Host = "192.0.2.10" };
-            rdpSites.Add(testRdp);
-            RefreshRdpSites(testRdp);
-            if (rdpSiteName.Text != testRdp.Name || rdpTarget.Text != testRdp.Host)
-                throw new InvalidOperationException("Selecting an RDP site did not load its server address.");
-            NewRdpSite();
-            if (rdpSiteChoice.SelectedIndex != -1 || rdpSiteName.Text.Length != 0 || rdpTarget.Text.Length != 0)
-                throw new InvalidOperationException("New RDP site did not clear the previous selection.");
-            rdpSites.Remove(testRdp);
-            RefreshRdpSites(null);
             tabs.SelectedTab = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "IP Shifter");
             split.SplitterDistance = 650;
             Application.DoEvents();
