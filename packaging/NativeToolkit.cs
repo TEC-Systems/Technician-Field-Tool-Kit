@@ -584,7 +584,7 @@ internal sealed partial class ToolkitWindow : Form
         TabPage rdpPage = Page("RDP");
         rdpManager = new RdpManager(rdpSites, SaveSettings, folder);
         rdpPage.Controls.Add(rdpManager);
-        BuildSiteWorkspace(Page("Sites"));
+        // Site workspaces are retained in settings but hidden for the field launch.
         BuildNetworkPage(Page("Network Troubleshooting"));
         BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
@@ -2062,11 +2062,12 @@ internal sealed partial class ToolkitWindow : Form
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
                 throw new InvalidOperationException("Release checksum line ending handling failed.");
-            if (tabs.TabPages.Count != 8) throw new InvalidOperationException("Expected eight active tabs.");
+            if (tabs.TabPages.Count != 7) throw new InvalidOperationException("Expected seven active tabs.");
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
-            if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner" || tabs.TabPages[3].Text != "RDP" || tabs.TabPages[4].Text != "Sites")
-                throw new InvalidOperationException("IP Scanner, RDP, and Sites tab order is incorrect.");
+            if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner" || tabs.TabPages[3].Text != "RDP" ||
+                tabs.TabPages.Cast<TabPage>().Any(p => p.Text == "Sites"))
+                throw new InvalidOperationException("IP Scanner/RDP tab order or hidden Sites tab is incorrect.");
             SelfTestSiteWorkspace();
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
             TabPage windowsPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Windows Troubleshooting");

@@ -510,13 +510,9 @@ internal sealed partial class ToolkitWindow
             throw new InvalidOperationException("Site workspace serialization failed.");
         if (UniqueName("Sample site", new[] { "Sample site" }) != "Sample site (2)")
             throw new InvalidOperationException("Imported site name collision handling failed.");
-        if (workspaceList == null || workspaceChecks == null || workspaceRdp == null ||
+        if (workspaceList != null || tabs.TabPages.Cast<TabPage>().Any(p => p.Text == "Sites") ||
             !tabs.TabPages.Cast<TabPage>().First(p => p.Text == "IP Shifter").Controls.OfType<Button>().Any(b => b.Text == "IP History"))
-            throw new InvalidOperationException("Site workspace or IP history controls are missing.");
-        SplitContainer siteLayout = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Sites").Controls.OfType<SplitContainer>().Single();
-        if (siteLayout.SplitterWidth > 2 || workspaceList.BorderStyle != BorderStyle.FixedSingle ||
-            workspaceRdp.BorderStyle != BorderStyle.FixedSingle || workspaceChecks.BorderStyle != BorderStyle.FixedSingle)
-            throw new InvalidOperationException("Site workspace borders are too heavy.");
+            throw new InvalidOperationException("Site workspaces must be hidden while IP History remains available.");
     }
 }
 
