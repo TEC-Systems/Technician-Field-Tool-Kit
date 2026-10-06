@@ -120,8 +120,10 @@ Copy-Item -LiteralPath $trayIco -Destination (Join-Path $root 'assets\TEC System
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
 if (-not (Test-Path $compiler)) { throw 'The .NET Framework C# compiler was not found.' }
 
-& $compiler /nologo /target:winexe ('/win32manifest:"{0}"' -f (Join-Path $PSScriptRoot 'Toolkit.manifest')) ("/out:`"{0}`"" -f $launcher) ("/win32icon:`"{0}`"" -f $iconIco) ("/resource:`"{0}`",MacVendors" -f (Join-Path $PSScriptRoot 'mac-vendors.tsv')) /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Management.dll /reference:System.ServiceProcess.dll /reference:System.Web.Extensions.dll /reference:System.Core.dll /reference:System.Security.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll (Join-Path $PSScriptRoot 'NativeToolkit.cs') (Join-Path $PSScriptRoot 'RdpManager.cs')
-if ($LASTEXITCODE -ne 0) { throw 'Native toolkit compilation failed.' }
+$compileOutput = & $compiler /nologo /target:winexe ('/win32manifest:"{0}"' -f (Join-Path $PSScriptRoot 'Toolkit.manifest')) ("/out:`"{0}`"" -f $launcher) ("/win32icon:`"{0}`"" -f $iconIco) ("/resource:`"{0}`",MacVendors" -f (Join-Path $PSScriptRoot 'mac-vendors.tsv')) /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Management.dll /reference:System.ServiceProcess.dll /reference:System.Web.Extensions.dll /reference:System.Core.dll /reference:System.Security.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll (Join-Path $PSScriptRoot 'NativeToolkit.cs') (Join-Path $PSScriptRoot 'RdpManager.cs') 2>&1
+$compileExit = $LASTEXITCODE
+$compileOutput | Write-Host
+if ($compileExit -ne 0) { throw ('Native toolkit compilation failed: ' + ($compileOutput -join "`n")) }
 $selfTestError = Join-Path $dist 'self-test-error.txt'
 if (Test-Path -LiteralPath $selfTestError) { Remove-Item -LiteralPath $selfTestError -Force }
 $selfTest = Start-Process -FilePath $launcher -ArgumentList '/self-test' -PassThru -Wait
@@ -145,8 +147,10 @@ for ($attempt = 1; $attempt -le 5; $attempt++) {
     }
 }
 
-& $compiler /nologo /target:winexe ('/win32manifest:"{0}"' -f (Join-Path $PSScriptRoot 'Toolkit.manifest')) ("/out:`"{0}`"" -f $setup) ("/win32icon:`"{0}`"" -f $iconIco) ("/resource:`"{0}`",ToolkitPayload" -f $payload) /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll (Join-Path $PSScriptRoot 'ToolkitSetup.cs')
-if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
+$compileOutput = & $compiler /nologo /target:winexe ('/win32manifest:"{0}"' -f (Join-Path $PSScriptRoot 'Toolkit.manifest')) ("/out:`"{0}`"" -f $setup) ("/win32icon:`"{0}`"" -f $iconIco) ("/resource:`"{0}`",ToolkitPayload" -f $payload) /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll (Join-Path $PSScriptRoot 'ToolkitSetup.cs') 2>&1
+$compileExit = $LASTEXITCODE
+$compileOutput | Write-Host
+if ($compileExit -ne 0) { throw ('Installer compilation failed: ' + ($compileOutput -join "`n")) }
 
 $verify = Start-Process -FilePath $setup -ArgumentList '/verify' -PassThru -Wait
 if ($verify.ExitCode -ne 0) { throw 'Installer payload verification failed.' }
