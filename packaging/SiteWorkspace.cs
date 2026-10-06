@@ -400,7 +400,7 @@ internal sealed partial class ToolkitWindow
                 string ipName = Value(row, "Name").Trim();
                 if (ipName.Length == 0 || ipName.Length > 100) throw new InvalidOperationException("The IP profile name is invalid.");
                 ip = new ToolkitProfile { Name = UniqueName(ipName, profiles.Select(p => p.Name)), Adapter = Value(row, "Adapter"),
-                    IPAddress = ValidateIpv4(Value(row, "IPAddress"), "Imported IP", false), SubnetMask = ValidateIpv4(Value(row, "SubnetMask"), "Imported mask", false),
+                    IPAddress = ValidateIpv4(Value(row, "IPAddress"), "Imported IP", true), SubnetMask = ValidateIpv4(Value(row, "SubnetMask"), "Imported mask", true),
                     Gateway = ValidateIpv4(Value(row, "Gateway"), "Imported gateway", true), Dns1 = ValidateIpv4(Value(row, "Dns1"), "Imported DNS 1", true),
                     Dns2 = ValidateIpv4(Value(row, "Dns2"), "Imported DNS 2", true) };
                 site.IpProfileName = ip.Name;
@@ -446,7 +446,8 @@ internal sealed partial class ToolkitWindow
         report.AppendLine(); report.AppendLine("Linked RDP connections (no credentials):");
         foreach (RdpSiteProfile rdp in rdpSites.Where(r => site.RdpIds.Contains(r.Id))) report.AppendLine("- " + rdp.Name + " | " + rdp.Host);
         report.AppendLine(); report.AppendLine("Current adapters:");
-        foreach (ToolkitAdapter adapter in adapters) report.AppendLine("- " + adapter.Name + " | " + adapter.Status + " | " + adapter.IP + " / " + adapter.Mask + " | Gateway " + adapter.Gateway);
+        foreach (ToolkitAdapter adapter in adapters) report.AppendLine("- " + adapter.Name + " | " + adapter.Status + " | " + adapter.IP + " / " + adapter.Mask +
+            " | Gateway " + adapter.Gateway + " | DNS " + adapter.Dns + " | MAC " + adapter.Mac);
         report.AppendLine(); report.AppendLine("Connection checks: " + (siteCheckedId == site.Id ? siteCheckedUtc : "Not run for this site"));
         if (siteCheckedId == site.Id) foreach (SiteCheckResult result in siteResults)
             report.AppendLine("- " + result.Name + " (" + result.Host + "): ping " + result.Ping + ", DNS " + result.Dns + ", RDP " + result.Rdp + ", web " + result.Web);
@@ -460,6 +461,7 @@ internal sealed partial class ToolkitWindow
     private void ExportWorkspaceReport()
     {
         if (selectedWorkspace == null) throw new InvalidOperationException("Select a saved site first.");
+        RefreshAdapters();
         using (SaveFileDialog dialog = new SaveFileDialog { Filter = "Text reports (*.txt)|*.txt", FileName = "TEC-Site-Report-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt" })
             if (dialog.ShowDialog(this) == DialogResult.OK) { File.WriteAllText(dialog.FileName, WorkspaceReport(selectedWorkspace), Encoding.UTF8); Log("Sites", "OK", "Exported diagnostic report for " + selectedWorkspace.Name); }
     }

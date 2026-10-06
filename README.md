@@ -68,6 +68,7 @@ The build also checks RDP profile persistence, folder grouping, resolution gener
 ## Repository files
 
 - `packaging/NativeToolkit.cs`: installed native technician GUI
+- `packaging/SiteWorkspace.cs`: site workspaces, connection checks, import/export, reports, and IP history
 - `packaging/ToolkitSetup.cs`: installer source
 - `packaging/Build-Installer.ps1`: IT-side release build script
 - `TEC-Systems-FieldToolkit.ps1`: legacy GUI, not installed
