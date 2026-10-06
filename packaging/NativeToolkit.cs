@@ -918,7 +918,7 @@ internal sealed class ToolkitWindow : Form
         Action[] actions = { SystemSummary, DiskSummary, ServiceCheck, EventErrors, ProblemDevices, UpdateStatus };
         for (int i = 0; i < labels.Length; i++) B(page, labels[i], 18 + (i % 5) * 144, 130 + (i / 5) * 40, 132, actions[i], "Write " + labels[i].ToLowerInvariant() + " findings to the technician log.", Cobalt);
         page.Controls.Add(L("Open tools", 18, 220, 180));
-        FlowLayoutPanel tools = new FlowLayoutPanel { Left = 18, Top = 244, Width = 708, Height = 126, AutoScroll = true, WrapContents = true };
+        FlowLayoutPanel tools = new FlowLayoutPanel { Left = 18, Top = 244, Width = 708, AutoScroll = false, WrapContents = true };
         page.Controls.Add(tools);
         string[,] specs = {
             { "Services", "services.msc", "" }, { "Event Viewer", "eventvwr.msc", "" }, { "Device Manager", "devmgmt.msc", "" },
@@ -929,6 +929,13 @@ internal sealed class ToolkitWindow : Form
             { "Printers", "control.exe", "printers" }, { "IPConfig /all", "cmd.exe", "/k ipconfig /all" }
         };
         for (int i = 0; i < specs.GetLength(0); i++) { string name = specs[i, 0], exe = specs[i, 1], arg = specs[i, 2]; B(tools, name, 0, 0, 126, delegate { OpenTool(name, exe, arg); }, "Open " + name + " for Windows troubleshooting.", Slate).Margin = new Padding(0, 0, 8, 8); }
+        Action fitTools = delegate {
+            tools.Width = Math.Max(134, page.ClientSize.Width - 36);
+            int columns = Math.Max(1, tools.ClientSize.Width / 134);
+            tools.Height = ((tools.Controls.Count + columns - 1) / columns) * 42 + 4;
+        };
+        page.SizeChanged += delegate { fitTools(); };
+        fitTools();
     }
 
     private void SystemSummary()
@@ -1829,6 +1836,13 @@ internal sealed class ToolkitWindow : Form
             FlowLayoutPanel windowsTools = windowsPage.Controls.Cast<Control>().OfType<FlowLayoutPanel>().First();
             if (!windowsTools.Controls.Cast<Control>().Any(c => c.Text == "IPConfig /all"))
                 throw new InvalidOperationException("Command Prompt IPConfig /all shortcut is missing.");
+            if (windowsTools.AutoScroll || windowsTools.Controls.Count != 17 ||
+                windowsTools.Controls.Cast<Control>().Any(c => !windowsTools.ClientRectangle.Contains(c.Bounds)))
+                throw new InvalidOperationException("Open tools shortcuts are clipped or require internal scrolling.");
+            split.SplitterDistance = 650; Application.DoEvents();
+            if (windowsTools.Controls.Cast<Control>().Any(c => !windowsTools.ClientRectangle.Contains(c.Bounds)))
+                throw new InvalidOperationException("Open tools shortcuts are clipped at narrow width.");
+            SetInitialSplit(); Application.DoEvents();
             string rdpSample = json.Serialize(new[] { new Dictionary<string, object> { { "Name", "Test site" }, { "Host", "192.0.2.10" } } });
             object[] rdpRoundTrip = json.Deserialize<object[]>(rdpSample);
             IDictionary<string, object> rdpLoaded = rdpRoundTrip[0] as IDictionary<string, object>;
