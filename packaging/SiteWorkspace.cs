@@ -135,10 +135,10 @@ internal sealed partial class ToolkitWindow
 
     private void BuildSiteWorkspace(TabPage page)
     {
-        SplitContainer layout = new SplitContainer { Dock = DockStyle.Fill, Size = new Size(800, 600), SplitterDistance = 180, Panel1MinSize = 145, Panel2MinSize = 360 };
+        SplitContainer layout = new SplitContainer { Dock = DockStyle.Fill, Size = new Size(800, 600), SplitterDistance = 180, SplitterWidth = 2, Panel1MinSize = 145, Panel2MinSize = 360 };
         page.Controls.Add(layout);
         layout.Panel1.Padding = new Padding(10);
-        workspaceList = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
+        workspaceList = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, BorderStyle = BorderStyle.FixedSingle };
         workspaceList.SelectedIndexChanged += delegate { if (!loadingWorkspace) SelectWorkspace(workspaceList.SelectedItem as SiteWorkspaceProfile); };
         layout.Panel1.Controls.Add(workspaceList);
         Label heading = new Label { Text = "Sites", Dock = DockStyle.Top, Height = 27, Font = new Font("Segoe UI", 11f, FontStyle.Bold) };
@@ -156,7 +156,7 @@ internal sealed partial class ToolkitWindow
         editor.Controls.Add(fields);
         workspaceName = new TextBox(); AddWorkspaceRow(fields, "Site name", workspaceName);
         workspaceIpProfile = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList }; AddWorkspaceRow(fields, "IP profile", workspaceIpProfile);
-        workspaceRdp = new CheckedListBox { Height = 85, CheckOnClick = true }; AddWorkspaceRow(fields, "RDP sites", workspaceRdp);
+        workspaceRdp = new CheckedListBox { Height = 85, CheckOnClick = true, BorderStyle = BorderStyle.FixedSingle }; AddWorkspaceRow(fields, "RDP sites", workspaceRdp);
         workspaceDevices = new TextBox { Multiline = true, Height = 78, ScrollBars = ScrollBars.Vertical };
         AddWorkspaceRow(fields, "Devices", workspaceDevices);
         AddWorkspaceRow(fields, "", new Label { Text = "One device per line: Name | hostname or IP. RDP sites are checked separately.", AutoSize = true, MaximumSize = new Size(380, 0) });
@@ -174,7 +174,7 @@ internal sealed partial class ToolkitWindow
         AddWorkspaceRow(fields, "", buttons);
         workspaceStatus = new Label { Text = "Select a site or create one.", AutoSize = true, MaximumSize = new Size(390, 0) };
         AddWorkspaceRow(fields, "", workspaceStatus);
-        workspaceChecks = new ListView { Height = 150, View = View.Details, FullRowSelect = true };
+        workspaceChecks = new ListView { Height = 150, View = View.Details, FullRowSelect = true, BorderStyle = BorderStyle.FixedSingle };
         workspaceChecks.Columns.Add("Target", 150); workspaceChecks.Columns.Add("Ping", 70); workspaceChecks.Columns.Add("DNS", 70);
         workspaceChecks.Columns.Add("RDP", 70); workspaceChecks.Columns.Add("Web", 90);
         AddWorkspaceRow(fields, "Results", workspaceChecks);
@@ -513,6 +513,10 @@ internal sealed partial class ToolkitWindow
         if (workspaceList == null || workspaceChecks == null || workspaceRdp == null ||
             !tabs.TabPages.Cast<TabPage>().First(p => p.Text == "IP Shifter").Controls.OfType<Button>().Any(b => b.Text == "IP History"))
             throw new InvalidOperationException("Site workspace or IP history controls are missing.");
+        SplitContainer siteLayout = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Sites").Controls.OfType<SplitContainer>().Single();
+        if (siteLayout.SplitterWidth > 2 || workspaceList.BorderStyle != BorderStyle.FixedSingle ||
+            workspaceRdp.BorderStyle != BorderStyle.FixedSingle || workspaceChecks.BorderStyle != BorderStyle.FixedSingle)
+            throw new InvalidOperationException("Site workspace borders are too heavy.");
     }
 }
 
