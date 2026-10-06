@@ -45,6 +45,7 @@ internal sealed class RdpManager : UserControl
         AddRow(editor, "Server / IP", host);
         AddRow(editor, "Username", user);
         AddRow(editor, "Domain", domain);
+        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = "For BMS sites using a local login, leave Domain blank. Enter a domain only if the site uses a domain account." });
         AddRow(editor, "Password", password);
         AddRow(editor, "", remember);
         resolution.Items.AddRange(Resolutions); resolution.SelectedIndex = 0;
@@ -73,7 +74,7 @@ internal sealed class RdpManager : UserControl
 
     private void AddButton(Control panel, string caption, Action action)
     {
-        Button button = new Button { Text = caption, AutoSize = true, Height = 34, Margin = new Padding(0, 0, 8, 8) };
+        Button button = new Button { Text = caption, AutoSize = true, Height = 34, FlatStyle = FlatStyle.Flat, Tag = caption == "Connect" ? Color.FromArgb(0, 67, 230) : caption == "Save Site" ? Color.FromArgb(31, 128, 78) : Color.FromArgb(75, 94, 116), Margin = new Padding(0, 0, 8, 8) };
         button.Click += delegate { Run(action); }; panel.Controls.Add(button);
     }
 
@@ -131,7 +132,7 @@ internal sealed class RdpManager : UserControl
             if (password.Text.Length > 0) encrypted = ProtectPassword(password.Text);
             else if (sameIdentity) encrypted = selected.ProtectedPassword;
         }
-        return new RdpSiteProfile { Name = name.Text.Trim(), Group = group.Text.Trim(), Host = server,
+        return new RdpSiteProfile { Id = selected == null ? Guid.NewGuid().ToString("N") : selected.Id, Name = name.Text.Trim(), Group = group.Text.Trim(), Host = server,
             User = user.Text.Trim(), Domain = domain.Text.Trim(), Resolution = Convert.ToString(resolution.SelectedItem), ProtectedPassword = encrypted };
     }
 
@@ -146,6 +147,7 @@ internal sealed class RdpManager : UserControl
         selected = edited;
         try { save(); }
         catch { if (index < 0) sites.Remove(edited); else sites[index] = previous; selected = previous; throw; }
+        if (!String.IsNullOrEmpty(folder)) WriteConnectionFile(edited, Screen.FromControl(this).WorkingArea.Size);
         password.Clear(); Reload();
     }
 
@@ -155,6 +157,7 @@ internal sealed class RdpManager : UserControl
         if (MessageBox.Show(this, "Delete saved site '" + selected.Name + "'?", "RDP", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         RdpSiteProfile previous = selected; int index = sites.IndexOf(previous); sites.Remove(previous);
         try { save(); } catch { sites.Insert(index, previous); throw; }
+        if (!String.IsNullOrEmpty(folder)) DeleteConnectionFile(folder, previous.Id);
         NewSite(); Reload();
     }
 
@@ -163,20 +166,71 @@ internal sealed class RdpManager : UserControl
         RdpSiteProfile connection = ReadFields();
         // An entered password can be used for this connection without saving it in the profile.
         if (!remember.Checked && password.Text.Length > 0) connection.ProtectedPassword = ProtectPassword(password.Text);
-        string connections = Path.Combine(folder, "rdp-connections"); Directory.CreateDirectory(connections);
-        string path = Path.Combine(connections, Guid.NewGuid().ToString("N") + ".rdp");
+        // A saved site uses the same path; one-off credentials use a disposable file.
+        bool persistent = selected != null && password.Text.Length == 0;
+        string path;
         Size screen = Screen.FromControl(this).WorkingArea.Size;
-        File.WriteAllText(path, BuildRdpFile(connection, screen), Encoding.Unicode);
+        if (persistent) path = WriteConnectionFile(connection, screen);
+        else
+        {
+            string connections = Path.Combine(folder, "rdp-connections"); Directory.CreateDirectory(connections);
+            path = Path.Combine(connections, "temporary-" + Guid.NewGuid().ToString("N") + ".rdp");
+            File.WriteAllText(path, BuildRdpFile(connection, screen), Encoding.Unicode);
+        }
         try
         {
             Process session = Process.Start(new ProcessStartInfo("mstsc.exe", "\"" + path + "\"") { UseShellExecute = true });
-            ThreadPool.QueueUserWorkItem(delegate {
+            if (persistent) { if (session != null) session.Dispose(); }
+            else ThreadPool.QueueUserWorkItem(delegate {
                 try { if (session != null) { session.WaitForExit(); session.Dispose(); } File.Delete(path); }
                 catch { /* Windows may still be using this encrypted connection file. */ }
             });
         }
-        catch { File.Delete(path); throw; }
+        catch { if (!persistent) File.Delete(path); throw; }
         password.Clear();
+    }
+
+    internal static string ValidProfileId(string value)
+    {
+        Guid id; return Guid.TryParse(value, out id) ? id.ToString("N") : Guid.NewGuid().ToString("N");
+    }
+
+    private static string ConnectionPath(string dataFolder, string id)
+    {
+        Guid parsed;
+        if (!Guid.TryParse(id, out parsed)) throw new InvalidOperationException("The saved site identifier is invalid. Save the site again.");
+        return Path.Combine(dataFolder, "rdp-connections", parsed.ToString("N") + ".rdp");
+    }
+
+    internal static void DeleteConnectionFile(string dataFolder, string id)
+    {
+        string path = ConnectionPath(dataFolder, id);
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    private string WriteConnectionFile(RdpSiteProfile site, Size screen)
+    {
+        string path = ConnectionPath(folder, site.Id);
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        string previous = File.Exists(path) ? File.ReadAllText(path, Encoding.Unicode) : "";
+        File.WriteAllText(path, MergeConnectionPreferences(previous, BuildRdpFile(site, screen)), Encoding.Unicode);
+        return path;
+    }
+
+    internal static string MergeConnectionPreferences(string previous, string generated)
+    {
+        // Retain ordinary MSTSC display/resource preferences, never silently suppress server authentication.
+        string[] preserved = { "redirectclipboard", "redirectprinters", "redirectcomports", "redirectsmartcards", "redirectposdevices", "drivestoredirect", "devicestoredirect", "audiomode", "audiocapturemode", "keyboardhook", "smart sizing", "use multimon", "selectedmonitors", "winposstr", "connection type", "networkautodetect", "bandwidthautodetect", "displayconnectionbar", "disable wallpaper", "disable full window drag", "disable menu anims", "disable themes", "bitmapcachepersistenable" };
+        List<string> lines = generated.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries).ToList();
+        foreach (string line in previous.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            int separator = line.IndexOf(':');
+            if (separator < 0) continue;
+            string key = line.Substring(0, separator);
+            if (!preserved.Contains(key, StringComparer.OrdinalIgnoreCase)) continue;
+            lines.RemoveAll(item => item.StartsWith(key + ":", StringComparison.OrdinalIgnoreCase)); lines.Add(line);
+        }
+        return String.Join("\r\n", lines.ToArray()) + "\r\n";
     }
 
     internal static string ProtectPassword(string value)
@@ -219,18 +273,37 @@ internal sealed class RdpManager : UserControl
             if (saves != 1 || data.Count != 1 || manager.tree.Nodes[0].Text != "Office" || manager.password.Text.Length != 0)
                 throw new InvalidOperationException("RDP site saving or folder display failed.");
             RdpSiteProfile site = data[0];
+            string temporaryFolder = Path.Combine(Path.GetTempPath(), "TEC-Rdp-Test-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                using (RdpManager fileManager = new RdpManager(data, delegate { }, temporaryFolder))
+                {
+                    string path = fileManager.WriteConnectionFile(site, new Size(1920, 1080));
+                    File.AppendAllText(path, "redirectprinters:i:1\r\n", Encoding.Unicode);
+                    string secondPath = fileManager.WriteConnectionFile(site, new Size(1920, 1080));
+                    if (path != secondPath || !File.ReadAllText(path).Contains("redirectprinters:i:1")) throw new InvalidOperationException("Saved RDP file or Windows preferences were not retained.");
+                    RdpSiteProfile cleared = new RdpSiteProfile { Id = site.Id, Host = site.Host, User = site.User, Resolution = site.Resolution };
+                    fileManager.WriteConnectionFile(cleared, new Size(1920, 1080));
+                    if (File.ReadAllText(path).Contains("password 51:")) throw new InvalidOperationException("Removed RDP password remained in the connection file.");
+                    DeleteConnectionFile(temporaryFolder, site.Id);
+                    if (File.Exists(path)) throw new InvalidOperationException("Deleted RDP site retained its connection file.");
+                }
+            }
+            finally { if (Directory.Exists(temporaryFolder)) Directory.Delete(temporaryFolder, true); }
+            string retained = MergeConnectionPreferences("redirectprinters:i:1\r\nauthentication level:i:0\r\npassword 51:b:DEAD\r\n", BuildRdpFile(site, new Size(1920, 1080)));
+            if (!retained.Contains("redirectprinters:i:1") || !retained.Contains("authentication level:i:2") || retained.Contains("password 51:b:DEAD")) throw new InvalidOperationException("RDP preferences or authentication retention failed.");
             byte[] encrypted = Enumerable.Range(0, site.ProtectedPassword.Length / 2).Select(i => Convert.ToByte(site.ProtectedPassword.Substring(i * 2, 2), 16)).ToArray();
             byte[] plain = ProtectedData.Unprotect(encrypted, null, DataProtectionScope.CurrentUser);
             try { if (Encoding.Unicode.GetString(plain) != "self-test-password") throw new InvalidOperationException("RDP password encryption round-trip failed."); }
             finally { Array.Clear(plain, 0, plain.Length); }
             JavaScriptSerializer serializer = new JavaScriptSerializer();
             RdpSiteProfile restored = serializer.Deserialize<RdpSiteProfile>(serializer.Serialize(site));
-            if (restored.Host != site.Host || restored.Group != "Office" || restored.Resolution != "1280 x 720" || restored.ProtectedPassword != site.ProtectedPassword)
+            if (restored.Id != site.Id || restored.Host != site.Host || restored.Group != "Office" || restored.Resolution != "1280 x 720" || restored.ProtectedPassword != site.ProtectedPassword)
                 throw new InvalidOperationException("RDP profile persistence failed.");
             string file = BuildRdpFile(restored, new Size(1920, 1080));
             if (!file.Contains("username:s:TEC\\technician") || !file.Contains("desktopwidth:i:1280") || !file.Contains("desktopheight:i:720") || file.Contains("self-test-password"))
                 throw new InvalidOperationException("RDP connection settings failed.");
-            manager.SaveSite(); if (data[0].ProtectedPassword != site.ProtectedPassword) throw new InvalidOperationException("RDP saved password was lost on edit.");
+            manager.SaveSite(); if (data[0].Id != site.Id || data[0].ProtectedPassword != site.ProtectedPassword) throw new InvalidOperationException("RDP saved password was lost on edit.");
             manager.host.Text = "192.0.2.11"; manager.SaveSite();
             if (data[0].ProtectedPassword.Length != 0) throw new InvalidOperationException("RDP credentials carried over to a different server.");
             manager.password.Text = "self-test-password"; manager.SaveSite();

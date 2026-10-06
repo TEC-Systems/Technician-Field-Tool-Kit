@@ -152,6 +152,14 @@ internal static class ToolkitSetup
         if (desktopShortcut == true) CreateShortcut(DesktopShortcut, Path.Combine(InstallFolder, ExeName));
         else if (desktopShortcut == false && File.Exists(DesktopShortcut)) File.Delete(DesktopShortcut);
         RegisterUninstall(PayloadVersion());
+        // Enable sign-in startup on first adoption; preserve the user's later opt-out.
+        using (RegistryKey preference = Registry.CurrentUser.CreateSubKey(@"Software\TEC Systems\Field Toolkit"))
+        using (RegistryKey run = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
+        {
+            if (preference.GetValue("StartupConfigured") == null || run.GetValue(ProductName) != null)
+                run.SetValue(ProductName, "\"" + Path.Combine(InstallFolder, ExeName) + "\" /startup");
+            preference.SetValue("StartupConfigured", 1);
+        }
     }
 
     private static bool IsInstalledToolkitRunning()
@@ -271,6 +279,8 @@ internal static class ToolkitSetup
         if (File.Exists(StartShortcut)) File.Delete(StartShortcut);
         if (File.Exists(DesktopShortcut)) File.Delete(DesktopShortcut);
         Registry.CurrentUser.DeleteSubKey(RegistryPath, false);
+        using (RegistryKey run = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+            if (run != null) run.DeleteValue(ProductName, false);
         string assets = Path.Combine(InstallFolder, "assets");
         if (Directory.Exists(assets) && !Directory.EnumerateFileSystemEntries(assets).Any()) Directory.Delete(assets);
         if (Directory.Exists(InstallFolder) && !Directory.EnumerateFileSystemEntries(InstallFolder).Any()) Directory.Delete(InstallFolder);

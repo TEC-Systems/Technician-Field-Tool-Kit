@@ -32,6 +32,32 @@ internal static class NativeToolkit
     [DllImport("user32.dll")]
     private static extern bool PostMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(uint processId);
+    [DllImport("user32.dll")]
+    internal static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    internal static extern bool ChangeWindowMessageFilterEx(IntPtr window, uint message, uint action, IntPtr filter);
+
+    internal static bool RestoreExisting()
+    {
+        for (int attempt = 0; attempt < 50; attempt++)
+        {
+            IntPtr existing = FindWindow(null, "TEC Systems Field Toolkit Activation");
+            if (existing == IntPtr.Zero) existing = FindWindow(null, "TEC Systems Field Toolkit");
+            if (existing != IntPtr.Zero)
+            {
+                uint processId; GetWindowThreadProcessId(existing, out processId);
+                AllowSetForegroundWindow(processId);
+                if (PostMessage(existing, RestoreMessage, IntPtr.Zero, IntPtr.Zero)) return true;
+            }
+            Thread.Sleep(100);
+        }
+        return false;
+    }
+
     [STAThread]
     private static int Main(string[] args)
     {
@@ -39,7 +65,20 @@ internal static class NativeToolkit
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            if (args.Length > 0 && args[0] == "/activate") return RestoreExisting() ? 0 : 1;
+            if (args.Length == 2 && args[0] == "/wait-for-exit")
+            {
+                int previousId;
+                if (!Int32.TryParse(args[1], out previousId) || previousId <= 0) throw new ArgumentException("Invalid previous toolkit process.");
+                try { using (Process previous = Process.GetProcessById(previousId)) if (!previous.WaitForExit(15000)) throw new InvalidOperationException("The previous toolkit did not exit. Exit it from its tray menu and try again."); }
+                catch (ArgumentException) { }
+            }
+            bool startup = args.Any(arg => arg == "/startup");
             bool selfTest = args.Length > 0 && args[0] == "/self-test";
+            if (args.Length > 0 && args[0] == "/startup-self-test")
+            {
+                using (ToolkitWindow startupWindow = new ToolkitWindow(true)) return startupWindow.StartupSelfTest();
+            }
             if (selfTest)
             {
                 using (ToolkitWindow testWindow = new ToolkitWindow()) return testWindow.SelfTest();
@@ -49,14 +88,13 @@ internal static class NativeToolkit
             {
                 if (!firstInstance)
                 {
-                    IntPtr existing = FindWindow(null, "TEC Systems Field Toolkit");
-                    if (existing == IntPtr.Zero || !PostMessage(existing, RestoreMessage, IntPtr.Zero, IntPtr.Zero))
-                        MessageBox.Show("The toolkit is already running in this Windows session. Open it from the TEC notification-area icon.", "TEC Systems Field Toolkit", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    if (!startup && !RestoreExisting())
+                        MessageBox.Show("The running toolkit could not be reached. Try its notification-area icon, or exit it there and reopen the toolkit.", "TEC Systems Field Toolkit", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return 0;
                 }
                 try
                 {
-                    using (ToolkitWindow window = new ToolkitWindow()) Application.Run(window);
+                    using (ToolkitWindow window = new ToolkitWindow(startup)) Application.Run(window);
                 }
                 finally { instance.ReleaseMutex(); }
             }
@@ -64,12 +102,52 @@ internal static class NativeToolkit
         }
         catch (Exception error)
         {
-            if (args.Length > 0 && args[0] == "/self-test")
+            if (args.Length > 0 && (args[0] == "/self-test" || args[0] == "/startup-self-test"))
                 File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "self-test-error.txt"), error.ToString());
             else
                 MessageBox.Show(error.Message, "TEC Systems Field Toolkit", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
+    }
+}
+
+internal sealed class ToolkitActivationWindow : NativeWindow, IDisposable
+{
+    private readonly Action restore;
+    internal ToolkitActivationWindow(Action action)
+    {
+        restore = action;
+        CreateHandle(new CreateParams { Caption = "TEC Systems Field Toolkit Activation" });
+        // This message only requests that the window be shown; no command or data is accepted.
+        NativeToolkit.ChangeWindowMessageFilterEx(Handle, NativeToolkit.RestoreMessage, 1, IntPtr.Zero);
+    }
+    protected override void WndProc(ref Message message)
+    {
+        if (message.Msg == NativeToolkit.RestoreMessage) { restore(); return; }
+        base.WndProc(ref message);
+    }
+    public void Dispose() { DestroyHandle(); }
+}
+
+internal static class ToolkitStartup
+{
+    internal const string RunPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    internal const string PreferencePath = @"Software\TEC Systems\Field Toolkit";
+    internal const string Entry = "TEC Systems Field Toolkit";
+    internal static bool Enabled()
+    {
+        using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunPath))
+            return key != null && key.GetValue(Entry) != null;
+    }
+    internal static string Command(string executable) { return "\"" + executable + "\" /startup"; }
+    internal static void SetEnabled(bool enabled)
+    {
+        using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RunPath))
+        {
+            if (enabled) key.SetValue(Entry, Command(Application.ExecutablePath));
+            else key.DeleteValue(Entry, false);
+        }
+        using (RegistryKey key = Registry.CurrentUser.CreateSubKey(PreferencePath)) key.SetValue("StartupConfigured", 1);
     }
 }
 
@@ -93,6 +171,7 @@ internal sealed class BmsServerProfile
 
 internal sealed class RdpSiteProfile
 {
+    public string Id = System.Guid.NewGuid().ToString("N");
     public string Name = "";
     public string Host = "";
     public string Group = "";
@@ -168,6 +247,12 @@ internal sealed class ToolkitWindow : Form
     private bool scanRunning;
     private string yabePath = "";
     private NotifyIcon tray;
+    private ToolkitActivationWindow activation;
+    private System.Windows.Forms.Timer updateTimer;
+    private Button updateButton;
+    private Dictionary<string, object> availableRelease;
+    private string availableVersion = "";
+    private int checkingUpdates;
     private bool testing;
     private ContextMenuStrip trayMenu;
     private System.Windows.Forms.Timer internetTimer;
@@ -195,11 +280,6 @@ internal sealed class ToolkitWindow : Form
     private TextBox telnetPort;
     private TextBox playbookText;
     private ComboBox bundleType;
-    private TextBox ebiHost;
-    private TextBox ebiUser;
-    private TextBox ebiBackupPath;
-    private TextBox bmsSiteName;
-    private ListView bmsProfileView;
     private ListView profileView;
     private ComboBox adapterChoice;
     private TextBox profileName;
@@ -216,7 +296,7 @@ internal sealed class ToolkitWindow : Form
     private ListView scanView;
     private Button scanButton;
 
-    public ToolkitWindow()
+    public ToolkitWindow(bool startup = false)
     {
         folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TEC Systems", "Field Toolkit");
         Directory.CreateDirectory(folder);
@@ -234,8 +314,10 @@ internal sealed class ToolkitWindow : Form
         if (File.Exists(iconFile)) Icon = new Icon(iconFile);
         BuildWindow();
         ConfigureTray();
+        activation = new ToolkitActivationWindow(RestoreFromTray);
+        if (startup) { WindowState = FormWindowState.Minimized; ShowInTaskbar = false; }
         ApplyTheme();
-        Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (testing) return; RefreshAdapters(); RefreshProfiles(); RefreshScannerAdapters(); UpdateInternet(); internetTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
+        Shown += delegate { if (startup) { Hide(); ShowInTaskbar = true; } SetInitialSplit(); ApplyTitleBarTheme(); if (testing) return; RefreshAdapters(); RefreshProfiles(); RefreshScannerAdapters(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
         FormClosing += OnClosing;
     }
 
@@ -255,6 +337,7 @@ internal sealed class ToolkitWindow : Form
             object mode;
             if (settings.TryGetValue("DarkMode", out mode)) dark = Convert.ToBoolean(mode);
             yabePath = Value(settings, "YabePath");
+            bool migratedRdpIds = false;
             object saved;
             if (settings.TryGetValue("SiteProfiles", out saved) && saved is IEnumerable)
             {
@@ -288,7 +371,9 @@ internal sealed class ToolkitWindow : Form
                     if (row == null) continue;
                     string name = Value(row, "Name").Trim(), host = Value(row, "Host").Trim();
                     if (name.Length == 0 || !ValidTarget(host) || rdpSites.Any(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
-                    rdpSites.Add(new RdpSiteProfile { Name = name, Host = host, Group = Value(row, "Group"),
+                    Guid savedId;
+                    if (!Guid.TryParse(Value(row, "Id"), out savedId)) migratedRdpIds = true;
+                    rdpSites.Add(new RdpSiteProfile { Id = RdpManager.ValidProfileId(Value(row, "Id")), Name = name, Host = host, Group = Value(row, "Group"),
                         User = Value(row, "User"), Domain = Value(row, "Domain"),
                         Resolution = String.IsNullOrEmpty(Value(row, "Resolution")) ? "Full screen" : Value(row, "Resolution"),
                         ProtectedPassword = Value(row, "ProtectedPassword") });
@@ -296,6 +381,7 @@ internal sealed class ToolkitWindow : Form
             }
             if (bmsProfiles.Count == 0 && ValidTarget(Value(settings, "EbiHost")))
                 bmsProfiles.Add(new BmsServerProfile { Name = "Saved server", Host = Value(settings, "EbiHost"), User = Value(settings, "EbiUser") });
+            if (migratedRdpIds) SaveSettings();
         }
         catch (Exception error) { File.AppendAllText(logPath, "Settings warning: " + error.Message + Environment.NewLine); }
     }
@@ -312,7 +398,7 @@ internal sealed class ToolkitWindow : Form
             { "Name", p.Name }, { "Host", p.Host }, { "User", p.User }
         }).ToArray();
         settings["RdpSites"] = rdpSites.Select(p => new Dictionary<string, object> {
-            { "Name", p.Name }, { "Host", p.Host }, { "Group", p.Group }, { "User", p.User },
+            { "Id", p.Id }, { "Name", p.Name }, { "Host", p.Host }, { "Group", p.Group }, { "User", p.User },
             { "Domain", p.Domain }, { "Resolution", p.Resolution }, { "ProtectedPassword", p.ProtectedPassword }
         }).ToArray();
         settings.Remove("EbiHost");
@@ -334,7 +420,7 @@ internal sealed class ToolkitWindow : Form
     {
         Button button = new Button { Text = text, Left = x, Top = y, Width = width, Height = 34, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Tag = color };
         button.FlatAppearance.BorderSize = 0;
-        button.Click += delegate { try { action(); } catch (Exception error) { Fail(text, error); } };
+        button.Click += delegate { try { action(); } catch (Exception error) { if (!IsDisposed) Fail(text, error); } };
         if (!String.IsNullOrEmpty(hint)) tips.SetToolTip(button, hint);
         parent.Controls.Add(button);
         return button;
@@ -377,7 +463,7 @@ internal sealed class ToolkitWindow : Form
         Controls.Add(footer);
         statusLabel = L("Ready", 18, 11, 295);
         footer.Controls.Add(statusLabel);
-        B(footer, "Check Updates", 338, 5, 130, delegate { CheckUpdates(false); }, "Check for a newer signed-off toolkit release.", Cobalt);
+        updateButton = B(footer, "Check Updates", 338, 5, 148, OpenUpdateOffer, "Check for a newer toolkit release or install an available update.", Cobalt);
         internetLabel = new Label { Text = "Internet: Checking", Dock = DockStyle.Right, Width = 450, TextAlign = ContentAlignment.MiddleRight, Padding = new Padding(0, 0, 18, 0) };
         footer.Controls.Add(internetLabel);
 
@@ -398,10 +484,11 @@ internal sealed class ToolkitWindow : Form
         rdpManager = new RdpManager(rdpSites, delegate { SaveSettings(); RefreshRdpSites(null); }, folder);
         rdpPage.Controls.Add(rdpManager);
         BuildFeedbackPage(Page("Feedback"));
-        BuildTestPage(Page("test"));
         BuildLogPanel();
         internetTimer = new System.Windows.Forms.Timer { Interval = 30000 };
         internetTimer.Tick += delegate { UpdateInternet(); };
+        updateTimer = new System.Windows.Forms.Timer { Interval = 30 * 60 * 1000 };
+        updateTimer.Tick += delegate { CheckUpdates(true); };
     }
 
     private void SetInitialSplit()
@@ -484,18 +571,38 @@ internal sealed class ToolkitWindow : Form
         string trayFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "TEC Systems Field Toolkit Tray.ico");
         trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("Open Toolkit", null, delegate { RestoreFromTray(); });
-        trayMenu.Items.Add("Check Updates", null, delegate { RestoreFromTray(); CheckUpdates(false); });
+        trayMenu.Items.Add("Check Updates", null, delegate { RestoreFromTray(); OpenUpdateOffer(); });
+        ToolStripMenuItem startupItem = new ToolStripMenuItem("Start with Windows") { Checked = ToolkitStartup.Enabled() };
+        startupItem.Click += delegate {
+            try { ToolkitStartup.SetEnabled(!startupItem.Checked); startupItem.Checked = ToolkitStartup.Enabled(); }
+            catch (Exception error) { Fail("Windows Startup", error); }
+        };
+        trayMenu.Items.Add(startupItem);
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add("Exit Toolkit", null, delegate { ExitToolkit(); });
         tray = new NotifyIcon { Icon = File.Exists(trayFile) ? new Icon(trayFile) : Icon, Text = Product, ContextMenuStrip = trayMenu, Visible = true };
-        tray.DoubleClick += delegate { RestoreFromTray(); };
+        tray.MouseClick += OnTrayMouseClick;
+        tray.BalloonTipClicked += delegate { RestoreFromTray(); OpenUpdateOffer(); };
+    }
+
+    private void OnTrayMouseClick(object sender, MouseEventArgs args)
+    {
+        if (args.Button == MouseButtons.Left) RestoreFromTray();
+    }
+
+    protected override void OnHandleCreated(EventArgs args)
+    {
+        base.OnHandleCreated(args);
+        NativeToolkit.ChangeWindowMessageFilterEx(Handle, NativeToolkit.RestoreMessage, 1, IntPtr.Zero);
     }
 
     private void RestoreFromTray()
     {
         if (!Visible) Show();
         WindowState = FormWindowState.Normal;
+        BringToFront();
         Activate();
+        NativeToolkit.SetForegroundWindow(Handle);
     }
 
     protected override void WndProc(ref Message message)
@@ -514,6 +621,8 @@ internal sealed class ToolkitWindow : Form
     {
         if (!exitRequested && args.CloseReason == CloseReason.UserClosing) { args.Cancel = true; Hide(); return; }
         if (internetTimer != null) { internetTimer.Stop(); internetTimer.Dispose(); }
+        if (updateTimer != null) { updateTimer.Stop(); updateTimer.Dispose(); }
+        if (activation != null) { activation.Dispose(); activation = null; }
         if (tray != null) { tray.Visible = false; tray.Dispose(); }
         if (trayMenu != null) trayMenu.Dispose();
         if (brandPicture != null) brandPicture.Image = null;
@@ -640,6 +749,12 @@ internal sealed class ToolkitWindow : Form
                 control.BackColor = surface;
             else if (control is SplitterPanel || control is Panel || control is TabControl || control is TabPage)
                 control.BackColor = canvas;
+            else if (control is TreeView)
+            {
+                control.BackColor = input;
+                ((TreeView)control).LineColor = text;
+                control.Invalidate();
+            }
             else if (control is TextBox || control is ComboBox || control is ListBox)
             {
                 control.BackColor = input;
@@ -829,6 +944,7 @@ internal sealed class ToolkitWindow : Form
         if (!selected.Host.Equals(host, StringComparison.OrdinalIgnoreCase)) selected.ProtectedPassword = "";
         selected.Host = host;
         SaveSettings();
+        RdpManager.DeleteConnectionFile(folder, selected.Id);
         RefreshRdpSites(selected);
         Log("RDP", "OK", "Saved site: " + name + " (" + host + ")");
     }
@@ -840,6 +956,7 @@ internal sealed class ToolkitWindow : Form
         if (MessageBox.Show(this, "Delete saved RDP site '" + selected.Name + "'?", "Delete RDP Site", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         rdpSites.Remove(selected);
         SaveSettings();
+        RdpManager.DeleteConnectionFile(folder, selected.Id);
         NewRdpSite();
         RefreshRdpSites(null);
         Log("RDP", "OK", "Deleted site: " + selected.Name);
@@ -1074,7 +1191,7 @@ internal sealed class ToolkitWindow : Form
         if (IsAdmin()) return;
         if (MessageBox.Show(this, "Changing adapter settings requires administrator rights. Restart the toolkit as administrator?", "Administrator Required", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
         {
-            try { Process.Start(new ProcessStartInfo(Application.ExecutablePath) { UseShellExecute = true, Verb = "runas" }); ExitToolkit(); }
+            try { Process.Start(new ProcessStartInfo(Application.ExecutablePath, "/wait-for-exit " + Process.GetCurrentProcess().Id) { UseShellExecute = true, Verb = "runas" }); ExitToolkit(); }
             catch (Exception error) { throw new InvalidOperationException("Could not restart as administrator: " + error.Message); }
         }
         throw new InvalidOperationException("No IP settings were changed. Run the toolkit as administrator.");
@@ -1221,161 +1338,9 @@ internal sealed class ToolkitWindow : Form
 
     private void BuildBmsPage(TabPage page)
     {
-        page.AutoScroll = true;
-        page.Controls.Add(new Label { Text = "BMS Tools", Left = 18, Top = 17, Width = 300, Height = 35, Font = new Font("Segoe UI", 16f, FontStyle.Bold) });
-        B(page, "Launch YABE", 400, 18, 150, LaunchYabe, "Open installed YABE. Select Yabe.exe once if it is installed elsewhere.", Green);
-        page.Controls.Add(L("Saved BMS servers", 18, 55, 250));
-        bmsProfileView = new ListView { Left = 18, Top = 78, Width = 590, Height = 112, View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = false };
-        bmsProfileView.Columns.Add("Site / profile", 190);
-        bmsProfileView.Columns.Add("Server", 210);
-        bmsProfileView.Columns.Add("Username", 170);
-        bmsProfileView.SelectedIndexChanged += delegate { LoadSelectedBmsProfile(); };
-        page.Controls.Add(bmsProfileView);
-        page.SizeChanged += delegate { ResizeBmsProfileView(page); };
-        ResizeBmsProfileView(page);
-        RefreshBmsProfiles();
-        page.Controls.Add(L("Profile name / site", 18, 195, 190));
-        bmsSiteName = T(18, 219, 190, ""); page.Controls.Add(bmsSiteName);
-        B(page, "New", 224, 215, 78, NewBmsProfile, "Clear the fields to create another site or server profile.", Slate);
-        B(page, "Save Profile", 312, 215, 112, SaveEbiServer, "Save or update this site's server and username on this laptop. Passwords are never stored.", Cobalt);
-        B(page, "Delete", 434, 215, 88, DeleteBmsProfile, "Delete the selected saved profile after confirmation. This does not change the server.", Slate);
-        BuildEbiPanel(page);
-        if (bmsProfileView.Items.Count > 0)
-        {
-            bmsProfileView.Items[0].Selected = true;
-            BmsServerProfile first = bmsProfileView.Items[0].Tag as BmsServerProfile;
-            if (first != null) { bmsSiteName.Text = first.Name; ebiHost.Text = first.Host; ebiUser.Text = first.User; }
-        }
-    }
-
-    private void ResizeBmsProfileView(TabPage page)
-    {
-        if (bmsProfileView == null) return;
-        bmsProfileView.Width = Math.Max(570, page.ClientSize.Width - 36);
-        int usable = bmsProfileView.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 5;
-        bmsProfileView.Columns[0].Width = Math.Max(170, (usable - 170) / 2);
-        bmsProfileView.Columns[1].Width = Math.Max(190, usable - bmsProfileView.Columns[0].Width - 170);
-        bmsProfileView.Columns[2].Width = 170;
-    }
-
-    private void RefreshBmsProfiles()
-    {
-        bmsProfileView.Items.Clear();
-        foreach (BmsServerProfile profile in bmsProfiles.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
-        {
-            ListViewItem item = new ListViewItem(profile.Name) { Tag = profile };
-            item.SubItems.Add(profile.Host);
-            item.SubItems.Add(profile.User);
-            bmsProfileView.Items.Add(item);
-        }
-    }
-
-    private void LoadSelectedBmsProfile()
-    {
-        if (bmsProfileView.SelectedItems.Count == 0) return;
-        BmsServerProfile profile = bmsProfileView.SelectedItems[0].Tag as BmsServerProfile;
-        if (profile == null) return;
-        bmsSiteName.Text = profile.Name;
-        ebiHost.Text = profile.Host;
-        ebiUser.Text = profile.User;
-        Log("BMS", "INFO", "Selected " + profile.Name + " (" + profile.Host + ").");
-    }
-
-    private void NewBmsProfile()
-    {
-        foreach (ListViewItem item in bmsProfileView.SelectedItems.Cast<ListViewItem>().ToArray()) item.Selected = false;
-        bmsSiteName.Clear(); ebiHost.Clear(); ebiUser.Clear();
-        bmsSiteName.Focus();
-    }
-
-    private void BuildEbiPanel(TabPage page)
-    {
-        GroupBox panel = new GroupBox { Text = "Connect to BMS Server (EBI)", Left = 18, Top = 265, Width = 590, Height = 258 };
-        page.Controls.Add(panel);
-        page.SizeChanged += delegate { panel.Width = Math.Max(570, page.ClientSize.Width - 36); };
-        panel.Width = Math.Max(570, page.ClientSize.Width - 36);
-        panel.Controls.Add(L("Server hostname / IP", 14, 26, 200));
-        ebiHost = T(14, 50, 250, ""); panel.Controls.Add(ebiHost);
-        panel.Controls.Add(L("Username (not password)", 280, 26, 220));
-        ebiUser = T(280, 50, 270, ""); panel.Controls.Add(ebiUser);
-        B(panel, "Ping", 14, 91, 92, delegate { PingTerminal(EbiTarget(), false); }, "Show four live ping replies from this laptop to the EBI server.", Slate);
-        B(panel, "RDP", 118, 91, 92, delegate { OpenRdp(EbiTarget()); }, "Open Remote Desktop Connection; Windows asks for your login.", Slate);
-        B(panel, "Remote Shell", 222, 91, 130, delegate { OpenEbiShell(null); }, "Open an interactive WinRM shell. Windows prompts for the password in the terminal.", Green);
-        B(panel, "Check Ports", 364, 91, 118, CheckEbiPorts, "Check RDP 3389 and WinRM 5985/5986. Open ports do not prove login access.", Slate);
-        panel.Controls.Add(L("Backup output path on server", 14, 143, 280));
-        ebiBackupPath = T(14, 168, 250, "C:\\sitename.txt"); panel.Controls.Add(ebiBackupPath);
-        B(panel, "Liclist", 280, 164, 110, delegate { OpenEbiShell("liclist"); }, "Run Liclist on the EBI server through WinRM.", Cobalt);
-        B(panel, "bckbld -out", 402, 164, 160, RunEbiBackup, "Run bckbld with the chosen output path on the server after confirmation.", Cobalt);
-        panel.Controls.Add(new Label { Text = "WinRM access must be approved and configured on the server. Use a hostname for domain authentication where possible.", Left = 14, Top = 213, Width = 550, Height = 30, AutoEllipsis = true });
-    }
-
-    private string EbiTarget()
-    {
-        string target = ebiHost.Text.Trim();
-        if (!ValidTarget(target)) throw new InvalidOperationException("Enter a valid EBI server hostname or IP address.");
-        return target;
-    }
-
-    private void SaveEbiServer()
-    {
-        string name = bmsSiteName.Text.Trim(), host = EbiTarget(), user = ebiUser.Text.Trim();
-        if (name.Length == 0 || name.Length > 80) throw new InvalidOperationException("Enter a profile name or site (up to 80 characters).");
-        BmsServerProfile profile = bmsProfileView.SelectedItems.Count > 0 ? bmsProfileView.SelectedItems[0].Tag as BmsServerProfile : null;
-        BmsServerProfile duplicate = bmsProfiles.FirstOrDefault(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-        if (duplicate != null && !Object.ReferenceEquals(duplicate, profile))
-            throw new InvalidOperationException("A BMS profile with that name already exists. Select it to update, or use another name.");
-        if (profile == null) { profile = new BmsServerProfile(); bmsProfiles.Add(profile); }
-        profile.Name = name; profile.Host = host; profile.User = user;
-        SaveSettings();
-        RefreshBmsProfiles();
-        ListViewItem item = bmsProfileView.Items.Cast<ListViewItem>().FirstOrDefault(row => Object.ReferenceEquals(row.Tag, profile));
-        if (item != null) item.Selected = true;
-        Log("BMS", "OK", "Saved " + name + " (" + host + "); no password stored.");
-    }
-
-    private void DeleteBmsProfile()
-    {
-        if (bmsProfileView.SelectedItems.Count == 0) throw new InvalidOperationException("Select a saved BMS profile to delete.");
-        BmsServerProfile profile = bmsProfileView.SelectedItems[0].Tag as BmsServerProfile;
-        if (profile == null) return;
-        if (MessageBox.Show(this, "Delete saved profile '" + profile.Name + "'? This only removes its local shortcut.", "Delete BMS Profile", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-        bmsProfiles.Remove(profile);
-        SaveSettings();
-        RefreshBmsProfiles();
-        bmsSiteName.Clear(); ebiHost.Clear(); ebiUser.Clear();
-        Log("BMS", "OK", "Deleted profile " + profile.Name + ".");
-    }
-
-    private void OpenEbiShell(string command)
-    {
-        string host = EbiTarget();
-        string user = ebiUser.Text.Trim();
-        if (!Regex.IsMatch(user, @"^[A-Za-z0-9_.@\\-]+$")) throw new InvalidOperationException("Enter a valid Windows username, such as DOMAIN\\technician. Passwords are entered only in the terminal prompt.");
-        string args = "/k winrs /r:" + host + " /u:" + user + " cmd.exe" + (String.IsNullOrEmpty(command) ? "" : " /c " + command);
-        Process.Start(new ProcessStartInfo("cmd.exe", args) { UseShellExecute = true });
-        Log("EBI", "INFO", "Opened WinRM " + (String.IsNullOrEmpty(command) ? "shell" : command) + " on " + host + ". Enter password in the terminal; it is not stored.");
-    }
-
-    private void RunEbiBackup()
-    {
-        string path = ebiBackupPath.Text.Trim();
-        if (!Regex.IsMatch(path, @"^[A-Za-z]:\\[A-Za-z0-9_.-]+\.txt$"))
-            throw new InvalidOperationException("Enter a server-local output path such as C:\\sitename.txt (letters, numbers, underscore, hyphen, or period only).");
-        if (MessageBox.Show(this, "Run bckbld -out " + path + " on " + EbiTarget() + "?\r\n\r\nThis writes a file on the EBI server. Confirm the site and path first.",
-            "Run EBI Command", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-        OpenEbiShell("bckbld -out " + path);
-    }
-
-    private void CheckEbiPorts()
-    {
-        string host = EbiTarget();
-        ThreadPool.QueueUserWorkItem(delegate {
-            foreach (int port in new[] { 3389, 5985, 5986 })
-            {
-                bool reachable = ProbePort(host, port, 650);
-                Log("EBI", reachable ? "OK" : "INFO", host + ":" + port + (reachable ? " reachable" : " unavailable"));
-            }
-        });
+        page.Controls.Add(new Label { Text = "BMS Tools", Left = 24, Top = 24, Width = 400, Height = 38, Font = new Font("Segoe UI", 16f, FontStyle.Bold) });
+        B(page, "Launch YABE", 24, 82, 160, LaunchYabe, "Open installed YABE. Select Yabe.exe once if it is installed elsewhere.", Green);
+        page.Controls.Add(L("More BMS tools — work in progress", 24, 142, 500));
     }
 
     private void LaunchYabe()
@@ -1678,30 +1643,6 @@ internal sealed class ToolkitWindow : Form
         }
     }
 
-    private void BuildTestPage(TabPage page)
-    {
-        page.Controls.Add(L("Update test - version " + version, 24, 28, 560));
-        page.Controls.Add(L("Open the test window to confirm this update is installed.", 24, 64, 620));
-        B(page, "Open Test Window", 24, 110, 180, delegate {
-            using (Form window = CreateTestWindow()) window.ShowDialog(this);
-        }, "Show the installed version in a test window.", Cobalt);
-    }
-
-    private Form CreateTestWindow()
-    {
-        Form window = new Form {
-            Text = "TEC Systems - Update Test", ClientSize = new Size(440, 180),
-            StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog,
-            MaximizeBox = false, MinimizeBox = false
-        };
-        window.Controls.Add(L("Update installed successfully: version " + version, 24, 28, 392));
-        window.Controls.Add(L("The test window is working.", 24, 64, 392));
-        Button close = B(window, "Close", 24, 112, 110, delegate { window.Close(); }, "Close this test window.", Slate);
-        window.AcceptButton = close;
-        window.CancelButton = close;
-        return window;
-    }
-
     private void BuildFeedbackPage(TabPage page)
     {
         page.Controls.Add(new Label {
@@ -1745,8 +1686,28 @@ internal sealed class ToolkitWindow : Form
         if (tray != null) tray.Text = Product + " - Internet: " + (online ? "Online" : "Offline");
     }
 
+    private void OpenUpdateOffer()
+    {
+        if (availableRelease != null) OfferUpdate(availableRelease, availableVersion);
+        else CheckUpdates(false);
+    }
+
+    private void AnnounceUpdate(Dictionary<string, object> release, string latest, bool silent)
+    {
+        bool newlyAvailable = availableVersion != latest;
+        availableRelease = release; availableVersion = latest;
+        updateButton.Text = "Update Available";
+        updateButton.Tag = Color.FromArgb(177, 93, 39);
+        updateButton.BackColor = Color.FromArgb(177, 93, 39);
+        tips.SetToolTip(updateButton, "Version " + latest + " is available. Click to install.");
+        if (newlyAvailable && !testing) tray.ShowBalloonTip(10000, "Toolkit update available", "Version " + latest + " is ready. Open the toolkit and click Update Available.", ToolTipIcon.Info);
+        if (!silent) OfferUpdate(release, latest);
+    }
+
     private void CheckUpdates(bool silent)
     {
+        if (Interlocked.CompareExchange(ref checkingUpdates, 1, 0) != 0) return;
+        if (availableRelease == null) updateButton.Text = "Checking...";
         ThreadPool.QueueUserWorkItem(delegate {
             try
             {
@@ -1758,7 +1719,7 @@ internal sealed class ToolkitWindow : Form
                     Dictionary<string, object> release = json.Deserialize<Dictionary<string, object>>(releaseJson);
                     Version latest = new Version(Value(release, "tag_name").TrimStart('v'));
                     if (latest <= new Version(version)) { if (!silent) BeginInvoke(new Action(delegate { MessageBox.Show(this, "This toolkit is up to date.", "Toolkit Updates"); })); return; }
-                    BeginInvoke(new Action(delegate { OfferUpdate(release, latest.ToString()); }));
+                    BeginInvoke(new Action(delegate { AnnounceUpdate(release, latest.ToString(), silent); }));
                 }
             }
             catch (WebException error)
@@ -1777,6 +1738,13 @@ internal sealed class ToolkitWindow : Form
                 if (!silent && !IsDisposed) BeginInvoke(new Action(delegate { Fail("Updates", error); }));
             }
             catch (Exception error) { if (!silent && !IsDisposed) BeginInvoke(new Action(delegate { Fail("Updates", error); })); }
+            finally
+            {
+                Interlocked.Exchange(ref checkingUpdates, 0);
+                if (!IsDisposed && IsHandleCreated)
+                    try { BeginInvoke(new Action(delegate { if (availableRelease == null) updateButton.Text = "Check Updates"; })); }
+                    catch (InvalidOperationException) { }
+            }
         });
     }
 
@@ -1823,6 +1791,17 @@ internal sealed class ToolkitWindow : Form
         return match.Groups[1].Value;
     }
 
+    public int StartupSelfTest()
+    {
+        testing = true;
+        Show(); Application.DoEvents();
+        if (Visible || !tray.Visible) throw new InvalidOperationException("Windows sign-in startup did not remain in the tray.");
+        RestoreFromTray(); Application.DoEvents();
+        if (!Visible || !ShowInTaskbar) throw new InvalidOperationException("Startup instance did not restore to the taskbar.");
+        ExitToolkit();
+        return 0;
+    }
+
     public int SelfTest()
     {
         try
@@ -1844,7 +1823,7 @@ internal sealed class ToolkitWindow : Form
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
                 throw new InvalidOperationException("Release checksum line ending handling failed.");
-            if (tabs.TabPages.Count != 8) throw new InvalidOperationException("Expected eight active tabs.");
+            if (tabs.TabPages.Count != 7) throw new InvalidOperationException("Expected seven active tabs.");
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
             if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner")
@@ -1873,14 +1852,9 @@ internal sealed class ToolkitWindow : Form
                 !deviceAccess.Controls.Cast<Control>().Any(c => c.Text == "Open Telnet"))
                 throw new InvalidOperationException("Telnet controls are missing.");
             TabPage bmsPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "BMS Tools");
-            if (!bmsPage.Controls.Cast<Control>().Any(c => c.Text == "Launch YABE") ||
-                !bmsPage.Controls.Cast<Control>().Any(c => c.Text == "Connect to BMS Server (EBI)"))
-                throw new InvalidOperationException("BMS server tools are missing.");
-            if (bmsPage.Controls.Cast<Control>().Any(c => c.Text == "Choose the reported issue" || c.Text == "Steps taken" || c.Text == "Start"))
-                throw new InvalidOperationException("BMS decision guide controls remain.");
-            if (bmsProfileView == null || bmsSiteName == null ||
-                !bmsPage.Controls.Cast<Control>().Any(c => c.Text == "Save Profile"))
-                throw new InvalidOperationException("BMS server profile controls are missing.");
+            if (bmsPage.Controls.OfType<Button>().Count() != 1 || !bmsPage.Controls.Cast<Control>().Any(c => c.Text == "Launch YABE") ||
+                !bmsPage.Controls.Cast<Control>().Any(c => c.Text == "More BMS tools — work in progress"))
+                throw new InvalidOperationException("BMS page should contain only YABE and the work-in-progress note.");
             string sample = json.Serialize(new[] { new Dictionary<string, object> { { "Name", "Test site" }, { "Host", "ebi.example.test" }, { "User", "DOMAIN\\tech" } } });
             object[] roundTrip = json.Deserialize<object[]>(sample);
             IDictionary<string, object> loaded = roundTrip[0] as IDictionary<string, object>;
@@ -1911,19 +1885,6 @@ internal sealed class ToolkitWindow : Form
                 throw new InvalidOperationException("NetBIOS hostname parsing failed.");
             if (typeof(ToolkitWindow).Assembly.GetReferencedAssemblies().Any(a => a.Name == "System.Management.Automation")) throw new InvalidOperationException("PowerShell runtime reference found.");
             Show(); Application.DoEvents();
-            TabPage testPage = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "test");
-            if (!testPage.Controls.Cast<Control>().OfType<Button>().Any(button => button.Text == "Open Test Window"))
-                throw new InvalidOperationException("Update test window button is missing.");
-            using (Form updateTest = CreateTestWindow())
-            {
-                updateTest.Show(this); Application.DoEvents();
-                if (!updateTest.Visible || !updateTest.Controls.Cast<Control>().Any(control => control.Text == "Update installed successfully: version " + version))
-                    throw new InvalidOperationException("Update test window did not show the installed version.");
-                updateTest.Controls.Cast<Control>().OfType<Button>().First(button => button.Text == "Close").PerformClick();
-                Application.DoEvents();
-                if (updateTest.Visible) throw new InvalidOperationException("Update test window did not close.");
-            }
-
             foreach (string caption in new[] { "Save Site", "Delete Site" })
             {
                 Control siteButton = windowsPage.Controls.Cast<Control>().First(control => control.Text == caption);
@@ -1945,23 +1906,6 @@ internal sealed class ToolkitWindow : Form
             Application.DoEvents();
             if (profileView.Columns.Cast<ColumnHeader>().Sum(column => column.Width) > profileView.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 4)
                 throw new InvalidOperationException("IP profile columns require horizontal scrolling.");
-            tabs.SelectedTab = bmsPage;
-            Application.DoEvents();
-            if (bmsProfileView.Columns.Cast<ColumnHeader>().Sum(column => column.Width) > bmsProfileView.ClientSize.Width - 4)
-                throw new InvalidOperationException("BMS profile columns require horizontal scrolling.");
-            BmsServerProfile testProfile = new BmsServerProfile { Name = "Self-test site", Host = "ebi.example.test", User = "DOMAIN\\tech" };
-            bmsProfiles.Add(testProfile);
-            RefreshBmsProfiles();
-            ListViewItem testRow = bmsProfileView.Items.Cast<ListViewItem>().First(row => Object.ReferenceEquals(row.Tag, testProfile));
-            testRow.Selected = true;
-            LoadSelectedBmsProfile();
-            if (bmsSiteName.Text != testProfile.Name || ebiHost.Text != testProfile.Host || ebiUser.Text != testProfile.User)
-                throw new InvalidOperationException("Selecting a BMS profile did not load its server fields.");
-            NewBmsProfile();
-            if (bmsSiteName.Text.Length != 0 || ebiHost.Text.Length != 0 || ebiUser.Text.Length != 0 || bmsProfileView.SelectedItems.Count != 0)
-                throw new InvalidOperationException("New BMS profile did not clear the previous selection.");
-            bmsProfiles.Remove(testProfile);
-            RefreshBmsProfiles();
             if (!tray.Visible) throw new InvalidOperationException("Tray icon not visible.");
             WindowState = FormWindowState.Minimized; Application.DoEvents();
             if (!Visible || !ShowInTaskbar || WindowState != FormWindowState.Minimized)
@@ -1969,8 +1913,32 @@ internal sealed class ToolkitWindow : Form
             WindowState = FormWindowState.Normal; Application.DoEvents();
             Close(); Application.DoEvents();
             if (!tray.Visible || Visible) throw new InvalidOperationException("Close did not keep the app in the tray.");
-            RestoreFromTray(); Application.DoEvents();
-            if (!Visible) throw new InvalidOperationException("Tray restore failed.");
+            using (Process secondLaunch = Process.Start(new ProcessStartInfo(Application.ExecutablePath, "/activate") { UseShellExecute = false }))
+            {
+                DateTime deadline = DateTime.UtcNow.AddSeconds(10);
+                while ((!secondLaunch.HasExited || !Visible) && DateTime.UtcNow < deadline) { Application.DoEvents(); Thread.Sleep(20); }
+                if (!secondLaunch.HasExited || secondLaunch.ExitCode != 0 || !Visible) throw new InvalidOperationException("Second-process activation did not restore the hidden toolkit.");
+            }
+            Hide();
+            OnTrayMouseClick(tray, new MouseEventArgs(MouseButtons.Left, 1, 0, 0, 0)); Application.DoEvents();
+            if (!Visible) throw new InvalidOperationException("Single-click tray restore failed.");
+            bool previousTheme = dark;
+            dark = true; ApplyTheme();
+            TreeView siteTree = AllControls(rdpManager).OfType<TreeView>().Single();
+            if (siteTree.BackColor == Color.White || siteTree.ForeColor.GetBrightness() < 0.5f) throw new InvalidOperationException("RDP tree dark theme is unreadable.");
+            dark = false; ApplyTheme();
+            if (siteTree.BackColor != Color.White || siteTree.ForeColor.GetBrightness() > 0.5f) throw new InvalidOperationException("RDP tree light theme is unreadable.");
+            dark = previousTheme; ApplyTheme();
+            AnnounceUpdate(new Dictionary<string, object>(), "99.0.0", true);
+            if (updateButton.Text != "Update Available" || availableVersion != "99.0.0") throw new InvalidOperationException("Persistent update indicator failed.");
+            if (ToolkitStartup.Command(@"C:\Program Files\Toolkit.exe") != @"""C:\Program Files\Toolkit.exe"" /startup") throw new InvalidOperationException("Windows startup command quoting failed.");
+            using (Process startupTest = Process.Start(new ProcessStartInfo(Application.ExecutablePath, "/startup-self-test") { UseShellExecute = false }))
+            {
+                DateTime deadline = DateTime.UtcNow.AddSeconds(15);
+                while (!startupTest.HasExited && DateTime.UtcNow < deadline) { Application.DoEvents(); Thread.Sleep(20); }
+                if (!startupTest.HasExited) { startupTest.Kill(); throw new InvalidOperationException("Windows startup self-test timed out."); }
+                if (startupTest.ExitCode != 0) throw new InvalidOperationException("Windows startup self-test failed.");
+            }
             ExitToolkit();
             if (tray.Visible) throw new InvalidOperationException("Tray icon remained after Exit.");
             return 0;
