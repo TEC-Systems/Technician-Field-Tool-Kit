@@ -1113,7 +1113,11 @@ internal sealed class ToolkitWindow : Form
         else Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=dhcp");
         RefreshAdapters();
         ToolkitAdapter updated = adapters.FirstOrDefault(a => a.Name == adapter.Name);
-        Log("IP Shifter", updated != null && updated.IP == ip ? "OK" : "WARN", "Requested " + ip + "; Windows reports " + (updated == null ? "adapter unavailable" : updated.IP));
+        bool verified = updated != null && updated.IP == ip && updated.Mask == mask;
+        Log("IP Shifter", verified ? "OK" : "WARN", "Requested " + ip + " / " + mask + "; Windows reports " + (updated == null ? "adapter unavailable" : updated.IP + " / " + updated.Mask));
+        MessageBox.Show(this, verified ? "IP address assigned successfully.\r\n\r\nAdapter: " + adapter.Name + "\r\nIP: " + ip + "\r\nSubnet mask: " + mask :
+            "Windows accepted the commands, but the requested IP address and subnet mask could not be verified.\r\n\r\nClick Refresh and Details to check the adapter before continuing.",
+            verified ? "IP Assigned Successfully" : "Verify IP Settings", MessageBoxButtons.OK, verified ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
     }
 
     private void ApplyDhcp()
