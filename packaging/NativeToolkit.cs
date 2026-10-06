@@ -544,11 +544,11 @@ internal sealed class ToolkitWindow : Form
         BuildWindowsPage(Page("Windows Troubleshooting"));
         BuildIpPage(Page("IP Shifter"));
         BuildScannerPage(Page("IP Scanner"));
-        BuildNetworkPage(Page("Network Troubleshooting"));
-        BuildBmsPage(Page("BMS Tools"));
         TabPage rdpPage = Page("RDP");
         rdpManager = new RdpManager(rdpSites, SaveSettings, folder);
         rdpPage.Controls.Add(rdpManager);
+        BuildNetworkPage(Page("Network Troubleshooting"));
+        BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
         BuildLogPanel();
         internetTimer = new System.Windows.Forms.Timer { Interval = 30000 };
@@ -1872,8 +1872,8 @@ internal sealed class ToolkitWindow : Form
             if (tabs.TabPages.Count != 7) throw new InvalidOperationException("Expected seven active tabs.");
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
-            if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner")
-                throw new InvalidOperationException("IP Scanner must be next to IP Shifter.");
+            if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner" || tabs.TabPages[3].Text != "RDP")
+                throw new InvalidOperationException("IP Scanner and RDP tab order is incorrect.");
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
             TabPage windowsPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Windows Troubleshooting");
             if (windowsPage.Controls.Cast<Control>().Any(c => c.Text == "Open Webpage" || c.Text == "Web URL" ||

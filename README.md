@@ -39,7 +39,7 @@ Technician settings, IP profiles, saved RDP sites, and logs are saved per Window
 
 ## RDP connection manager
 
-The **RDP** tab groups saved sites by folder. Select a site to edit its server/IP, username, domain, and resolution, then click **Save Site**. **New** clears the editor; **Delete** removes the selected profile after confirmation. Sites saved by earlier toolkit versions appear here automatically. Site names must be unique. A folder name groups connections like the connections tree in mRemoteNG.
+The **RDP** tab sits next to IP Scanner and groups saved sites by folder. Select a site to edit its server/IP, username, domain, and resolution, then click **Save Site**. **New** clears the editor; **Delete** removes the selected profile after confirmation. Sites saved by earlier toolkit versions appear here automatically. Site names must be unique. A folder name groups connections like the connections tree in mRemoteNG.
 
 Choose full screen, fit to screen (a window sized for the current monitor), or a fixed resolution. **Connect**, or double-click a saved site, opens a separate Windows Remote Desktop window using the current editor settings. Sessions are managed by Windows Remote Desktop rather than embedded inside the toolkit.
 
