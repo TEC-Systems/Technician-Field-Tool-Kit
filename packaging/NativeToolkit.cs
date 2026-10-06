@@ -902,10 +902,10 @@ internal sealed class ToolkitWindow : Form
         adapters.Clear();
         try
         {
-            foreach (ManagementObject item in new ManagementObjectSearcher("SELECT DeviceID,NetConnectionID,GUID,NetConnectionStatus,MACAddress FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL").Get())
+            foreach (ManagementObject item in new ManagementObjectSearcher("SELECT DeviceID,NetConnectionID,GUID,NetConnectionStatus,MACAddress,Description,PNPDeviceID,ServiceName FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL").Get())
             {
                 string name = Convert.ToString(item["NetConnectionID"]);
-                if (String.IsNullOrWhiteSpace(name)) continue;
+                if (String.IsNullOrWhiteSpace(name) || IsBluetoothAdapter(name, Convert.ToString(item["Description"]), Convert.ToString(item["PNPDeviceID"]), Convert.ToString(item["ServiceName"]))) continue;
                 int index = Convert.ToInt32(item["DeviceID"]);
                 int status = item["NetConnectionStatus"] == null ? -1 : Convert.ToInt32(item["NetConnectionStatus"]);
                 ToolkitAdapter adapter = new ToolkitAdapter { Name = name, Guid = Convert.ToString(item["GUID"]), Status = status == 2 ? "Connected" : status == 7 || status == 0 ? "Disconnected" : status == 5 ? "Disabled" : "Status " + status, Mac = Convert.ToString(item["MACAddress"]) };
@@ -939,6 +939,53 @@ internal sealed class ToolkitWindow : Form
         if (adapters.Count > 0) adapterChoice.SelectedIndex = Math.Max(0, adapters.FindIndex(a => a.Name == selected));
         RefreshScannerAdapters();
         Log("Adapter", "INFO", adapters.Count + " adapters found.");
+    }
+
+    private static bool IsBluetoothAdapter(string name, string description, string deviceId, string service)
+    {
+        return (name ?? "").IndexOf("Bluetooth", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            (description ?? "").IndexOf("Bluetooth", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            (deviceId ?? "").StartsWith("BTH", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(service, "BthPan", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<ToolkitAdapter> ReadIpAssignments()
+    {
+        // Inspect all adapters, including Bluetooth and disconnected devices hidden from the selector.
+        Dictionary<string, string> names = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        using (ManagementObjectSearcher search = new ManagementObjectSearcher("SELECT GUID,NetConnectionID,Description FROM Win32_NetworkAdapter"))
+        using (ManagementObjectCollection rows = search.Get())
+            foreach (ManagementObject row in rows)
+            {
+                string guid = Convert.ToString(row["GUID"]);
+                if (guid.Length > 0) names[guid] = String.IsNullOrWhiteSpace(Convert.ToString(row["NetConnectionID"])) ? Convert.ToString(row["Description"]) : Convert.ToString(row["NetConnectionID"]);
+            }
+        List<ToolkitAdapter> result = new List<ToolkitAdapter>();
+        using (ManagementObjectSearcher search = new ManagementObjectSearcher("SELECT SettingsID,Description,IPAddress FROM Win32_NetworkAdapterConfiguration"))
+        using (ManagementObjectCollection rows = search.Get())
+            foreach (ManagementObject row in rows)
+            {
+                string guid = Convert.ToString(row["SettingsID"]), name;
+                if (!names.TryGetValue(guid, out name)) name = Convert.ToString(row["Description"]);
+                List<string> values = new List<string>((row["IPAddress"] as string[]) ?? new string[0]);
+                if (guid.Length > 0)
+                    using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\" + guid))
+                        if (key != null) values.AddRange((key.GetValue("IPAddress") as string[]) ?? new string[0]);
+                foreach (string address in values.Distinct())
+                {
+                    IPAddress parsed;
+                    if (address != "0.0.0.0" && IPAddress.TryParse(address, out parsed) && parsed.AddressFamily == AddressFamily.InterNetwork)
+                        result.Add(new ToolkitAdapter { Name = name, Guid = guid, IP = parsed.ToString() });
+                }
+            }
+        return result;
+    }
+
+    private static string[] IpConflictOwners(IEnumerable<ToolkitAdapter> assignments, ToolkitAdapter selected, string ip)
+    {
+        return assignments.Where(a => a.IP == ip &&
+            !(String.IsNullOrEmpty(selected.Guid) ? String.Equals(a.Name, selected.Name, StringComparison.OrdinalIgnoreCase) : String.Equals(a.Guid, selected.Guid, StringComparison.OrdinalIgnoreCase)))
+            .Select(a => String.IsNullOrWhiteSpace(a.Name) ? a.Guid : a.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
     private static string JoinAddresses(object addresses)
@@ -1050,9 +1097,17 @@ internal sealed class ToolkitWindow : Form
         ToolkitAdapter adapter = SelectedAdapter();
         string ip = ValidateIpv4(ipField.Text, "IP address", false), mask = ValidateIpv4(maskField.Text, "Subnet mask", false);
         string gateway = ValidateIpv4(gatewayField.Text, "Gateway", true), dns1 = ValidateIpv4(dns1Field.Text, "DNS 1", true), dns2 = ValidateIpv4(dns2Field.Text, "DNS 2", true);
+        List<ToolkitAdapter> assignments;
+        try { assignments = ReadIpAssignments(); }
+        catch (Exception error) { throw new InvalidOperationException("Could not check existing IP assignments. No settings were changed. Refresh adapters and try again. Details: " + error.Message); }
+        string[] owners = IpConflictOwners(assignments, adapter, ip);
+        if (owners.Length > 0)
+            throw new InvalidOperationException("IP address " + ip + " is already assigned to: " + String.Join(", ", owners) +
+                ". No settings were changed. Choose another IP, or review and remove the existing assignment from that adapter before trying again.");
+        bool alreadyAssigned = assignments.Any(a => a.IP == ip && (String.IsNullOrEmpty(adapter.Guid) ? String.Equals(a.Name, adapter.Name, StringComparison.OrdinalIgnoreCase) : String.Equals(a.Guid, adapter.Guid, StringComparison.OrdinalIgnoreCase)));
         RequireAdmin();
         string summary = adapter.Name + "\r\nIP: " + ip + "\r\nMask: " + mask + "\r\nGateway: " + (gateway.Length == 0 ? "None" : gateway) + "\r\nDNS: " + (dns1.Length == 0 ? "Automatic" : dns1 + (dns2.Length == 0 ? "" : ", " + dns2));
-        if (MessageBox.Show(this, "Apply this configuration?\r\n\r\n" + summary, "Confirm IP Change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        if (MessageBox.Show(this, (alreadyAssigned ? "This IP is already assigned to the selected adapter. Reapply these settings?" : "Apply this configuration?") + "\r\n\r\n" + summary, "Confirm IP Change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         Netsh("interface ipv4 set address name=" + Quote(adapter.Name) + " source=static address=" + ip + " mask=" + mask + " gateway=" + (gateway.Length == 0 ? "none" : gateway));
         if (dns1.Length > 0) { Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=static address=" + dns1 + " validate=no"); if (dns2.Length > 0) Netsh("interface ipv4 add dnsservers name=" + Quote(adapter.Name) + " address=" + dns2 + " index=2 validate=no"); }
         else Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=dhcp");
@@ -1770,6 +1825,17 @@ internal sealed class ToolkitWindow : Form
         {
             testing = true;
             RdpManager.SelfTest();
+            if (!IsBluetoothAdapter("Renamed adapter", "Bluetooth Device (Personal Area Network)", "", "") ||
+                !IsBluetoothAdapter("Renamed adapter", "", "BTH\\MS_BTHPAN", "") ||
+                IsBluetoothAdapter("Ethernet 3", "USB Ethernet", "USB\\123", ""))
+                throw new InvalidOperationException("Bluetooth adapter filtering failed.");
+            ToolkitAdapter ipSelected = new ToolkitAdapter { Name = "Ethernet 3", Guid = "ethernet" };
+            ToolkitAdapter[] assignments = { new ToolkitAdapter { Name = "Bluetooth Network Connection", Guid = "bluetooth", IP = "10.211.113.251" },
+                new ToolkitAdapter { Name = "Ethernet 3", Guid = "ethernet", IP = "192.168.2.251" } };
+            if (IpConflictOwners(assignments, ipSelected, "10.211.113.251").Single() != "Bluetooth Network Connection" ||
+                IpConflictOwners(assignments, ipSelected, "192.168.2.251").Length != 0 ||
+                IpConflictOwners(assignments, ipSelected, "10.211.113.252").Length != 0)
+                throw new InvalidOperationException("Existing IP assignment detection failed.");
             string checksumSample = new string('a', 64) + "  TEC-Systems-FieldToolkit-Setup.exe";
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
