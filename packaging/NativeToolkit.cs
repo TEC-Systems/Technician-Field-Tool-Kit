@@ -271,7 +271,7 @@ internal sealed class ToolkitTabs : TabControl
     }
 }
 
-internal sealed class ToolkitWindow : Form
+internal sealed partial class ToolkitWindow : Form
 {
     private const string Product = "TEC Systems Field Toolkit";
     private const string Mailbox = "IT@tec-system.com";
@@ -476,6 +476,7 @@ internal sealed class ToolkitWindow : Form
             }
             if (bmsProfiles.Count == 0 && ValidTarget(Value(settings, "EbiHost")))
                 bmsProfiles.Add(new BmsServerProfile { Name = "Saved server", Host = Value(settings, "EbiHost"), User = Value(settings, "EbiUser") });
+            LoadWorkspaceSettings();
             if (migratedRdpIds) SaveSettings();
         }
         catch (Exception error) { File.AppendAllText(logPath, "Settings warning: " + error.Message + Environment.NewLine); }
@@ -502,6 +503,7 @@ internal sealed class ToolkitWindow : Form
             { "Id", p.Id }, { "Name", p.Name }, { "Host", p.Host }, { "Group", p.Group }, { "User", p.User },
             { "Domain", p.Domain }, { "Resolution", p.Resolution }, { "ProtectedPassword", p.ProtectedPassword }
         }).ToArray();
+        SaveWorkspaceSettings();
         settings.Remove("EbiHost");
         settings.Remove("EbiUser");
         File.WriteAllText(configPath, json.Serialize(settings), Encoding.UTF8);
@@ -582,6 +584,7 @@ internal sealed class ToolkitWindow : Form
         TabPage rdpPage = Page("RDP");
         rdpManager = new RdpManager(rdpSites, SaveSettings, folder);
         rdpPage.Controls.Add(rdpManager);
+        BuildSiteWorkspace(Page("Sites"));
         BuildNetworkPage(Page("Network Troubleshooting"));
         BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
@@ -864,7 +867,7 @@ internal sealed class ToolkitWindow : Form
                 control.BackColor = dark ? Color.FromArgb(30, 40, 48) : Color.FromArgb(240, 244, 248);
             else if (control is GroupBox || control is FlowLayoutPanel)
                 control.BackColor = surface;
-            else if (control is SplitterPanel || control is Panel || control is TabControl || control is TabPage)
+            else if (control is SplitterPanel || control is Panel || control is TableLayoutPanel || control is TabControl || control is TabPage)
                 control.BackColor = canvas;
             else if (control is TreeView)
             {
@@ -1056,6 +1059,7 @@ internal sealed class ToolkitWindow : Form
         B(page, "Apply Static IP", 18, 510, 150, ApplyStaticIp, "Confirm and apply a static IPv4 address. Administrator rights required.", Color.FromArgb(177, 93, 39));
         B(page, "Set DHCP", 184, 510, 120, ApplyDhcp, "Confirm and restore automatic IPv4 and DNS settings.", Slate);
         B(page, "Restore Previous IP", 320, 510, 168, RestorePreviousIp, "Restore this adapter's settings from before the last IP Shifter change.", Green);
+        B(page, "IP History", 504, 510, 112, ShowIpHistory, "View verified and failed IP changes on this laptop.", Cobalt);
         profileView.Width = Math.Max(550, page.ClientSize.Width - 36);
         UpdateProfileColumns();
     }
@@ -1356,23 +1360,29 @@ internal sealed class ToolkitWindow : Form
         if (MessageBox.Show(this, "Restore the saved settings for " + adapter.Name + "?\r\nSaved: " + point.CapturedUtc + " UTC\r\n\r\n" + summary,
             "Confirm IP Restore", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         RequireAdmin();
-        foreach (string command in commands) Netsh(command);
-        RefreshAdapters();
-        ToolkitAdapter updated = adapters.FirstOrDefault(a => String.Equals(a.Guid, adapter.Guid, StringComparison.OrdinalIgnoreCase));
-        bool verified = false;
-        if (updated != null)
+        string prior = adapter.IP + " / " + adapter.Mask;
+        try
         {
-            IpRestorePoint current = CaptureIpRestorePoint(updated);
-            verified = current.DhcpEnabled == point.DhcpEnabled &&
-                (point.DhcpEnabled || (current.IPAddress == point.IPAddress && current.SubnetMask == point.SubnetMask && current.Gateway == point.Gateway)) &&
-                current.DnsAutomatic == point.DnsAutomatic &&
-                (point.DnsAutomatic || (current.Dns1 == point.Dns1 && current.Dns2 == point.Dns2));
+            foreach (string command in commands) Netsh(command);
+            RefreshAdapters();
+            ToolkitAdapter updated = adapters.FirstOrDefault(a => String.Equals(a.Guid, adapter.Guid, StringComparison.OrdinalIgnoreCase));
+            bool verified = false;
+            if (updated != null)
+            {
+                IpRestorePoint current = CaptureIpRestorePoint(updated);
+                verified = current.DhcpEnabled == point.DhcpEnabled &&
+                    (point.DhcpEnabled || (current.IPAddress == point.IPAddress && current.SubnetMask == point.SubnetMask && current.Gateway == point.Gateway)) &&
+                    current.DnsAutomatic == point.DnsAutomatic &&
+                    (point.DnsAutomatic || (current.Dns1 == point.Dns1 && current.Dns2 == point.Dns2));
+            }
+            if (!verified) throw new InvalidOperationException("Windows accepted the restore commands, but the adapter settings could not be verified. The saved restore point is still available; click Refresh and Details before trying again.");
+            ipRestorePoints.Remove(point);
+            SaveSettings();
+            RecordIpChange(adapter, "Restore", prior, summary.Replace("\r\n", "; "), "Verified", "Previous settings restored.");
+            Log("IP Shifter", "OK", "Restored previous IP settings for " + adapter.Name + ".");
+            MessageBox.Show(this, "Previous IP settings restored for " + adapter.Name + ".", "IP Restored", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
-        if (!verified) throw new InvalidOperationException("Windows accepted the restore commands, but the adapter settings could not be verified. The saved restore point is still available; click Refresh and Details before trying again.");
-        ipRestorePoints.Remove(point);
-        SaveSettings();
-        Log("IP Shifter", "OK", "Restored previous IP settings for " + adapter.Name + ".");
-        MessageBox.Show(this, "Previous IP settings restored for " + adapter.Name + ".", "IP Restored", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        catch (Exception error) { RecordIpChange(adapter, "Restore", prior, summary.Replace("\r\n", "; "), "Failed", error.Message); throw; }
     }
 
     private void ApplyStaticIp()
@@ -1392,16 +1402,22 @@ internal sealed class ToolkitWindow : Form
         string summary = adapter.Name + "\r\nIP: " + ip + "\r\nMask: " + mask + "\r\nGateway: " + (gateway.Length == 0 ? "None" : gateway) + "\r\nDNS: " + (dns1.Length == 0 ? "Automatic" : dns1 + (dns2.Length == 0 ? "" : ", " + dns2));
         if (MessageBox.Show(this, (alreadyAssigned ? "This IP is already assigned to the selected adapter. Reapply these settings?" : "Apply this configuration?") + "\r\n\r\n" + summary, "Confirm IP Change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         SaveIpRestorePoint(adapter);
-        Netsh("interface ipv4 set address name=" + Quote(adapter.Name) + " source=static address=" + ip + " mask=" + mask + " gateway=" + (gateway.Length == 0 ? "none" : gateway));
-        if (dns1.Length > 0) { Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=static address=" + dns1 + " validate=no"); if (dns2.Length > 0) Netsh("interface ipv4 add dnsservers name=" + Quote(adapter.Name) + " address=" + dns2 + " index=2 validate=no"); }
-        else Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=dhcp");
-        RefreshAdapters();
-        ToolkitAdapter updated = adapters.FirstOrDefault(a => a.Name == adapter.Name);
-        bool verified = updated != null && updated.IP == ip && updated.Mask == mask;
-        Log("IP Shifter", verified ? "OK" : "WARN", "Requested " + ip + " / " + mask + "; Windows reports " + (updated == null ? "adapter unavailable" : updated.IP + " / " + updated.Mask));
-        MessageBox.Show(this, verified ? "IP address assigned successfully.\r\n\r\nAdapter: " + adapter.Name + "\r\nIP: " + ip + "\r\nSubnet mask: " + mask :
-            "Windows accepted the commands, but the requested IP address and subnet mask could not be verified.\r\n\r\nClick Refresh and Details to check the adapter before continuing.",
-            verified ? "IP Assigned Successfully" : "Verify IP Settings", MessageBoxButtons.OK, verified ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        string before = adapter.IP + " / " + adapter.Mask, after = ip + " / " + mask;
+        try
+        {
+            Netsh("interface ipv4 set address name=" + Quote(adapter.Name) + " source=static address=" + ip + " mask=" + mask + " gateway=" + (gateway.Length == 0 ? "none" : gateway));
+            if (dns1.Length > 0) { Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=static address=" + dns1 + " validate=no"); if (dns2.Length > 0) Netsh("interface ipv4 add dnsservers name=" + Quote(adapter.Name) + " address=" + dns2 + " index=2 validate=no"); }
+            else Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=dhcp");
+            RefreshAdapters();
+            ToolkitAdapter updated = adapters.FirstOrDefault(a => a.Name == adapter.Name);
+            bool verified = updated != null && updated.IP == ip && updated.Mask == mask;
+            RecordIpChange(adapter, "Static IP", before, after, verified ? "Verified" : "Unverified", "Gateway: " + gateway + "; DNS: " + (dns1.Length == 0 ? "Automatic" : dns1 + ", " + dns2));
+            Log("IP Shifter", verified ? "OK" : "WARN", "Requested " + ip + " / " + mask + "; Windows reports " + (updated == null ? "adapter unavailable" : updated.IP + " / " + updated.Mask));
+            MessageBox.Show(this, verified ? "IP address assigned successfully.\r\n\r\nAdapter: " + adapter.Name + "\r\nIP: " + ip + "\r\nSubnet mask: " + mask :
+                "Windows accepted the commands, but the requested IP address and subnet mask could not be verified.\r\n\r\nClick Refresh and Details to check the adapter before continuing.",
+                verified ? "IP Assigned Successfully" : "Verify IP Settings", MessageBoxButtons.OK, verified ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        catch (Exception error) { RecordIpChange(adapter, "Static IP", before, after, "Failed", error.Message); throw; }
     }
 
     private void ApplyDhcp()
@@ -1410,9 +1426,20 @@ internal sealed class ToolkitWindow : Form
         RequireAdmin();
         if (MessageBox.Show(this, "Switch " + adapter.Name + " to automatic IP and DNS?", "Confirm DHCP", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         SaveIpRestorePoint(adapter);
-        Netsh("interface ipv4 set address name=" + Quote(adapter.Name) + " source=dhcp");
-        Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=dhcp");
-        RefreshAdapters(); Log("IP Shifter", "OK", "Requested DHCP on " + adapter.Name);
+        string before = adapter.IP + " / " + adapter.Mask;
+        try
+        {
+            Netsh("interface ipv4 set address name=" + Quote(adapter.Name) + " source=dhcp");
+            Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=dhcp");
+            RefreshAdapters();
+            ToolkitAdapter updated = adapters.FirstOrDefault(a => String.Equals(a.Guid, adapter.Guid, StringComparison.OrdinalIgnoreCase));
+            bool verified = updated != null && CaptureIpRestorePoint(updated).DhcpEnabled;
+            RecordIpChange(adapter, "DHCP", before, "Automatic IP and DNS", verified ? "Verified" : "Unverified", "DHCP requested.");
+            Log("IP Shifter", verified ? "OK" : "WARN", "Requested DHCP on " + adapter.Name);
+            MessageBox.Show(this, verified ? "Automatic IP and DNS enabled successfully for " + adapter.Name + "." : "Windows accepted the DHCP commands, but DHCP could not be verified. Click Refresh and Details to check the adapter.",
+                verified ? "DHCP Enabled" : "Verify DHCP", MessageBoxButtons.OK, verified ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        catch (Exception error) { RecordIpChange(adapter, "DHCP", before, "Automatic IP and DNS", "Failed", error.Message); throw; }
     }
 
     private void BuildNetworkPage(TabPage page)
@@ -2035,11 +2062,12 @@ internal sealed class ToolkitWindow : Form
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
                 throw new InvalidOperationException("Release checksum line ending handling failed.");
-            if (tabs.TabPages.Count != 7) throw new InvalidOperationException("Expected seven active tabs.");
+            if (tabs.TabPages.Count != 8) throw new InvalidOperationException("Expected eight active tabs.");
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
-            if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner" || tabs.TabPages[3].Text != "RDP")
-                throw new InvalidOperationException("IP Scanner and RDP tab order is incorrect.");
+            if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner" || tabs.TabPages[3].Text != "RDP" || tabs.TabPages[4].Text != "Sites")
+                throw new InvalidOperationException("IP Scanner, RDP, and Sites tab order is incorrect.");
+            SelfTestSiteWorkspace();
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
             TabPage windowsPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Windows Troubleshooting");
             if (windowsPage.Controls.Cast<Control>().Any(c => c.Text == "Open Webpage" || c.Text == "Web URL" ||

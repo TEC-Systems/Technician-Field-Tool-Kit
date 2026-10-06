@@ -190,6 +190,14 @@ internal sealed class RdpManager : UserControl
         password.Clear();
     }
 
+    public void OpenSavedSite(string id)
+    {
+        RdpSiteProfile site = sites.FirstOrDefault(item => item.Id == id);
+        if (site == null) throw new InvalidOperationException("The linked RDP connection was removed.");
+        LoadSite(site);
+        Connect();
+    }
+
     internal static string ValidProfileId(string value)
     {
         Guid id; return Guid.TryParse(value, out id) ? id.ToString("N") : Guid.NewGuid().ToString("N");
