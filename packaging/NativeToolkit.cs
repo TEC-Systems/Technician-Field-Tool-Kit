@@ -95,6 +95,11 @@ internal sealed class RdpSiteProfile
 {
     public string Name = "";
     public string Host = "";
+    public string Group = "";
+    public string User = "";
+    public string Domain = "";
+    public string Resolution = "Full screen";
+    public string ProtectedPassword = "";
     public override string ToString() { return Name + "  |  " + Host; }
 }
 
@@ -180,6 +185,7 @@ internal sealed class ToolkitWindow : Form
     private Button themeButton;
     private TextBox pingTarget;
     private CheckBox continuousPing;
+    private RdpManager rdpManager;
     private TextBox rdpTarget;
     private TextBox rdpSiteName;
     private ComboBox rdpSiteChoice;
@@ -282,7 +288,10 @@ internal sealed class ToolkitWindow : Form
                     if (row == null) continue;
                     string name = Value(row, "Name").Trim(), host = Value(row, "Host").Trim();
                     if (name.Length == 0 || !ValidTarget(host) || rdpSites.Any(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
-                    rdpSites.Add(new RdpSiteProfile { Name = name, Host = host });
+                    rdpSites.Add(new RdpSiteProfile { Name = name, Host = host, Group = Value(row, "Group"),
+                        User = Value(row, "User"), Domain = Value(row, "Domain"),
+                        Resolution = String.IsNullOrEmpty(Value(row, "Resolution")) ? "Full screen" : Value(row, "Resolution"),
+                        ProtectedPassword = Value(row, "ProtectedPassword") });
                 }
             }
             if (bmsProfiles.Count == 0 && ValidTarget(Value(settings, "EbiHost")))
@@ -303,7 +312,8 @@ internal sealed class ToolkitWindow : Form
             { "Name", p.Name }, { "Host", p.Host }, { "User", p.User }
         }).ToArray();
         settings["RdpSites"] = rdpSites.Select(p => new Dictionary<string, object> {
-            { "Name", p.Name }, { "Host", p.Host }
+            { "Name", p.Name }, { "Host", p.Host }, { "Group", p.Group }, { "User", p.User },
+            { "Domain", p.Domain }, { "Resolution", p.Resolution }, { "ProtectedPassword", p.ProtectedPassword }
         }).ToArray();
         settings.Remove("EbiHost");
         settings.Remove("EbiUser");
@@ -384,6 +394,9 @@ internal sealed class ToolkitWindow : Form
         BuildScannerPage(Page("IP Scanner"));
         BuildNetworkPage(Page("Network Troubleshooting"));
         BuildBmsPage(Page("BMS Tools"));
+        TabPage rdpPage = Page("RDP");
+        rdpManager = new RdpManager(rdpSites, delegate { SaveSettings(); RefreshRdpSites(null); }, folder);
+        rdpPage.Controls.Add(rdpManager);
         BuildFeedbackPage(Page("Feedback"));
         BuildTestPage(Page("test"));
         BuildLogPanel();
@@ -784,6 +797,7 @@ internal sealed class ToolkitWindow : Form
         foreach (RdpSiteProfile site in rdpSites.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)) rdpSiteChoice.Items.Add(site);
         rdpSiteChoice.SelectedItem = selected;
         rdpSiteChoice.EndUpdate();
+        if (rdpManager != null) rdpManager.Reload();
     }
 
     private void LoadSelectedRdpSite()
@@ -812,6 +826,7 @@ internal sealed class ToolkitWindow : Form
             throw new InvalidOperationException("An RDP site with that name already exists. Select it to edit, or use a different name.");
         if (selected == null) { selected = new RdpSiteProfile(); rdpSites.Add(selected); }
         selected.Name = name;
+        if (!selected.Host.Equals(host, StringComparison.OrdinalIgnoreCase)) selected.ProtectedPassword = "";
         selected.Host = host;
         SaveSettings();
         RefreshRdpSites(selected);
@@ -1754,11 +1769,12 @@ internal sealed class ToolkitWindow : Form
         try
         {
             testing = true;
+            RdpManager.SelfTest();
             string checksumSample = new string('a', 64) + "  TEC-Systems-FieldToolkit-Setup.exe";
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
                 throw new InvalidOperationException("Release checksum line ending handling failed.");
-            if (tabs.TabPages.Count != 7) throw new InvalidOperationException("Expected seven active tabs.");
+            if (tabs.TabPages.Count != 8) throw new InvalidOperationException("Expected eight active tabs.");
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
             if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner")

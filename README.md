@@ -26,12 +26,20 @@ Technician settings, IP profiles, saved RDP sites, and logs are saved per Window
 
 ## Field diagnostics
 
-- **Windows Troubleshooting** opens `IPConfig /all` in a Command Prompt that stays open. Its saved RDP sites list stores site names and server hostnames/IPs; choose a site and click **Open RDP**, or enter a server directly. Save, edit, or delete sites locally. No RDP passwords are stored. The old webpage field has been removed from this tab.
+- **Windows Troubleshooting** opens `IPConfig /all` in a Command Prompt that stays open. Its saved RDP sites list stores site names and server hostnames/IPs; choose a site and click **Open RDP**, or enter a server directly. Save, edit, or delete sites locally. These quick shortcuts use the standard Windows credential prompt. The dedicated **RDP** tab adds folders, credentials, and resolution profiles. The old webpage field has been removed from this tab.
 - **IP Shifter** lists connected and disconnected adapters, shows their configured IPv4 addresses when Windows exposes them, and saves named adapter/IP/DNS profiles. Its full-width profile list adjusts column widths when the toolkit is resized. Applying a change requires Windows administrator rights and confirmation; the toolkit reads the adapter again afterward to verify the requested IP.
 - **IP Scanner** sits next to IP Shifter, selects a connected adapter, and fills its real IPv4 subnet. Large subnets default to a 254-address slice near the laptop. Technicians can enter any ascending range up to 1,024 addresses. It scans with ICMP and common TCP probes (22, 80, 443, 445, 3389), resolves hostnames through reverse DNS with a NetBIOS fallback, shows local ARP MACs and offline MAC-prefix owners when available, and exports CSV. A MAC-prefix owner may differ from the device brand. Devices that publish neither reverse DNS nor NetBIOS names will still have blank hostnames; silent hosts and filtered services may be absent.
 - **Support bundle** exports the current toolkit log with network snapshots, a system summary and service list, or both into a ZIP. Review the package before sharing because it can contain sensitive machine and network details.
 - **BMS Tools** keeps the YABE shortcut and **Connect to BMS Server (EBI)** without a decision guide. YABE is checked at `C:\Program Files\Yabe\Yabe.exe`; a technician can locate it once if installed elsewhere. Save multiple named site/server profiles with a hostname or IP and username. Selecting a profile fills the connection fields for Ping, RDP, WinRM Remote Shell, `liclist`, and `bckbld -out`. Profiles are stored locally in `%LOCALAPPDATA%\TEC Systems\Field Toolkit\config.json`; passwords are never stored. An older single saved server is imported as a profile on the next launch. WinRM must already be approved and configured on the server; its password prompt is in the Windows terminal, not saved by the toolkit. WinRM to a raw IP may need site-approved HTTPS or TrustedHosts configuration; the toolkit does not change those security settings. Confirm the backup output path before running it. The Windows **Remote Desktop** shortcut opens the RDP Connection client.
 - **Network Troubleshooting** includes a Telnet TCP-port check and a shortcut to the optional Windows Telnet Client. The check only proves a TCP connection can open; it does not verify login. Telnet is unencrypted, so use it only on approved networks.
+
+## RDP connection manager
+
+The **RDP** tab groups saved sites by folder. Select a site to edit its server/IP, username, domain, and resolution, then click **Save Site**. **New** clears the editor; **Delete** removes the selected profile after confirmation. Existing Windows Troubleshooting RDP sites appear here automatically. Site names must be unique. A folder name groups connections like the connections tree in mRemoteNG.
+
+Choose full screen, fit to screen (a window sized for the current monitor), or a fixed resolution. **Connect**, or double-click a saved site, opens a separate Windows Remote Desktop window using the current editor settings. Sessions are managed by Windows Remote Desktop rather than embedded inside the toolkit.
+
+Passwords are optional. **Save password for this Windows user** encrypts the password with Windows DPAPI for the current account on this laptop. Passwords are never written as plain text to profiles, connection files, or logs. Leave the password field blank to retain an existing saved password; uncheck the option and save to remove it. Changing the server, username, or domain clears the retained password unless you enter a new one. Encrypted passwords do not transfer to another Windows user or laptop. An entered password can also be used for a single connection without saving it to the profile. Connection files contain encrypted password data and are removed when the launched Remote Desktop process exits; a crash may leave an encrypted file under the user's data folder. Windows/server policy may still prompt for credentials. Username can also use DOMAIN\user or user@domain format.
 
 ## Feedback
 
@@ -43,7 +51,7 @@ The **test** tab includes **Open Test Window**, which displays the installed ver
 
 ## Verification
 
-The build runs `TEC-Systems-FieldToolkit.exe /self-test` to check native startup, visible tabs, tray close/restore/exit, and the absence of a PowerShell assembly reference. The setup also runs `/verify` against its embedded payload. Neither check sends feedback or changes adapter settings. `tests/Smoke-Toolkit.ps1` tests only the legacy script.
+The build also checks RDP profile persistence, folder grouping, resolution generation, password encryption/removal, and the update test window. The build runs `TEC-Systems-FieldToolkit.exe /self-test` to check native startup, visible tabs, tray close/restore/exit, and the absence of a PowerShell assembly reference. The setup also runs `/verify` against its embedded payload. Neither check sends feedback or changes adapter settings. `tests/Smoke-Toolkit.ps1` tests only the legacy script.
 
 ## Repository files
 
