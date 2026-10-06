@@ -163,6 +163,20 @@ internal sealed class ToolkitProfile
     public string Dns2 = "";
 }
 
+internal sealed class IpRestorePoint
+{
+    public string AdapterGuid = "";
+    public string AdapterName = "";
+    public string CapturedUtc = "";
+    public bool DhcpEnabled;
+    public string IPAddress = "";
+    public string SubnetMask = "";
+    public string Gateway = "";
+    public string Dns1 = "";
+    public string Dns2 = "";
+    public bool DnsAutomatic = true;
+}
+
 internal sealed class BmsServerProfile
 {
     public string Name = "";
@@ -271,6 +285,7 @@ internal sealed class ToolkitWindow : Form
     private readonly string version;
     private readonly JavaScriptSerializer json = new JavaScriptSerializer();
     private readonly List<ToolkitProfile> profiles = new List<ToolkitProfile>();
+    private readonly List<IpRestorePoint> ipRestorePoints = new List<IpRestorePoint>();
     private readonly List<BmsServerProfile> bmsProfiles = new List<BmsServerProfile>();
     private readonly List<RdpSiteProfile> rdpSites = new List<RdpSiteProfile>();
     private readonly List<ToolkitAdapter> adapters = new List<ToolkitAdapter>();
@@ -404,6 +419,21 @@ internal sealed class ToolkitWindow : Form
             yabePath = Value(settings, "YabePath");
             bool migratedRdpIds = false;
             object saved;
+            if (settings.TryGetValue("IpRestorePoints", out saved) && saved is IEnumerable)
+            {
+                foreach (object entry in (IEnumerable)saved)
+                {
+                    IDictionary<string, object> row = entry as IDictionary<string, object>;
+                    if (row == null || String.IsNullOrWhiteSpace(Value(row, "AdapterGuid"))) continue;
+                    bool dhcp, automatic;
+                    if (!Boolean.TryParse(Value(row, "DhcpEnabled"), out dhcp) ||
+                        !Boolean.TryParse(Value(row, "DnsAutomatic"), out automatic)) continue;
+                    ipRestorePoints.Add(new IpRestorePoint { AdapterGuid = Value(row, "AdapterGuid"), AdapterName = Value(row, "AdapterName"),
+                        CapturedUtc = Value(row, "CapturedUtc"), DhcpEnabled = dhcp, IPAddress = Value(row, "IPAddress"),
+                        SubnetMask = Value(row, "SubnetMask"), Gateway = Value(row, "Gateway"), Dns1 = Value(row, "Dns1"),
+                        Dns2 = Value(row, "Dns2"), DnsAutomatic = automatic });
+                }
+            }
             if (settings.TryGetValue("SiteProfiles", out saved) && saved is IEnumerable)
             {
                 foreach (object entry in (IEnumerable)saved)
@@ -456,6 +486,11 @@ internal sealed class ToolkitWindow : Form
         settings["DarkMode"] = dark;
         settings["ThemeMode"] = followWindowsTheme ? "system" : "manual";
         settings["YabePath"] = yabePath;
+        settings["IpRestorePoints"] = ipRestorePoints.Select(p => new Dictionary<string, object> {
+            { "AdapterGuid", p.AdapterGuid }, { "AdapterName", p.AdapterName }, { "CapturedUtc", p.CapturedUtc },
+            { "DhcpEnabled", p.DhcpEnabled }, { "IPAddress", p.IPAddress }, { "SubnetMask", p.SubnetMask },
+            { "Gateway", p.Gateway }, { "Dns1", p.Dns1 }, { "Dns2", p.Dns2 }, { "DnsAutomatic", p.DnsAutomatic }
+        }).ToArray();
         settings["SiteProfiles"] = profiles.Select(p => new Dictionary<string, object> {
             { "Name", p.Name }, { "Adapter", p.Adapter }, { "IPAddress", p.IPAddress },
             { "SubnetMask", p.SubnetMask }, { "Gateway", p.Gateway }, { "Dns1", p.Dns1 }, { "Dns2", p.Dns2 }
@@ -1020,6 +1055,7 @@ internal sealed class ToolkitWindow : Form
         page.Controls.Add(L("DNS 2", 218, 448, 120)); dns2Field = T(218, 472, 170, ""); page.Controls.Add(dns2Field);
         B(page, "Apply Static IP", 18, 510, 150, ApplyStaticIp, "Confirm and apply a static IPv4 address. Administrator rights required.", Color.FromArgb(177, 93, 39));
         B(page, "Set DHCP", 184, 510, 120, ApplyDhcp, "Confirm and restore automatic IPv4 and DNS settings.", Slate);
+        B(page, "Restore Previous IP", 320, 510, 168, RestorePreviousIp, "Restore this adapter's settings from before the last IP Shifter change.", Green);
         profileView.Width = Math.Max(550, page.ClientSize.Width - 36);
         UpdateProfileColumns();
     }
@@ -1100,11 +1136,11 @@ internal sealed class ToolkitWindow : Form
                 if (guid.Length > 0) names[guid] = String.IsNullOrWhiteSpace(Convert.ToString(row["NetConnectionID"])) ? Convert.ToString(row["Description"]) : Convert.ToString(row["NetConnectionID"]);
             }
         List<ToolkitAdapter> result = new List<ToolkitAdapter>();
-        using (ManagementObjectSearcher search = new ManagementObjectSearcher("SELECT SettingsID,Description,IPAddress FROM Win32_NetworkAdapterConfiguration"))
+        using (ManagementObjectSearcher search = new ManagementObjectSearcher("SELECT SettingID,Description,IPAddress FROM Win32_NetworkAdapterConfiguration"))
         using (ManagementObjectCollection rows = search.Get())
             foreach (ManagementObject row in rows)
             {
-                string guid = Convert.ToString(row["SettingsID"]), name;
+                string guid = Convert.ToString(row["SettingID"]), name;
                 if (!names.TryGetValue(guid, out name)) name = Convert.ToString(row["Description"]);
                 List<string> values = new List<string>((row["IPAddress"] as string[]) ?? new string[0]);
                 if (guid.Length > 0)
@@ -1231,6 +1267,114 @@ internal sealed class ToolkitWindow : Form
         }
     }
 
+    private static List<string> Ipv4Values(object value)
+    {
+        string[] raw = value as string[] ?? new string[0];
+        return raw.Where(address => { IPAddress parsed; return IPAddress.TryParse(address, out parsed) && parsed.AddressFamily == AddressFamily.InterNetwork && address != "0.0.0.0"; }).ToList();
+    }
+
+    private IpRestorePoint CaptureIpRestorePoint(ToolkitAdapter adapter)
+    {
+        if (String.IsNullOrWhiteSpace(adapter.Guid)) throw new InvalidOperationException("Windows did not provide an adapter ID, so its settings cannot be saved for restore. No settings were changed.");
+        using (ManagementObjectSearcher search = new ManagementObjectSearcher("SELECT SettingID,DHCPEnabled,IPAddress,IPSubnet,DefaultIPGateway FROM Win32_NetworkAdapterConfiguration"))
+        using (ManagementObjectCollection rows = search.Get())
+            foreach (ManagementObject row in rows)
+            {
+                if (!String.Equals(Convert.ToString(row["SettingID"]).Trim('{', '}'), adapter.Guid.Trim('{', '}'), StringComparison.OrdinalIgnoreCase)) continue;
+                if (row["DHCPEnabled"] == null) break;
+                IpRestorePoint point = new IpRestorePoint { AdapterGuid = adapter.Guid, AdapterName = adapter.Name,
+                    CapturedUtc = DateTime.UtcNow.ToString("o"), DhcpEnabled = Convert.ToBoolean(row["DHCPEnabled"]) };
+                if (!point.DhcpEnabled)
+                {
+                    string[] addresses = row["IPAddress"] as string[] ?? new string[0];
+                    string[] masks = row["IPSubnet"] as string[] ?? new string[0];
+                    List<int> ipv4Indexes = new List<int>();
+                    for (int i = 0; i < addresses.Length; i++)
+                    {
+                        IPAddress parsed;
+                        if (IPAddress.TryParse(addresses[i], out parsed) && parsed.AddressFamily == AddressFamily.InterNetwork && addresses[i] != "0.0.0.0") ipv4Indexes.Add(i);
+                    }
+                    if (ipv4Indexes.Count != 1 || ipv4Indexes[0] >= masks.Length)
+                        throw new InvalidOperationException("This adapter has multiple or unavailable static IPv4 addresses. IP Shifter cannot safely save and restore that configuration, so no settings were changed.");
+                    point.IPAddress = ValidateIpv4(addresses[ipv4Indexes[0]], "Previous IP address", false);
+                    point.SubnetMask = ValidateIpv4(masks[ipv4Indexes[0]], "Previous subnet mask", false);
+                }
+                List<string> gateways = Ipv4Values(row["DefaultIPGateway"]);
+                if (gateways.Count > 1) throw new InvalidOperationException("This adapter has multiple IPv4 gateways. IP Shifter cannot safely restore them, so no settings were changed.");
+                point.Gateway = gateways.Count == 0 ? "" : ValidateIpv4(gateways[0], "Previous gateway", false);
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\" + adapter.Guid))
+                {
+                    if (key == null) throw new InvalidOperationException("Could not read the adapter's DNS settings for restore. No settings were changed.");
+                    string nameServer = Convert.ToString(key.GetValue("NameServer")).Trim();
+                    point.DnsAutomatic = nameServer.Length == 0;
+                    if (!point.DnsAutomatic)
+                    {
+                        string[] dns = nameServer.Split(new[] { ',', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (dns.Length < 1 || dns.Length > 2) throw new InvalidOperationException("This adapter has more than two custom DNS servers. IP Shifter cannot safely restore them, so no settings were changed.");
+                        point.Dns1 = ValidateIpv4(dns[0], "Previous DNS 1", false);
+                        if (dns.Length == 2) point.Dns2 = ValidateIpv4(dns[1], "Previous DNS 2", false);
+                    }
+                }
+                return point;
+            }
+        throw new InvalidOperationException("Could not read the selected adapter's Windows IP settings for restore. No settings were changed.");
+    }
+
+    private void SaveIpRestorePoint(ToolkitAdapter adapter)
+    {
+        IpRestorePoint point = CaptureIpRestorePoint(adapter);
+        ipRestorePoints.RemoveAll(p => String.Equals(p.AdapterGuid, adapter.Guid, StringComparison.OrdinalIgnoreCase));
+        ipRestorePoints.Add(point);
+        SaveSettings();
+        Log("IP Shifter", "INFO", "Saved previous IP settings for " + adapter.Name + ".");
+    }
+
+    private static string[] RestoreIpCommands(IpRestorePoint point, string adapterName)
+    {
+        string name = Quote(adapterName);
+        List<string> commands = new List<string>();
+        if (point.DhcpEnabled) commands.Add("interface ipv4 set address name=" + name + " source=dhcp");
+        else commands.Add("interface ipv4 set address name=" + name + " source=static address=" + ValidateIpv4(point.IPAddress, "Previous IP address", false) +
+            " mask=" + ValidateIpv4(point.SubnetMask, "Previous subnet mask", false) + " gateway=" + (String.IsNullOrEmpty(point.Gateway) ? "none" : ValidateIpv4(point.Gateway, "Previous gateway", false)));
+        if (point.DnsAutomatic) commands.Add("interface ipv4 set dnsservers name=" + name + " source=dhcp");
+        else
+        {
+            commands.Add("interface ipv4 set dnsservers name=" + name + " source=static address=" + ValidateIpv4(point.Dns1, "Previous DNS 1", false) + " validate=no");
+            if (!String.IsNullOrEmpty(point.Dns2)) commands.Add("interface ipv4 add dnsservers name=" + name + " address=" + ValidateIpv4(point.Dns2, "Previous DNS 2", false) + " index=2 validate=no");
+        }
+        return commands.ToArray();
+    }
+
+    private void RestorePreviousIp()
+    {
+        ToolkitAdapter adapter = SelectedAdapter();
+        IpRestorePoint point = ipRestorePoints.LastOrDefault(p => String.Equals(p.AdapterGuid, adapter.Guid, StringComparison.OrdinalIgnoreCase));
+        if (point == null) throw new InvalidOperationException("No previous IP settings are saved for " + adapter.Name + ". Apply Static IP or Set DHCP once to create a restore point.");
+        string[] commands = RestoreIpCommands(point, adapter.Name);
+        string summary = point.DhcpEnabled ? "IP: Automatic (DHCP)" : "IP: " + point.IPAddress + " / " + point.SubnetMask + "\r\nGateway: " + (point.Gateway.Length == 0 ? "None" : point.Gateway);
+        summary += "\r\nDNS: " + (point.DnsAutomatic ? "Automatic" : point.Dns1 + (point.Dns2.Length == 0 ? "" : ", " + point.Dns2));
+        if (MessageBox.Show(this, "Restore the saved settings for " + adapter.Name + "?\r\nSaved: " + point.CapturedUtc + " UTC\r\n\r\n" + summary,
+            "Confirm IP Restore", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        RequireAdmin();
+        foreach (string command in commands) Netsh(command);
+        RefreshAdapters();
+        ToolkitAdapter updated = adapters.FirstOrDefault(a => String.Equals(a.Guid, adapter.Guid, StringComparison.OrdinalIgnoreCase));
+        bool verified = false;
+        if (updated != null)
+        {
+            IpRestorePoint current = CaptureIpRestorePoint(updated);
+            verified = current.DhcpEnabled == point.DhcpEnabled &&
+                (point.DhcpEnabled || (current.IPAddress == point.IPAddress && current.SubnetMask == point.SubnetMask && current.Gateway == point.Gateway)) &&
+                current.DnsAutomatic == point.DnsAutomatic &&
+                (point.DnsAutomatic || (current.Dns1 == point.Dns1 && current.Dns2 == point.Dns2));
+        }
+        if (!verified) throw new InvalidOperationException("Windows accepted the restore commands, but the adapter settings could not be verified. The saved restore point is still available; click Refresh and Details before trying again.");
+        ipRestorePoints.Remove(point);
+        SaveSettings();
+        Log("IP Shifter", "OK", "Restored previous IP settings for " + adapter.Name + ".");
+        MessageBox.Show(this, "Previous IP settings restored for " + adapter.Name + ".", "IP Restored", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
     private void ApplyStaticIp()
     {
         ToolkitAdapter adapter = SelectedAdapter();
@@ -1247,6 +1391,7 @@ internal sealed class ToolkitWindow : Form
         RequireAdmin();
         string summary = adapter.Name + "\r\nIP: " + ip + "\r\nMask: " + mask + "\r\nGateway: " + (gateway.Length == 0 ? "None" : gateway) + "\r\nDNS: " + (dns1.Length == 0 ? "Automatic" : dns1 + (dns2.Length == 0 ? "" : ", " + dns2));
         if (MessageBox.Show(this, (alreadyAssigned ? "This IP is already assigned to the selected adapter. Reapply these settings?" : "Apply this configuration?") + "\r\n\r\n" + summary, "Confirm IP Change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        SaveIpRestorePoint(adapter);
         Netsh("interface ipv4 set address name=" + Quote(adapter.Name) + " source=static address=" + ip + " mask=" + mask + " gateway=" + (gateway.Length == 0 ? "none" : gateway));
         if (dns1.Length > 0) { Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=static address=" + dns1 + " validate=no"); if (dns2.Length > 0) Netsh("interface ipv4 add dnsservers name=" + Quote(adapter.Name) + " address=" + dns2 + " index=2 validate=no"); }
         else Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=dhcp");
@@ -1264,6 +1409,7 @@ internal sealed class ToolkitWindow : Form
         ToolkitAdapter adapter = SelectedAdapter();
         RequireAdmin();
         if (MessageBox.Show(this, "Switch " + adapter.Name + " to automatic IP and DNS?", "Confirm DHCP", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        SaveIpRestorePoint(adapter);
         Netsh("interface ipv4 set address name=" + Quote(adapter.Name) + " source=dhcp");
         Netsh("interface ipv4 set dnsservers name=" + Quote(adapter.Name) + " source=dhcp");
         RefreshAdapters(); Log("IP Shifter", "OK", "Requested DHCP on " + adapter.Name);
@@ -1865,6 +2011,26 @@ internal sealed class ToolkitWindow : Form
                 IpConflictOwners(assignments, ipSelected, "192.168.2.251").Length != 0 ||
                 IpConflictOwners(assignments, ipSelected, "10.211.113.252").Length != 0)
                 throw new InvalidOperationException("Existing IP assignment detection failed.");
+            IpRestorePoint restoreSample = new IpRestorePoint { AdapterGuid = "sample", AdapterName = "Ethernet 3", IPAddress = "192.0.2.10",
+                SubnetMask = "255.255.255.0", Gateway = "192.0.2.1", DnsAutomatic = false, Dns1 = "1.1.1.1", Dns2 = "8.8.8.8" };
+            string[] restoreCommands = RestoreIpCommands(restoreSample, "Ethernet 3");
+            if (restoreCommands.Length != 3 || !restoreCommands[0].Contains("address=192.0.2.10") ||
+                !restoreCommands[1].Contains("address=1.1.1.1") || !restoreCommands[2].Contains("address=8.8.8.8"))
+                throw new InvalidOperationException("Static IP restore command planning failed.");
+            restoreSample.DhcpEnabled = true;
+            restoreSample.DnsAutomatic = true;
+            restoreCommands = RestoreIpCommands(restoreSample, "Ethernet 3");
+            if (restoreCommands.Length != 2 || !restoreCommands[0].Contains("source=dhcp") || !restoreCommands[1].Contains("source=dhcp"))
+                throw new InvalidOperationException("DHCP restore command planning failed.");
+            string restoreJson = json.Serialize(new Dictionary<string, object> { { "AdapterGuid", restoreSample.AdapterGuid },
+                { "DhcpEnabled", restoreSample.DhcpEnabled }, { "DnsAutomatic", restoreSample.DnsAutomatic } });
+            IDictionary<string, object> restoredRow = json.Deserialize<Dictionary<string, object>>(restoreJson);
+            if (Value(restoredRow, "AdapterGuid") != "sample" || !Boolean.Parse(Value(restoredRow, "DhcpEnabled")) ||
+                !Boolean.Parse(Value(restoredRow, "DnsAutomatic")))
+                throw new InvalidOperationException("IP restore point serialization failed.");
+            TabPage ipPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "IP Shifter");
+            if (!ipPage.Controls.OfType<Button>().Any(c => c.Text == "Restore Previous IP"))
+                throw new InvalidOperationException("IP restore action is missing.");
             string checksumSample = new string('a', 64) + "  TEC-Systems-FieldToolkit-Setup.exe";
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
