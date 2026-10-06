@@ -1856,6 +1856,7 @@ internal sealed class ToolkitWindow : Form
                 scanView.Items[0].SubItems[4].Text != "Cisco Systems, Inc")
                 throw new InvalidOperationException("IP Scanner result columns are misaligned.");
             scanView.Items.Clear();
+            tabs.SelectedTab = scannerPage; Application.DoEvents();
             AddScanHost(new ScanHost { IP = "192.168.1.10", Hostname = "zulu", Ping = "12 ms" });
             AddScanHost(new ScanHost { IP = "192.168.1.2", Hostname = "Alpha", Ping = "3 ms" });
             SortScanResults(0);
