@@ -279,6 +279,8 @@ internal sealed class ToolkitWindow : Form
     private readonly ToolTip tips = new ToolTip();
     private Dictionary<string, object> settings = new Dictionary<string, object>();
     private bool dark;
+    private bool followWindowsTheme = true;
+    private ToolStripMenuItem followThemeItem;
     private bool exitRequested;
     private bool stopScan;
     private bool scanRunning;
@@ -340,6 +342,7 @@ internal sealed class ToolkitWindow : Form
         logPath = Path.Combine(folder, "TEC_FieldToolkit_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
         string versionFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "version.txt");
         version = File.Exists(versionFile) ? File.ReadAllText(versionFile).Trim() : "0.0.0";
+        dark = WindowsPrefersDark();
         LoadSettings();
         Text = Product;
         StartPosition = FormStartPosition.CenterScreen;
@@ -355,12 +358,34 @@ internal sealed class ToolkitWindow : Form
         ApplyTheme();
         Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (startup) Hide(); if (testing) return; RefreshAdapters(); RefreshProfiles(); RefreshScannerAdapters(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
         FormClosing += OnClosing;
+        SystemEvents.UserPreferenceChanged += OnWindowsPreferenceChanged;
     }
 
     private static string Value(IDictionary<string, object> row, string key)
     {
         object value;
         return row != null && row.TryGetValue(key, out value) && value != null ? Convert.ToString(value) : "";
+    }
+
+    private static bool WindowsPrefersDark()
+    {
+        try
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+            {
+                object value = key == null ? null : key.GetValue("AppsUseLightTheme");
+                if (value == null && key != null) value = key.GetValue("SystemUsesLightTheme");
+                return value != null && Convert.ToInt32(value) == 0;
+            }
+        }
+        catch { return false; }
+    }
+
+    private void OnWindowsPreferenceChanged(object sender, UserPreferenceChangedEventArgs args)
+    {
+        if (!followWindowsTheme || IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke(new Action(delegate { if (followWindowsTheme && !IsDisposed) { dark = WindowsPrefersDark(); ApplyTheme(); } })); }
+        catch (InvalidOperationException) { }
     }
 
     private void LoadSettings()
@@ -371,7 +396,11 @@ internal sealed class ToolkitWindow : Form
             settings = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(configPath));
             if (settings == null) settings = new Dictionary<string, object>();
             object mode;
-            if (settings.TryGetValue("DarkMode", out mode)) dark = Convert.ToBoolean(mode);
+            if (settings.TryGetValue("ThemeMode", out mode) && String.Equals(Convert.ToString(mode), "manual", StringComparison.OrdinalIgnoreCase))
+            {
+                followWindowsTheme = false;
+                if (settings.TryGetValue("DarkMode", out mode)) dark = Convert.ToBoolean(mode);
+            }
             yabePath = Value(settings, "YabePath");
             bool migratedRdpIds = false;
             object saved;
@@ -425,6 +454,7 @@ internal sealed class ToolkitWindow : Form
     private void SaveSettings()
     {
         settings["DarkMode"] = dark;
+        settings["ThemeMode"] = followWindowsTheme ? "system" : "manual";
         settings["YabePath"] = yabePath;
         settings["SiteProfiles"] = profiles.Select(p => new Dictionary<string, object> {
             { "Name", p.Name }, { "Adapter", p.Adapter }, { "IPAddress", p.IPAddress },
@@ -614,6 +644,14 @@ internal sealed class ToolkitWindow : Form
             catch (Exception error) { Fail("Windows Startup", error); }
         };
         trayMenu.Items.Add(startupItem);
+        followThemeItem = new ToolStripMenuItem("Follow Windows Theme") { Checked = followWindowsTheme };
+        followThemeItem.Click += delegate {
+            followWindowsTheme = !followWindowsTheme;
+            if (followWindowsTheme) { dark = WindowsPrefersDark(); ApplyTheme(); }
+            followThemeItem.Checked = followWindowsTheme;
+            SaveSettings();
+        };
+        trayMenu.Items.Add(followThemeItem);
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add("Exit Toolkit", null, delegate { ExitToolkit(); });
         tray = new NotifyIcon { Icon = File.Exists(trayFile) ? new Icon(trayFile) : Icon, Text = Product, ContextMenuStrip = trayMenu, Visible = true };
@@ -657,6 +695,7 @@ internal sealed class ToolkitWindow : Form
     private void OnClosing(object sender, FormClosingEventArgs args)
     {
         if (!exitRequested && args.CloseReason == CloseReason.UserClosing) { args.Cancel = true; Hide(); return; }
+        SystemEvents.UserPreferenceChanged -= OnWindowsPreferenceChanged;
         if (internetTimer != null) { internetTimer.Stop(); internetTimer.Dispose(); }
         if (updateTimer != null) { updateTimer.Stop(); updateTimer.Dispose(); }
         if (activation != null) { activation.Dispose(); activation = null; }
@@ -667,7 +706,13 @@ internal sealed class ToolkitWindow : Form
         if (lightBrand != null) lightBrand.Dispose();
     }
 
-    private void ToggleTheme() { dark = !dark; ApplyTheme(); SaveSettings(); }
+    private void ToggleTheme()
+    {
+        dark = !dark;
+        followWindowsTheme = false;
+        if (followThemeItem != null) followThemeItem.Checked = false;
+        ApplyTheme(); SaveSettings();
+    }
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
@@ -816,6 +861,7 @@ internal sealed class ToolkitWindow : Form
             }
             control.ForeColor = control is Button ? Color.White : text;
         }
+        if (themeButton != null) themeButton.Text = dark ? "Light Mode" : "Dark Mode";
         if (brandPicture != null) brandPicture.Image = dark ? darkBrand : lightBrand;
         if (statusLabel != null) statusLabel.ForeColor = dark ? Color.FromArgb(93, 214, 168) : Green;
         if (internetLabel != null) internetLabel.ForeColor = dark ? Color.FromArgb(93, 214, 168) : Green;
@@ -923,7 +969,7 @@ internal sealed class ToolkitWindow : Form
         string[,] specs = {
             { "Services", "services.msc", "" }, { "Event Viewer", "eventvwr.msc", "" }, { "Device Manager", "devmgmt.msc", "" },
             { "Computer Mgmt", "compmgmt.msc", "" }, { "Local Users", "lusrmgr.msc", "" }, { "Programs", "appwiz.cpl", "" },
-            { "System Props", "sysdm.cpl", "" }, { "Task Manager", "taskmgr.exe", "" }, { "Command Prompt", "cmd.exe", "" },
+            { "System Props", "sysdm.cpl", "" }, { "Display Settings", "ms-settings:display", "" }, { "Task Manager", "taskmgr.exe", "" }, { "Command Prompt", "cmd.exe", "" },
             { "Task Scheduler", "taskschd.msc", "" }, { "Firewall Console", "wf.msc", "" }, { "Credential Mgr", "control.exe", "/name Microsoft.CredentialManager" },
             { "Shared Folders", "fsmgmt.msc", "" }, { "Windows Update", "ms-settings:windowsupdate", "" }, { "Remote Desktop", "mstsc.exe", "" },
             { "Printers", "control.exe", "printers" }, { "IPConfig /all", "cmd.exe", "/k ipconfig /all" }
@@ -1834,9 +1880,10 @@ internal sealed class ToolkitWindow : Form
                 c.Text == "Saved RDP sites" || c.Text == "Save Site" || c.Text == "Delete Site" || c.Text == "Site name"))
                 throw new InvalidOperationException("Windows Troubleshooting still contains removed RDP site controls.");
             FlowLayoutPanel windowsTools = windowsPage.Controls.Cast<Control>().OfType<FlowLayoutPanel>().First();
-            if (!windowsTools.Controls.Cast<Control>().Any(c => c.Text == "IPConfig /all"))
-                throw new InvalidOperationException("Command Prompt IPConfig /all shortcut is missing.");
-            if (windowsTools.AutoScroll || windowsTools.Controls.Count != 17 ||
+            if (!windowsTools.Controls.Cast<Control>().Any(c => c.Text == "IPConfig /all") ||
+                !windowsTools.Controls.Cast<Control>().Any(c => c.Text == "Display Settings"))
+                throw new InvalidOperationException("Windows tool shortcuts are missing.");
+            if (windowsTools.AutoScroll || windowsTools.Controls.Count != 18 ||
                 windowsTools.Controls.Cast<Control>().Any(c => !windowsTools.ClientRectangle.Contains(c.Bounds)))
                 throw new InvalidOperationException("Open tools shortcuts are clipped or require internal scrolling.");
             split.SplitterDistance = 650; Application.DoEvents();
