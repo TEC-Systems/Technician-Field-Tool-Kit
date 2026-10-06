@@ -1597,8 +1597,18 @@ internal sealed class ToolkitWindow : Form
         foreach (ColumnHeader header in scanView.Columns)
             header.Text = header.Text.TrimEnd(' ', '▲', '▼');
         scanView.Columns[column].Text += scanSortDescending ? " ▼" : " ▲";
-        scanView.ListViewItemSorter = new ScanResultsComparer(column, scanSortDescending);
-        scanView.Sort();
+        ApplyScanSort();
+    }
+
+    private void ApplyScanSort()
+    {
+        if (scanSortColumn < 0 || scanView.Items.Count < 2) return;
+        List<ListViewItem> rows = scanView.Items.Cast<ListViewItem>().ToList();
+        ScanResultsComparer comparer = new ScanResultsComparer(scanSortColumn, scanSortDescending);
+        rows.Sort((left, right) => comparer.Compare(left, right));
+        scanView.BeginUpdate();
+        try { scanView.Items.Clear(); scanView.Items.AddRange(rows.ToArray()); }
+        finally { scanView.EndUpdate(); }
     }
 
     private void AddScanHost(ScanHost host)
@@ -1607,6 +1617,7 @@ internal sealed class ToolkitWindow : Form
         ListViewItem row = new ListViewItem(host.IP);
         row.SubItems.Add(host.Hostname); row.SubItems.Add(host.Ping); row.SubItems.Add(host.Mac); row.SubItems.Add(host.Manufacturer); row.SubItems.Add(host.Ports);
         scanView.Items.Add(row);
+        ApplyScanSort();
     }
     private void ScanProgress(int done, int count) { if (!IsDisposed) scanStatus.Text = "Scanning " + done + "/" + count + " | " + scanView.Items.Count + " devices"; }
 
@@ -1871,7 +1882,7 @@ internal sealed class ToolkitWindow : Form
             if (scanView.Items[0].SubItems[2].Text != "3 ms") throw new InvalidOperationException("IP Scanner ping sort is not numeric.");
             AddScanHost(new ScanHost { IP = "192.168.1.3", Hostname = "Bravo", Ping = "1 ms" });
             if (scanView.Items[0].SubItems[2].Text != "1 ms") throw new InvalidOperationException("New scan result ignored the selected sort.");
-            scanView.ListViewItemSorter = null; scanView.Items.Clear();
+            scanSortColumn = -1; scanView.Items.Clear();
             byte[] nodeStatus = new byte[43];
             nodeStatus[0] = 0x54; nodeStatus[1] = 0x45; nodeStatus[2] = 0x80; nodeStatus[7] = 1;
             nodeStatus[12] = 0xC0; nodeStatus[13] = 0x0C; nodeStatus[15] = 0x21; nodeStatus[17] = 1;
