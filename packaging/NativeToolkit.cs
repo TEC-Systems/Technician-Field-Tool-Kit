@@ -63,6 +63,7 @@ internal static class NativeToolkit
     {
         try
         {
+            if (args.Any(arg => arg == "/self-test" || arg == "/startup-self-test")) Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             if (args.Length > 0 && args[0] == "/activate") return RestoreExisting() ? 0 : 1;
@@ -315,9 +316,9 @@ internal sealed class ToolkitWindow : Form
         BuildWindow();
         ConfigureTray();
         activation = new ToolkitActivationWindow(RestoreFromTray);
-        if (startup) { WindowState = FormWindowState.Minimized; ShowInTaskbar = false; }
+        if (startup) ShowInTaskbar = false;
         ApplyTheme();
-        Shown += delegate { if (startup) { Hide(); ShowInTaskbar = true; } SetInitialSplit(); ApplyTitleBarTheme(); if (testing) return; RefreshAdapters(); RefreshProfiles(); RefreshScannerAdapters(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
+        Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (startup) Hide(); if (testing) return; RefreshAdapters(); RefreshProfiles(); RefreshScannerAdapters(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
         FormClosing += OnClosing;
     }
 
@@ -598,6 +599,7 @@ internal sealed class ToolkitWindow : Form
 
     private void RestoreFromTray()
     {
+        ShowInTaskbar = true;
         if (!Visible) Show();
         WindowState = FormWindowState.Normal;
         BringToFront();
@@ -1937,7 +1939,7 @@ internal sealed class ToolkitWindow : Form
                 DateTime deadline = DateTime.UtcNow.AddSeconds(15);
                 while (!startupTest.HasExited && DateTime.UtcNow < deadline) { Application.DoEvents(); Thread.Sleep(20); }
                 if (!startupTest.HasExited) { startupTest.Kill(); throw new InvalidOperationException("Windows startup self-test timed out."); }
-                if (startupTest.ExitCode != 0) throw new InvalidOperationException("Windows startup self-test failed.");
+                if (startupTest.ExitCode != 0) throw new InvalidOperationException("Windows startup self-test failed: " + (File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "self-test-error.txt")) ? File.ReadAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "self-test-error.txt")) : "No child error details."));
             }
             ExitToolkit();
             if (tray.Visible) throw new InvalidOperationException("Tray icon remained after Exit.");
