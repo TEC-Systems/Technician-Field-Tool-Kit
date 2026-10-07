@@ -275,7 +275,6 @@ internal sealed partial class ToolkitWindow : Form
 {
     private const string Product = "TEC Systems Field Toolkit";
     private const string Mailbox = "IT@tec-system.com";
-    private const string Tec0BotUrl = "https://aibot.tec-system.com/";
     private static readonly Color Cobalt = Color.FromArgb(0, 67, 230);
     private static readonly Color Green = Color.FromArgb(31, 128, 78);
     private static readonly Color Slate = Color.FromArgb(75, 94, 116);
@@ -572,7 +571,6 @@ internal sealed partial class ToolkitWindow : Form
         statusLabel = L("Ready", 18, 11, 295);
         footer.Controls.Add(statusLabel);
         updateButton = B(footer, "Check Updates", 338, 5, 148, OpenUpdateOffer, "Check for a newer toolkit release or install an available update.", Cobalt);
-        B(footer, "TEC0 AI Bot", 500, 5, 130, delegate { OpenWeb(Tec0BotUrl); }, "Open TEC0 AI Bot in your default browser.", Green);
         internetLabel = new Label { Text = "Internet: Checking", Dock = DockStyle.Right, Width = 450, TextAlign = ContentAlignment.MiddleRight, Padding = new Padding(0, 0, 18, 0) };
         footer.Controls.Add(internetLabel);
 
