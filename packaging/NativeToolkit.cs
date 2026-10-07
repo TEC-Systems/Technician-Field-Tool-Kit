@@ -1010,6 +1010,10 @@ internal sealed partial class ToolkitWindow : Form
         }, "Show the update message without changing the installed toolkit.", Cobalt);
         B(page, "Check for Live Update", 240, 140, 190, delegate { CheckUpdates(false); },
             "Check GitHub for a published update. This can offer a real installation.", Green);
+        B(page, "Show Installed Version", 446, 140, 190, delegate {
+            MessageBox.Show(this, "Toolkit installed version: " + version,
+                "Toolkit Version", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }, "Confirm the version installed after an update.", Slate);
         page.Controls.Add(L("The live check uses the published release and may offer to install it.", 24, 194, 700));
     }
 
@@ -2204,7 +2208,8 @@ internal sealed partial class ToolkitWindow : Form
                 throw new InvalidOperationException("Expected the update demonstration tab.");
             TabPage testPage = tabs.TabPages[7];
             if (!testPage.Controls.Cast<Control>().Any(c => c.Text == "Preview Update Notice") ||
-                !testPage.Controls.Cast<Control>().Any(c => c.Text == "Check for Live Update"))
+                !testPage.Controls.Cast<Control>().Any(c => c.Text == "Check for Live Update") ||
+                !testPage.Controls.Cast<Control>().Any(c => c.Text == "Show Installed Version"))
                 throw new InvalidOperationException("Update demonstration actions are missing.");
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
