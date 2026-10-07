@@ -307,6 +307,7 @@ internal sealed partial class ToolkitWindow : Form
     private Dictionary<string, object> availableRelease;
     private string availableVersion = "";
     private int checkingUpdates;
+    private int checkingInternet;
     private bool testing;
     private ContextMenuStrip trayMenu;
     private System.Windows.Forms.Timer internetTimer;
@@ -375,7 +376,7 @@ internal sealed partial class ToolkitWindow : Form
         activation = new ToolkitActivationWindow(RestoreFromTray);
         if (startup) ShowInTaskbar = false;
         ApplyTheme();
-        Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (startup) Hide(); if (testing) return; RefreshAdapters(); RefreshProfiles(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
+        Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (startup) Hide(); if (testing) return; RefreshProfiles(); RefreshAdaptersAsync(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
         FormClosing += OnClosing;
         SystemEvents.UserPreferenceChanged += OnWindowsPreferenceChanged;
     }
@@ -1082,7 +1083,24 @@ internal sealed partial class ToolkitWindow : Form
     private void RefreshAdapters()
     {
         string selected = adapterChoice.SelectedIndex >= 0 && adapterChoice.SelectedIndex < adapters.Count ? adapters[adapterChoice.SelectedIndex].Name : "";
-        adapters.Clear();
+        ShowAdapters(ReadAdapters(), selected);
+    }
+
+    private void RefreshAdaptersAsync()
+    {
+        ThreadPool.QueueUserWorkItem(delegate {
+            List<ToolkitAdapter> found = ReadAdapters();
+            if (!IsDisposed && IsHandleCreated)
+                try { BeginInvoke(new Action(delegate {
+                    if (!IsDisposed) ShowAdapters(found, "");
+                })); }
+                catch (InvalidOperationException) { }
+        });
+    }
+
+    private List<ToolkitAdapter> ReadAdapters()
+    {
+        List<ToolkitAdapter> found = new List<ToolkitAdapter>();
         try
         {
             foreach (ManagementObject item in new ManagementObjectSearcher("SELECT DeviceID,NetConnectionID,GUID,NetConnectionStatus,MACAddress,Description,PNPDeviceID,ServiceName FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL").Get())
@@ -1116,11 +1134,18 @@ internal sealed partial class ToolkitWindow : Form
                     }
                 }
                 if (!IsUsableIpv4(adapter.Gateway)) adapter.Gateway = GatewayFromNetworkInterface(adapter.Guid);
-                adapters.Add(adapter);
+                found.Add(adapter);
             }
         }
         catch (Exception error) { Log("Adapter", "ERROR", error.Message); }
-        adapters.Sort((a, b) => String.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        found.Sort((a, b) => String.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        return found;
+    }
+
+    private void ShowAdapters(List<ToolkitAdapter> found, string selected)
+    {
+        adapters.Clear();
+        adapters.AddRange(found);
         adapterChoice.Items.Clear();
         foreach (ToolkitAdapter adapter in adapters) adapterChoice.Items.Add(adapter.Name + " [" + adapter.Status + "] - IP: " + adapter.IP + (String.IsNullOrEmpty(adapter.Mask) ? "" : " / " + adapter.Mask));
         if (adapters.Count > 0) adapterChoice.SelectedIndex = Math.Max(0, adapters.FindIndex(a => a.Name == selected));
@@ -1982,10 +2007,22 @@ internal sealed partial class ToolkitWindow : Form
 
     private void UpdateInternet()
     {
-        bool online = InternetOnline();
-        internetLabel.Text = online ? "Internet: Online" : "Internet: Offline";
-        internetLabel.ForeColor = online ? (dark ? Color.FromArgb(93, 214, 168) : Green) : (dark ? Color.FromArgb(255, 120, 120) : Color.Firebrick);
-        if (tray != null) tray.Text = Product + " - Internet: " + (online ? "Online" : "Offline");
+        if (Interlocked.CompareExchange(ref checkingInternet, 1, 0) != 0) return;
+        ThreadPool.QueueUserWorkItem(delegate {
+            try
+            {
+                bool online = InternetOnline();
+                if (!IsDisposed && IsHandleCreated)
+                    try { BeginInvoke(new Action(delegate {
+                        if (IsDisposed) return;
+                        internetLabel.Text = online ? "Internet: Online" : "Internet: Offline";
+                        internetLabel.ForeColor = online ? (dark ? Color.FromArgb(93, 214, 168) : Green) : (dark ? Color.FromArgb(255, 120, 120) : Color.Firebrick);
+                        if (tray != null) tray.Text = Product + " - Internet: " + (online ? "Online" : "Offline");
+                    })); }
+                    catch (InvalidOperationException) { }
+            }
+            finally { Interlocked.Exchange(ref checkingInternet, 0); }
+        });
     }
 
     private void OpenUpdateOffer()
