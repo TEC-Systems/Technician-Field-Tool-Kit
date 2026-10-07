@@ -82,6 +82,11 @@ internal static class NativeToolkit
                 }
                 return 0;
             }
+            if (args.Length == 2 && args[0] == "/main-preview")
+            {
+                using (ToolkitWindow preview = new ToolkitWindow()) preview.SavePreview(args[1]);
+                return 0;
+            }
             if (args.Length > 0 && args[0] == "/activate") return RestoreExisting() ? 0 : 1;
             if (args.Length == 2 && args[0] == "/wait-for-exit")
             {
@@ -120,7 +125,7 @@ internal static class NativeToolkit
         }
         catch (Exception error)
         {
-            if (args.Length > 0 && (args[0] == "/self-test" || args[0] == "/startup-self-test" || args[0] == "/activity-preview"))
+            if (args.Length > 0 && (args[0] == "/self-test" || args[0] == "/startup-self-test" || args[0] == "/activity-preview" || args[0] == "/main-preview"))
                 File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "self-test-error.txt"), error.ToString());
             else
                 MessageBox.Show(error.Message, "TEC Systems Field Toolkit", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -2283,6 +2288,20 @@ internal sealed partial class ToolkitWindow : Form
         if (!Visible || !ShowInTaskbar) throw new InvalidOperationException("Startup instance did not restore to the taskbar.");
         ExitToolkit();
         return 0;
+    }
+
+    public void SavePreview(string path)
+    {
+        testing = true;
+        dark = true;
+        ApplyTheme();
+        Show(); Application.DoEvents();
+        using (Bitmap image = new Bitmap(Width, Height))
+        {
+            DrawToBitmap(image, new Rectangle(0, 0, image.Width, image.Height));
+            image.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+        }
+        ExitToolkit();
     }
 
     public int SelfTest()

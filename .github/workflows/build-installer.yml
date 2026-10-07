@@ -52,6 +52,7 @@ jobs:
             dist/app-icon.png
             dist/tray-icon.png
             dist/activity-report-preview.png
+            dist/main-toolkit-preview.png
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/') || inputs.publish_release
         shell: pwsh

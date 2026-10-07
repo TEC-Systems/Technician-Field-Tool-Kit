@@ -138,6 +138,12 @@ if ($previewTest.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $activityPrevie
     $detail = if (Test-Path -LiteralPath $selfTestError) { Get-Content -LiteralPath $selfTestError -Raw } else { 'No error details were written.' }
     throw "Activity report preview failed: $detail"
 }
+$mainPreview = Join-Path $dist 'main-toolkit-preview.png'
+$mainPreviewTest = Start-Process -FilePath $launcher -ArgumentList ('/main-preview "{0}"' -f $mainPreview) -PassThru -Wait
+if ($mainPreviewTest.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $mainPreview)) {
+    $detail = if (Test-Path -LiteralPath $selfTestError) { Get-Content -LiteralPath $selfTestError -Raw } else { 'No error details were written.' }
+    throw "Main toolkit preview failed: $detail"
+}
 
 $payloadFiles = @($launcher, (Join-Path $root 'version.txt'), (Join-Path $root 'assets'))
 $archiveError = $null
