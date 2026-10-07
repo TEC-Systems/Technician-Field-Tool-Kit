@@ -1108,7 +1108,7 @@ internal sealed partial class ToolkitWindow : Form
         liveRefresh.Enabled = false; liveStart.Enabled = false; liveStop.Enabled = true;
         liveInterfaceChoice.Enabled = false; liveDurationChoice.Enabled = false;
         captureBrowse.Enabled = false; captureAnalyze.Enabled = false; captureExport.Enabled = false;
-        captureReport.Clear(); captureStatus.Text = "Capturing for up to " + duration + " seconds...";
+        capturePath.Clear(); captureReport.Clear(); captureStatus.Text = "Capturing for up to " + duration + " seconds...";
         ThreadPool.QueueUserWorkItem(delegate {
             string error = null;
             bool stopped = false;
@@ -1122,8 +1122,9 @@ internal sealed partial class ToolkitWindow : Form
                     liveRefresh.Enabled = true; liveStart.Enabled = true; liveStop.Enabled = false;
                     liveInterfaceChoice.Enabled = true; liveDurationChoice.Enabled = true;
                     captureBrowse.Enabled = true; captureAnalyze.Enabled = true;
-                    if (File.Exists(path) && new FileInfo(path).Length > 0) capturePath.Text = path;
-                    captureStatus.Text = error ?? (stopped ? "Capture stopped; any saved packets can be analyzed." : "Capture saved; analyzing...");
+                    bool saved = File.Exists(path) && new FileInfo(path).Length > 0;
+                    if (saved) capturePath.Text = path;
+                    captureStatus.Text = error ?? (stopped ? (saved ? "Capture stopped; saved packets can be analyzed." : "Capture stopped; no packets saved.") : "Capture saved; analyzing...");
                     if (error != null) captureReport.Text = error;
                     Log("Capture", error == null ? "OK" : "ERROR", error ?? (stopped ? "Stopped capture" : "Saved capture") + ": " + path);
                     source.Dispose();
