@@ -2294,8 +2294,11 @@ internal sealed partial class ToolkitWindow : Form
     {
         testing = true;
         dark = true;
+        Text = Product + " (Preview)";
         ApplyTheme();
         Show(); Application.DoEvents();
+        Size = new Size(1280, 780);
+        Application.DoEvents();
         using (Bitmap image = new Bitmap(Width, Height))
         {
             DrawToBitmap(image, new Rectangle(0, 0, image.Width, image.Height));

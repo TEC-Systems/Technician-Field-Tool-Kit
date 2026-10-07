@@ -125,6 +125,8 @@ $compileOutput = & $compiler /nologo /target:winexe ('/win32manifest:"{0}"' -f (
 $compileExit = $LASTEXITCODE
 $compileOutput | Write-Host
 if ($compileExit -ne 0) { throw ('Native toolkit compilation failed: ' + ($compileOutput -join "`n")) }
+Copy-Item -LiteralPath (Join-Path $root 'version.txt') -Destination (Join-Path $dist 'version.txt') -Force
+Copy-Item -LiteralPath (Join-Path $root 'assets') -Destination (Join-Path $dist 'assets') -Recurse -Force
 $selfTestError = Join-Path $dist 'self-test-error.txt'
 if (Test-Path -LiteralPath $selfTestError) { Remove-Item -LiteralPath $selfTestError -Force }
 $selfTest = Start-Process -FilePath $launcher -ArgumentList '/self-test' -PassThru -Wait
