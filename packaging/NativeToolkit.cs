@@ -340,6 +340,10 @@ internal sealed partial class ToolkitWindow : Form
     private TextBox dns1Field;
     private TextBox dns2Field;
     private ComboBox scanAdapter;
+    private ComboBox networkGatewayChoice;
+    private readonly List<ToolkitAdapter> gatewayAdapters = new List<ToolkitAdapter>();
+    private string scanSelectedAdapterGuid = "";
+    private string scanSelectedAdapterName = "";
     private TextBox scanStart;
     private TextBox scanEnd;
     private Label scanScope;
@@ -371,7 +375,7 @@ internal sealed partial class ToolkitWindow : Form
         activation = new ToolkitActivationWindow(RestoreFromTray);
         if (startup) ShowInTaskbar = false;
         ApplyTheme();
-        Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (startup) Hide(); if (testing) return; RefreshAdapters(); RefreshProfiles(); RefreshScannerAdapters(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
+        Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (startup) Hide(); if (testing) return; RefreshAdapters(); RefreshProfiles(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
         FormClosing += OnClosing;
         SystemEvents.UserPreferenceChanged += OnWindowsPreferenceChanged;
     }
@@ -589,6 +593,9 @@ internal sealed partial class ToolkitWindow : Form
         BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
         BuildLogPanel();
+        tabs.SelectedIndexChanged += delegate {
+            if (!testing && tabs.SelectedTab != null && (tabs.SelectedTab.Text == "IP Scanner" || tabs.SelectedTab.Text == "Network Troubleshooting")) RefreshAdapters();
+        };
         internetTimer = new System.Windows.Forms.Timer { Interval = 30000 };
         internetTimer.Tick += delegate { UpdateInternet(); };
         updateTimer = new System.Windows.Forms.Timer { Interval = 30 * 60 * 1000 };
@@ -1095,19 +1102,23 @@ internal sealed partial class ToolkitWindow : Form
                     adapter.Gateway = FirstIpv4(config["DefaultIPGateway"]);
                     adapter.Dns = JoinAddresses(config["DNSServerSearchOrder"]);
                 }
-                if (adapter.IP == "No IP" && !String.IsNullOrEmpty(adapter.Guid))
+                if (!String.IsNullOrEmpty(adapter.Guid))
                 {
                     using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\" + adapter.Guid))
                     {
                         if (key != null)
                         {
-                            string stored = FirstIpv4(key.GetValue("IPAddress"));
-                            if (stored != "No IP" && stored != "0.0.0.0") { adapter.IP = stored; adapter.Mask = FirstIpv4(key.GetValue("SubnetMask")); }
-                            if (String.IsNullOrEmpty(adapter.Gateway)) adapter.Gateway = FirstIpv4(key.GetValue("DefaultGateway"));
+                            if (adapter.IP == "No IP")
+                            {
+                                string stored = FirstIpv4(key.GetValue("IPAddress"));
+                                if (stored != "No IP" && stored != "0.0.0.0") { adapter.IP = stored; adapter.Mask = FirstIpv4(key.GetValue("SubnetMask")); }
+                            }
+                            if (!IsUsableIpv4(adapter.Gateway)) adapter.Gateway = FirstIpv4(key.GetValue("DefaultGateway"));
                             if (String.IsNullOrEmpty(adapter.Dns)) adapter.Dns = Convert.ToString(key.GetValue("NameServer"));
                         }
                     }
                 }
+                if (!IsUsableIpv4(adapter.Gateway)) adapter.Gateway = GatewayFromNetworkInterface(adapter.Guid);
                 adapters.Add(adapter);
             }
         }
@@ -1117,6 +1128,7 @@ internal sealed partial class ToolkitWindow : Form
         foreach (ToolkitAdapter adapter in adapters) adapterChoice.Items.Add(adapter.Name + " [" + adapter.Status + "] - IP: " + adapter.IP + (String.IsNullOrEmpty(adapter.Mask) ? "" : " / " + adapter.Mask));
         if (adapters.Count > 0) adapterChoice.SelectedIndex = Math.Max(0, adapters.FindIndex(a => a.Name == selected));
         RefreshScannerAdapters();
+        RefreshGatewayAdapters();
         Log("Adapter", "INFO", adapters.Count + " adapters found.");
     }
 
@@ -1182,6 +1194,28 @@ internal sealed partial class ToolkitWindow : Form
             IPAddress parsed;
             if (IPAddress.TryParse(candidate, out parsed) && parsed.AddressFamily == AddressFamily.InterNetwork) return candidate;
         }
+        return "No IP";
+    }
+
+    private static bool IsUsableIpv4(string value)
+    {
+        IPAddress parsed;
+        return !String.IsNullOrWhiteSpace(value) && IPAddress.TryParse(value, out parsed) &&
+            parsed.AddressFamily == AddressFamily.InterNetwork && !parsed.Equals(IPAddress.Any);
+    }
+
+    private static string GatewayFromNetworkInterface(string guid)
+    {
+        if (String.IsNullOrEmpty(guid)) return "No IP";
+        try
+        {
+            NetworkInterface nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(item =>
+                String.Equals(item.Id.Trim('{', '}'), guid.Trim('{', '}'), StringComparison.OrdinalIgnoreCase));
+            if (nic != null)
+                foreach (GatewayIPAddressInformation gateway in nic.GetIPProperties().GatewayAddresses)
+                    if (IsUsableIpv4(gateway.Address.ToString())) return gateway.Address.ToString();
+        }
+        catch (NetworkInformationException) { }
         return "No IP";
     }
 
@@ -1446,8 +1480,10 @@ internal sealed partial class ToolkitWindow : Form
     {
         GroupBox device = new GroupBox { Text = "Device Checks", Left = 18, Top = 18, Width = 340, Height = 230 }; page.Controls.Add(device);
         device.Controls.Add(L("Device host / IP", 14, 28, 160)); networkTarget = T(14, 52, 300, "192.168.1.10"); device.Controls.Add(networkTarget);
+        device.Controls.Add(L("Gateway adapter", 14, 82, 105));
+        networkGatewayChoice = new ComboBox { Left = 120, Top = 79, Width = 194, DropDownWidth = 310, DropDownStyle = ComboBoxStyle.DropDownList }; device.Controls.Add(networkGatewayChoice);
         B(device, "Ping Device", 14, 106, 142, delegate { PingTerminal(networkTarget.Text, false); }, "Four live pings to the device.", Cobalt);
-        B(device, "Ping Gateway", 172, 106, 142, delegate { PingTerminal(SelectedAdapter().Gateway, false); }, "Four live pings to the selected adapter's gateway.", Green);
+        B(device, "Ping Gateway", 172, 106, 142, PingSelectedGateway, "Ping the gateway shown for the selected network adapter.", Green);
         B(device, "Tracert", 14, 146, 142, delegate { if (!ValidTarget(networkTarget.Text)) throw new InvalidOperationException("Enter a valid target."); RunExternal("Trace", "tracert.exe", "-d " + networkTarget.Text.Trim()); }, "Trace the route to the device.", Slate);
         B(device, "PathPing", 172, 146, 142, delegate { if (!ValidTarget(networkTarget.Text)) throw new InvalidOperationException("Enter a valid target."); RunExternal("PathPing", "pathping.exe", "-n " + networkTarget.Text.Trim()); }, "Find route and packet loss along the path.", Slate);
         B(device, "DNS Lookup", 14, 186, 142, delegate { Lookup(networkTarget.Text); }, "Resolve the device hostname.", Cobalt);
@@ -1486,6 +1522,35 @@ internal sealed partial class ToolkitWindow : Form
         page.Controls.Add(L("Support bundle", 376, 530, 220));
         bundleType = new ComboBox { Left = 376, Top = 560, Width = 190, DropDownStyle = ComboBoxStyle.DropDownList }; bundleType.Items.AddRange(new object[] { "Network", "Windows", "Both" }); bundleType.SelectedIndex = 0; page.Controls.Add(bundleType);
         B(page, "Export ZIP", 574, 556, 130, ExportBundle, "Export selected logs and diagnostic snapshots as a ZIP for review before sharing.", Green);
+    }
+
+    private void RefreshGatewayAdapters()
+    {
+        if (networkGatewayChoice == null) return;
+        string selectedGuid = networkGatewayChoice.SelectedIndex >= 0 && networkGatewayChoice.SelectedIndex < gatewayAdapters.Count ?
+            gatewayAdapters[networkGatewayChoice.SelectedIndex].Guid : "";
+        gatewayAdapters.Clear(); networkGatewayChoice.Items.Clear();
+        foreach (ToolkitAdapter adapter in adapters.Where(a => a.Status == "Connected" && IsUsableIpv4(a.Gateway)))
+        {
+            gatewayAdapters.Add(adapter);
+            networkGatewayChoice.Items.Add(adapter.Gateway + "  |  " + adapter.Name);
+        }
+        if (gatewayAdapters.Count > 0)
+        {
+            int previous = gatewayAdapters.FindIndex(a => a.Guid == selectedGuid && selectedGuid.Length > 0);
+            int shifter = adapterChoice.SelectedIndex >= 0 && adapterChoice.SelectedIndex < adapters.Count ?
+                gatewayAdapters.FindIndex(a => a.Guid == adapters[adapterChoice.SelectedIndex].Guid) : -1;
+            networkGatewayChoice.SelectedIndex = previous >= 0 ? previous : shifter >= 0 ? shifter : 0;
+        }
+    }
+
+    private void PingSelectedGateway()
+    {
+        if (networkGatewayChoice == null || networkGatewayChoice.SelectedIndex < 0 || networkGatewayChoice.SelectedIndex >= gatewayAdapters.Count)
+            throw new InvalidOperationException("No connected adapter with an IPv4 gateway was found. Connect to a network with a gateway and click Refresh in IP Shifter.");
+        ToolkitAdapter adapter = gatewayAdapters[networkGatewayChoice.SelectedIndex];
+        if (!IsUsableIpv4(adapter.Gateway)) throw new InvalidOperationException("The selected adapter does not have a valid IPv4 gateway. Refresh the adapters and try again.");
+        PingTerminal(adapter.Gateway, false);
     }
 
     private int SelectedTelnetPort()
@@ -1599,7 +1664,8 @@ internal sealed partial class ToolkitWindow : Form
     private void BuildScannerPage(TabPage page)
     {
         page.Controls.Add(L("Network adapter", 18, 16, 220));
-        scanAdapter = new ComboBox { Left = 18, Top = 38, Width = 690, DropDownStyle = ComboBoxStyle.DropDownList }; scanAdapter.SelectedIndexChanged += delegate { SelectScanAdapter(); }; page.Controls.Add(scanAdapter);
+        scanAdapter = new ComboBox { Left = 18, Top = 38, Width = 558, DropDownStyle = ComboBoxStyle.DropDownList }; scanAdapter.SelectedIndexChanged += delegate { SelectScanAdapter(); }; page.Controls.Add(scanAdapter);
+        B(page, "Refresh", 592, 35, 112, RefreshAdapters, "Read the current IP, mask, and gateway from Windows again.", Cobalt);
         scanScope = L("Select an adapter to fill the local network range.", 18, 68, 690); page.Controls.Add(scanScope);
         page.Controls.Add(L("Start IP", 18, 98, 120)); scanStart = T(18, 122, 156, ""); page.Controls.Add(scanStart);
         page.Controls.Add(L("End IP", 190, 98, 120)); scanEnd = T(190, 122, 156, ""); page.Controls.Add(scanEnd);
@@ -1637,20 +1703,40 @@ internal sealed partial class ToolkitWindow : Form
         if (scanAdapter == null) return;
         scanAdapter.Items.Clear();
         foreach (ToolkitAdapter a in adapters) scanAdapter.Items.Add(a.Name + " [" + a.Status + "] - " + a.IP);
-        if (adapters.Count > 0) { int index = adapters.FindIndex(a => a.Status == "Connected" && a.IP != "No IP"); scanAdapter.SelectedIndex = index >= 0 ? index : 0; }
+        if (adapters.Count == 0)
+        {
+            scanStart.Clear(); scanEnd.Clear(); scanScope.Text = "No network adapters found. Click Refresh in IP Shifter.";
+            return;
+        }
+        int previous = adapters.FindIndex(a => scanSelectedAdapterGuid.Length > 0 && a.Guid == scanSelectedAdapterGuid);
+        if (previous < 0) previous = adapters.FindIndex(a => a.Name == scanSelectedAdapterName && scanSelectedAdapterName.Length > 0);
+        int preferred = adapters.FindIndex(a => a.Status == "Connected" && IsUsableIpv4(a.IP) && IsUsableIpv4(a.Mask));
+        scanAdapter.SelectedIndex = previous >= 0 ? previous : preferred >= 0 ? preferred : 0;
     }
 
     private void SelectScanAdapter()
     {
         if (scanAdapter.SelectedIndex < 0 || scanAdapter.SelectedIndex >= adapters.Count) return;
         ToolkitAdapter a = adapters[scanAdapter.SelectedIndex];
-        if (a.Status != "Connected" || a.IP == "No IP") { scanScope.Text = "This adapter is disconnected. Enter a range manually or choose a connected adapter."; return; }
+        scanSelectedAdapterGuid = a.Guid; scanSelectedAdapterName = a.Name;
+        scanStart.Clear(); scanEnd.Clear();
+        if (a.Status != "Connected" || !IsUsableIpv4(a.IP) || !IsUsableIpv4(a.Mask))
+        {
+            scanScope.Text = a.Name + " has no usable connected IPv4 address and mask. Select a connected adapter or click Refresh in IP Shifter.";
+            return;
+        }
         try
         {
             uint ip = IpNumber(a.IP), mask = IpNumber(a.Mask), network = ip & mask, broadcast = network | ~mask;
             uint first = network + 1, last = broadcast - 1;
             if (last < first) { first = ip; last = ip; }
-            if ((ulong)last - first + 1 > 254) { first = Math.Max(first, ip > 126 ? ip - 126 : 0); last = Math.Min(last, first + 253); scanScope.Text = a.Name + ": large subnet; showing 254 addresses near this laptop. Edit the range for another slice."; }
+            if ((ulong)last - first + 1 > 254)
+            {
+                uint slice = ip > 126 ? ip - 126 : 0;
+                first = Math.Min(Math.Max(first, slice), last - 253);
+                last = first + 253;
+                scanScope.Text = a.Name + ": large subnet; showing 254 addresses near this laptop. Edit the range for another slice.";
+            }
             else scanScope.Text = a.Name + ": connected | " + a.IP + " / " + a.Mask;
             scanStart.Text = IpText(first); scanEnd.Text = IpText(last);
         }
@@ -2118,6 +2204,35 @@ internal sealed partial class ToolkitWindow : Form
             TabPage scannerPage = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "IP Scanner");
             if (scanView.Columns.Count != 6 || scanView.Columns[4].Text != "Manufacturer")
                 throw new InvalidOperationException("IP Scanner manufacturer column is missing.");
+            List<ToolkitAdapter> originalAdapters = adapters.ToList();
+            string originalScanGuid = scanSelectedAdapterGuid, originalScanName = scanSelectedAdapterName;
+            try
+            {
+                adapters.Clear();
+                adapters.Add(new ToolkitAdapter { Name = "Ethernet A", Guid = "adapter-a", Status = "Connected", IP = "192.168.10.20", Mask = "255.255.255.0", Gateway = "192.168.10.1" });
+                adapters.Add(new ToolkitAdapter { Name = "Ethernet B", Guid = "adapter-b", Status = "Connected", IP = "10.20.30.40", Mask = "255.255.255.0", Gateway = "10.20.30.1" });
+                adapters.Add(new ToolkitAdapter { Name = "Offline", Guid = "adapter-c", Status = "Disconnected", IP = "No IP", Mask = "No IP", Gateway = "No IP" });
+                RefreshScannerAdapters();
+                scanAdapter.SelectedIndex = 1;
+                if (scanStart.Text != "10.20.30.1" || scanEnd.Text != "10.20.30.254")
+                    throw new InvalidOperationException("Changing scanner adapters did not update the scan range.");
+                RefreshScannerAdapters();
+                if (scanAdapter.SelectedIndex != 1 || scanStart.Text != "10.20.30.1")
+                    throw new InvalidOperationException("Refreshing adapters reset the scanner selection.");
+                scanAdapter.SelectedIndex = 2;
+                if (scanStart.Text.Length != 0 || scanEnd.Text.Length != 0)
+                    throw new InvalidOperationException("An unavailable scanner adapter retained the previous range.");
+                RefreshGatewayAdapters();
+                if (gatewayAdapters.Count != 2 || networkGatewayChoice.Items.Count != 2 ||
+                    !Convert.ToString(networkGatewayChoice.Items[0]).Contains("192.168.10.1"))
+                    throw new InvalidOperationException("Gateway selection did not show connected adapters with valid gateways.");
+            }
+            finally
+            {
+                adapters.Clear(); adapters.AddRange(originalAdapters);
+                scanSelectedAdapterGuid = originalScanGuid; scanSelectedAdapterName = originalScanName;
+                RefreshScannerAdapters(); RefreshGatewayAdapters();
+            }
             AddScanHost(new ScanHost { IP = "192.0.2.1", Hostname = "TEST-HOST", Mac = "00-00-0C-00-00-01", Manufacturer = "Cisco Systems, Inc" });
             if (scanView.Items[0].SubItems.Count != 6 || scanView.Items[0].SubItems[1].Text != "TEST-HOST" ||
                 scanView.Items[0].SubItems[4].Text != "Cisco Systems, Inc")
