@@ -592,6 +592,7 @@ internal sealed partial class ToolkitWindow : Form
         statusLabel = L("Ready", 18, 11, 295);
         footer.Controls.Add(statusLabel);
         updateButton = B(footer, "Check Updates", 338, 5, 148, OpenUpdateOffer, "Check for a newer toolkit release or install an available update.", Cobalt);
+        B(footer, "Activity Report", 500, 5, 148, ShowActivityReport, "View this week's saved sites and technician activity.", Green);
         internetLabel = new Label { Text = "Internet: Checking", Dock = DockStyle.Right, Width = 450, TextAlign = ContentAlignment.MiddleRight, Padding = new Padding(0, 0, 18, 0) };
         footer.Controls.Add(internetLabel);
 
@@ -607,7 +608,7 @@ internal sealed partial class ToolkitWindow : Form
         BuildIpPage(Page("IP Shifter"));
         BuildScannerPage(Page("IP Scanner"));
         TabPage rdpPage = Page("RDP");
-        rdpManager = new RdpManager(rdpSites, SaveSettings, folder);
+        rdpManager = new RdpManager(rdpSites, SaveSettings, folder, delegate(string message) { Log("RDP", "OK", message); });
         rdpPage.Controls.Add(rdpManager);
         // Site workspaces are retained in settings but hidden for the field launch.
         BuildNetworkPage(Page("Network Troubleshooting"));
@@ -694,6 +695,12 @@ internal sealed partial class ToolkitWindow : Form
     {
         using (SaveFileDialog dialog = new SaveFileDialog { Filter = "Log files (*.log)|*.log|Text files (*.txt)|*.txt", FileName = Path.GetFileName(logPath) })
             if (dialog.ShowDialog(this) == DialogResult.OK) { File.Copy(logPath, dialog.FileName, true); Log("Log", "OK", "Exported " + dialog.FileName); }
+    }
+
+    private void ShowActivityReport()
+    {
+        using (ActivityWindow report = new ActivityWindow(folder, delegate { return rdpSites.Count; },
+            delegate { return profiles.Count; }, dark)) report.ShowDialog(this);
     }
 
     private void ConfigureTray()
@@ -1374,10 +1381,11 @@ internal sealed partial class ToolkitWindow : Form
         string name = profileName.Text.Trim();
         if (name.Length == 0) throw new InvalidOperationException("Enter a profile name.");
         ToolkitProfile p = profiles.FirstOrDefault(item => String.Equals(item.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (p == null) { p = new ToolkitProfile(); profiles.Add(p); }
+        bool created = p == null;
+        if (created) { p = new ToolkitProfile(); profiles.Add(p); }
         p.Name = name; p.Adapter = SelectedAdapter().Name; p.IPAddress = ipField.Text.Trim(); p.SubnetMask = maskField.Text.Trim();
         p.Gateway = gatewayField.Text.Trim(); p.Dns1 = dns1Field.Text.Trim(); p.Dns2 = dns2Field.Text.Trim();
-        SaveSettings(); RefreshProfiles(); Log("IP Shifter", "OK", "Saved profile: " + name);
+        SaveSettings(); RefreshProfiles(); Log("IP Shifter", "OK", (created ? "Added profile: " : "Updated profile: ") + name);
     }
 
     private void DeleteProfile()
@@ -2241,6 +2249,7 @@ internal sealed partial class ToolkitWindow : Form
         {
             testing = true;
             RdpManager.SelfTest();
+            ActivitySnapshot.SelfTest();
             if (!IsBluetoothAdapter("Renamed adapter", "Bluetooth Device (Personal Area Network)", "", "") ||
                 !IsBluetoothAdapter("Renamed adapter", "", "BTH\\MS_BTHPAN", "") ||
                 IsBluetoothAdapter("Ethernet 3", "USB Ethernet", "USB\\123", ""))

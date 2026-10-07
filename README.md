@@ -14,6 +14,8 @@ The toolkit follows the Windows app theme on launch and responds to Windows them
 
 The **Packet Analyzer** tab opens an existing `.pcap`, `.pcapng`, or `.cap` file and gives a plain-language report. It includes a transparent capture score, possible duplicate IP or BACnet device IDs, BACnet discovery and error traffic, and general DNS, HTTP, TLS, and TCP clues. Detailed protocol, endpoint, and conversation counts follow the findings. Reports can be saved as text. This tab requires Wireshark with its TShark command-line component. It does not record packets or require Npcap. Captures and reports stay on the laptop and are not uploaded by the toolkit. The score is a triage aid based only on packets in the file; it does not reproduce Optigo's proprietary score. Inspect the original capture in Wireshark for packet-level detail.
 
+The **Activity Report** button opens a local weekly dashboard with saved RDP site and IP profile totals, newly added RDP sites, a daily activity chart, a by-tool chart, and recent actions. It can export a text report. It reads the toolkit's local log files; no usage data is sent to TEC Systems or an external service. Older releases did not record every action, so historical counts may be incomplete.
+
 The toolkit checks GitHub Releases when it opens and every 30 minutes while running. A newer release leaves an **Update Available** button visible and shows a notification-area balloon; clicking the button or notification prompts the technician before downloading; the downloaded installer must match the published SHA-256 checksum before it runs. The **Check Updates** button checks on demand.
 
 ## Build and publish

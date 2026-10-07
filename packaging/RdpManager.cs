@@ -16,6 +16,7 @@ internal sealed class RdpManager : UserControl
     private static readonly string[] Resolutions = { "Full screen", "Fit to screen", "1024 x 768", "1280 x 720", "1366 x 768", "1600 x 900", "1920 x 1080", "2560 x 1440" };
     private readonly List<RdpSiteProfile> sites;
     private readonly Action save;
+    private readonly Action<string> activity;
     private readonly string folder;
     private readonly TreeView tree = new TreeView { Dock = DockStyle.Fill, HideSelection = false };
     private readonly TextBox name = new TextBox(), group = new TextBox(), host = new TextBox(), user = new TextBox(), domain = new TextBox();
@@ -25,9 +26,9 @@ internal sealed class RdpManager : UserControl
     private readonly Label notice = new Label { AutoSize = true, MaximumSize = new Size(480, 0) };
     private RdpSiteProfile selected;
 
-    public RdpManager(List<RdpSiteProfile> profiles, Action persist, string dataFolder)
+    public RdpManager(List<RdpSiteProfile> profiles, Action persist, string dataFolder, Action<string> recordActivity = null)
     {
-        sites = profiles; save = persist; folder = dataFolder;
+        sites = profiles; save = persist; folder = dataFolder; activity = recordActivity;
         Dock = DockStyle.Fill;
         TableLayoutPanel layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(12) };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 35));
@@ -148,6 +149,7 @@ internal sealed class RdpManager : UserControl
         try { save(); }
         catch { if (index < 0) sites.Remove(edited); else sites[index] = previous; selected = previous; throw; }
         if (!String.IsNullOrEmpty(folder)) WriteConnectionFile(edited, Screen.FromControl(this).WorkingArea.Size);
+        if (activity != null) activity((index < 0 ? "Added site: " : "Updated site: ") + edited.Name);
         password.Clear(); Reload();
     }
 
@@ -158,6 +160,7 @@ internal sealed class RdpManager : UserControl
         RdpSiteProfile previous = selected; int index = sites.IndexOf(previous); sites.Remove(previous);
         try { save(); } catch { sites.Insert(index, previous); throw; }
         if (!String.IsNullOrEmpty(folder)) DeleteConnectionFile(folder, previous.Id);
+        if (activity != null) activity("Deleted site: " + previous.Name);
         NewSite(); Reload();
     }
 
@@ -187,6 +190,7 @@ internal sealed class RdpManager : UserControl
             });
         }
         catch { if (!persistent) File.Delete(path); throw; }
+        if (activity != null) activity("Opened connection: " + connection.Name);
         password.Clear();
     }
 
