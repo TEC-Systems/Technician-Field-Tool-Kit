@@ -15,6 +15,7 @@ $launcher = Join-Path $dist 'TEC-Systems-FieldToolkit.exe'
 $payload = Join-Path $dist 'toolkit-payload.zip'
 $setup = Join-Path $dist 'TEC-Systems-FieldToolkit-Setup.exe'
 $installerZip = Join-Path $dist 'TEC-Systems-FieldToolkit-Install.zip'
+$installer7z = Join-Path $dist 'TEC-Systems-FieldToolkit-Install.7z'
 
 # Use the official emblem (left of the wordmark) at each Windows icon size.
 $logoPath = Join-Path $root 'assets\TEC Systems Full Logo Cobalt RGB.png'
@@ -157,5 +158,17 @@ if ($verify.ExitCode -ne 0) { throw 'Installer payload verification failed.' }
 $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
 [System.IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS.txt'), ("{0}  TEC-Systems-FieldToolkit-Setup.exe`n" -f $hash), [System.Text.Encoding]::ASCII)
 Compress-Archive -Path $setup -DestinationPath $installerZip -Force
+$sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+if (-not (Test-Path -LiteralPath $sevenZip)) {
+    $command = Get-Command 7z.exe -ErrorAction SilentlyContinue
+    if ($null -eq $command) { throw '7-Zip is required to package the Teams-friendly installer archive.' }
+    $sevenZip = $command.Source
+}
+if (Test-Path -LiteralPath $installer7z) { Remove-Item -LiteralPath $installer7z -Force }
+& $sevenZip a -t7z -mx=9 $installer7z $setup (Join-Path $dist 'SHA256SUMS.txt') | Write-Host
+if ($LASTEXITCODE -ne 0) { throw 'Could not create the installer 7z archive.' }
+& $sevenZip t $installer7z | Write-Host
+if ($LASTEXITCODE -ne 0) { throw 'The installer 7z archive failed integrity verification.' }
 Write-Host ('Built: {0}' -f $setup)
 Write-Host ('Installer ZIP: {0}' -f $installerZip)
+Write-Host ('Installer 7z: {0}' -f $installer7z)
