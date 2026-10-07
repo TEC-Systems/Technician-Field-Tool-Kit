@@ -593,6 +593,7 @@ internal sealed partial class ToolkitWindow : Form
         BuildNetworkPage(Page("Network Troubleshooting"));
         BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
+        BuildTestPage(Page("Test"));
         BuildLogPanel();
         internetTimer = new System.Windows.Forms.Timer { Interval = 30000 };
         internetTimer.Tick += delegate { UpdateInternet(); };
@@ -993,6 +994,23 @@ internal sealed partial class ToolkitWindow : Form
     {
         Process.Start(new ProcessStartInfo(executable, args) { UseShellExecute = true });
         Log("Windows", "INFO", "Opened " + name);
+    }
+
+    private void BuildTestPage(TabPage page)
+    {
+        page.Controls.Add(L("Update demonstration", 24, 28, 560));
+        page.Controls.Add(L("Installed version: " + version, 24, 64, 560));
+        page.Controls.Add(L("Preview the update notice for your meeting. The preview does not download or install anything.", 24, 100, 760));
+        B(page, "Preview Update Notice", 24, 140, 200, delegate {
+            MessageBox.Show(this,
+                "DEMO PREVIEW — no update will be installed.\r\n\r\n" +
+                "A new toolkit version is available. The live notice appears in the notification area and changes the footer button to Update Available.\r\n\r\n" +
+                "When a technician accepts a real update, the toolkit verifies the downloaded installer, exits, installs the new version, and reopens.",
+                "Toolkit Update Available — Demo", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }, "Show the update message without changing the installed toolkit.", Cobalt);
+        B(page, "Check for Live Update", 240, 140, 190, delegate { CheckUpdates(false); },
+            "Check GitHub for a published update. This can offer a real installation.", Green);
+        page.Controls.Add(L("The live check uses the published release and may offer to install it.", 24, 194, 700));
     }
 
     private void BuildWindowsPage(TabPage page)
@@ -2182,7 +2200,12 @@ internal sealed partial class ToolkitWindow : Form
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
                 throw new InvalidOperationException("Release checksum line ending handling failed.");
-            if (tabs.TabPages.Count != 7) throw new InvalidOperationException("Expected seven active tabs.");
+            if (tabs.TabPages.Count != 8 || tabs.TabPages[7].Text != "Test")
+                throw new InvalidOperationException("Expected the update demonstration tab.");
+            TabPage testPage = tabs.TabPages[7];
+            if (!testPage.Controls.Cast<Control>().Any(c => c.Text == "Preview Update Notice") ||
+                !testPage.Controls.Cast<Control>().Any(c => c.Text == "Check for Live Update"))
+                throw new InvalidOperationException("Update demonstration actions are missing.");
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
             if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner" || tabs.TabPages[3].Text != "RDP" ||
