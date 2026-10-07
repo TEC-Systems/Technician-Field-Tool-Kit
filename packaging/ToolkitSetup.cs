@@ -159,7 +159,10 @@ internal static class ToolkitSetup
             }
         };
         form.Controls.AddRange(new Control[] { title, managed, version, destination, exitSteps, desktop, launch, install });
-        if (updating || Directory.Exists(DataFolder)) form.Controls.Add(uninstall);
+        bool cleanupAvailable = updating || Directory.Exists(InstallFolder) || Directory.Exists(DataFolder);
+        using (RegistryKey registration = Registry.CurrentUser.OpenSubKey(RegistryPath))
+            cleanupAvailable = cleanupAvailable || registration != null;
+        if (cleanupAvailable) form.Controls.Add(uninstall);
         return form;
     }
 
@@ -169,7 +172,9 @@ internal static class ToolkitSetup
             ProductName, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return false;
         string copy = Path.Combine(Path.GetTempPath(), "TEC-FieldToolkit-Uninstall-" + Guid.NewGuid().ToString("N") + ".exe");
         File.Copy(Application.ExecutablePath, copy);
-        Process.Start(new ProcessStartInfo(copy, "/remove-run " + Process.GetCurrentProcess().Id) { UseShellExecute = true });
+        Process.Start(new ProcessStartInfo(copy, "/remove-run " + Process.GetCurrentProcess().Id) {
+            UseShellExecute = true, WorkingDirectory = Path.GetTempPath()
+        });
         return true;
     }
 
