@@ -593,9 +593,6 @@ internal sealed partial class ToolkitWindow : Form
         BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
         BuildLogPanel();
-        tabs.SelectedIndexChanged += delegate {
-            if (!testing && tabs.SelectedTab != null && (tabs.SelectedTab.Text == "IP Scanner" || tabs.SelectedTab.Text == "Network Troubleshooting")) RefreshAdapters();
-        };
         internetTimer = new System.Windows.Forms.Timer { Interval = 30000 };
         internetTimer.Tick += delegate { UpdateInternet(); };
         updateTimer = new System.Windows.Forms.Timer { Interval = 30 * 60 * 1000 };
