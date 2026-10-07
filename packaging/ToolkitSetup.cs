@@ -18,6 +18,9 @@ internal static class ToolkitSetup
     private static readonly string InstallFolder = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Programs", ProductName);
+    private static readonly string DataFolder = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "TEC Systems", "Field Toolkit");
     private static readonly string[] PayloadFiles = {
         ExeName, "version.txt",
         "assets/TEC Systems Full Logo Cobalt RGB.png",
@@ -31,6 +34,16 @@ internal static class ToolkitSetup
         try
         {
             if (args.Length > 0 && args[0] == "/verify") { VerifyPayload(); return 0; }
+            if (args.Length > 0 && args[0] == "/self-test")
+            {
+                Application.EnableVisualStyles();
+                using (Form form = CreateWindow(false))
+                {
+                    CheckBox launch = form.Controls.OfType<CheckBox>().FirstOrDefault(box => box.Text == "Launch after setup");
+                    if (launch == null || launch.Checked) throw new InvalidOperationException("Setup must not launch the toolkit by default.");
+                }
+                return 0;
+            }
             if (args.Length > 1 && args[0] == "/test-install")
             {
                 ExtractPayload(Path.GetFullPath(args[1]));
@@ -38,17 +51,17 @@ internal static class ToolkitSetup
             }
             if (args.Length > 0 && args[0] == "/remove")
             {
-                if (MessageBox.Show("Remove the toolkit? Saved profiles, flows, and logs will be kept.",
-                    ProductName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return 0;
-                string copy = Path.Combine(Path.GetTempPath(), "TEC-FieldToolkit-Uninstall-" + Guid.NewGuid().ToString("N") + ".exe");
-                File.Copy(Application.ExecutablePath, copy);
-                Process.Start(new ProcessStartInfo(copy, "/remove-run") { UseShellExecute = true });
+                BeginRemove();
                 return 0;
             }
             if (args.Length > 0 && args[0] == "/remove-run")
             {
+                if (args.Length != 2) throw new ArgumentException("Missing uninstall parent process ID.");
+                int parentId;
+                if (!Int32.TryParse(args[1], out parentId) || parentId <= 0) throw new ArgumentException("Invalid uninstall parent process ID.");
+                WaitForProcessExit(parentId);
                 RemoveInstalledFiles();
-                MessageBox.Show("The toolkit was removed. Your saved data was kept.", ProductName);
+                MessageBox.Show("The toolkit, saved profiles, settings, and logs were removed.", ProductName);
                 return 0;
             }
             bool automaticUpdate = args.Length == 2 && args[0] == "/wait-for-exit";
@@ -77,7 +90,7 @@ internal static class ToolkitSetup
         }
         catch (Exception error)
         {
-            if (args.Length > 0 && (args[0] == "/verify" || args[0] == "/test-install")) return 1;
+            if (args.Length > 0 && (args[0] == "/verify" || args[0] == "/self-test" || args[0] == "/test-install")) return 1;
             MessageBox.Show(error.Message, ProductName + " Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
@@ -117,7 +130,16 @@ internal static class ToolkitSetup
             ForeColor = System.Drawing.Color.FromArgb(60, 70, 83)
         };
         CheckBox desktop = new CheckBox { Text = "Create desktop shortcut", Left = 30, Top = 238, Width = 220, Checked = true };
-        CheckBox launch = new CheckBox { Text = "Launch after setup", Left = 260, Top = 238, Width = 190, Checked = true };
+        CheckBox launch = new CheckBox { Text = "Launch after setup", Left = 260, Top = 238, Width = 190, Checked = false };
+        Button uninstall = new Button {
+            Text = "Uninstall", Left = 190, Top = 280,
+            Width = 145, Height = 34, BackColor = System.Drawing.Color.FromArgb(75, 94, 116),
+            ForeColor = System.Drawing.Color.White, FlatStyle = FlatStyle.Flat
+        };
+        uninstall.Click += (sender, e) => {
+            try { if (BeginRemove()) form.Close(); }
+            catch (Exception error) { MessageBox.Show(error.Message, ProductName + " Setup", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        };
         Button install = new Button {
             Text = updating ? "Update" : "Install", Left = 365, Top = 280,
             Width = 140, Height = 34, BackColor = System.Drawing.Color.FromArgb(6, 72, 255),
@@ -137,7 +159,24 @@ internal static class ToolkitSetup
             }
         };
         form.Controls.AddRange(new Control[] { title, managed, version, destination, exitSteps, desktop, launch, install });
+        if (updating || Directory.Exists(DataFolder)) form.Controls.Add(uninstall);
         return form;
+    }
+
+    private static bool BeginRemove()
+    {
+        if (MessageBox.Show("Uninstall the toolkit and permanently delete this Windows user's saved profiles, passwords, settings, and logs? Any running toolkit will close.",
+            ProductName, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return false;
+        string copy = Path.Combine(Path.GetTempPath(), "TEC-FieldToolkit-Uninstall-" + Guid.NewGuid().ToString("N") + ".exe");
+        File.Copy(Application.ExecutablePath, copy);
+        Process.Start(new ProcessStartInfo(copy, "/remove-run " + Process.GetCurrentProcess().Id) { UseShellExecute = true });
+        return true;
+    }
+
+    private static void WaitForProcessExit(int id)
+    {
+        try { using (Process previous = Process.GetProcessById(id)) if (!previous.WaitForExit(15000)) throw new IOException("The setup window did not close in time. Close it and try uninstall again."); }
+        catch (ArgumentException) { /* The parent already exited. */ }
     }
 
     private static void InstallPayload(bool? desktopShortcut)
@@ -271,18 +310,29 @@ internal static class ToolkitSetup
 
     private static void RemoveInstalledFiles()
     {
-        foreach (string name in PayloadFiles.Concat(new[] { UninstallName, "TEC-Systems-FieldToolkit.ps1" }))
+        string installedExe = Path.Combine(InstallFolder, ExeName);
+        foreach (Process process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(ExeName)))
         {
-            string path = Path.Combine(InstallFolder, name.Replace('/', Path.DirectorySeparatorChar));
-            if (File.Exists(path)) File.Delete(path);
+            using (process)
+            {
+                string path;
+                try { path = process.MainModule.FileName; }
+                catch (InvalidOperationException) { continue; }
+                catch (System.ComponentModel.Win32Exception) { continue; }
+                if (!String.Equals(path, installedExe, StringComparison.OrdinalIgnoreCase)) continue;
+                try { process.Kill(); if (!process.WaitForExit(10000)) throw new IOException("The running toolkit did not close. Exit it from the TEC tray icon and try uninstall again."); }
+                catch (InvalidOperationException) { /* The toolkit already exited. */ }
+            }
         }
-        if (File.Exists(StartShortcut)) File.Delete(StartShortcut);
-        if (File.Exists(DesktopShortcut)) File.Delete(DesktopShortcut);
-        Registry.CurrentUser.DeleteSubKey(RegistryPath, false);
         using (RegistryKey run = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
             if (run != null) run.DeleteValue(ProductName, false);
-        string assets = Path.Combine(InstallFolder, "assets");
-        if (Directory.Exists(assets) && !Directory.EnumerateFileSystemEntries(assets).Any()) Directory.Delete(assets);
-        if (Directory.Exists(InstallFolder) && !Directory.EnumerateFileSystemEntries(InstallFolder).Any()) Directory.Delete(InstallFolder);
+        if (File.Exists(StartShortcut)) File.Delete(StartShortcut);
+        if (File.Exists(DesktopShortcut)) File.Delete(DesktopShortcut);
+        string startFolder = Path.GetDirectoryName(StartShortcut);
+        if (Directory.Exists(startFolder) && !Directory.EnumerateFileSystemEntries(startFolder).Any()) Directory.Delete(startFolder);
+        if (Directory.Exists(InstallFolder)) Directory.Delete(InstallFolder, true);
+        if (Directory.Exists(DataFolder)) Directory.Delete(DataFolder, true);
+        Registry.CurrentUser.DeleteSubKey(RegistryPath, false);
+        Registry.CurrentUser.DeleteSubKeyTree(@"Software\TEC Systems\Field Toolkit", false);
     }
 }
