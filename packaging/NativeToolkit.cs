@@ -354,6 +354,20 @@ internal sealed partial class ToolkitWindow : Form
     private int scanSortColumn = -1;
     private bool scanSortDescending;
     private Button scanButton;
+    private TextBox capturePath;
+    private TextBox captureReport;
+    private Label captureStatus;
+    private Button captureBrowse;
+    private Button captureAnalyze;
+    private Button captureCancel;
+    private Button captureExport;
+    private CancellationTokenSource captureCancellation;
+    private ComboBox liveInterfaceChoice;
+    private ComboBox liveDurationChoice;
+    private Button liveRefresh;
+    private Button liveStart;
+    private Button liveStop;
+    private CancellationTokenSource liveCancellation;
 
     public ToolkitWindow(bool startup = false, bool updated = false)
     {
@@ -603,6 +617,7 @@ internal sealed partial class ToolkitWindow : Form
         rdpPage.Controls.Add(rdpManager);
         // Site workspaces are retained in settings but hidden for the field launch.
         BuildNetworkPage(Page("Network Troubleshooting"));
+        BuildCapturePage(Page("Packet Analyzer"));
         BuildBmsPage(Page("BMS Tools"));
         BuildFeedbackPage(Page("Feedback"));
         BuildLogPanel();
@@ -1005,6 +1020,161 @@ internal sealed partial class ToolkitWindow : Form
     {
         Process.Start(new ProcessStartInfo(executable, args) { UseShellExecute = true });
         Log("Windows", "INFO", "Opened " + name);
+    }
+
+    private void BuildCapturePage(TabPage page)
+    {
+        page.Controls.Add(new Label { Text = "Wireshark Capture Analyzer", Left = 18, Top = 18, Width = 520, Height = 34,
+            Font = new Font("Segoe UI", 15f, FontStyle.Bold) });
+        page.Controls.Add(L("Analyze .pcap or .pcapng files on this computer using TShark (included with Wireshark).", 18, 58, 790));
+        capturePath = T(18, 90, 510, ""); capturePath.ReadOnly = true; page.Controls.Add(capturePath);
+        captureBrowse = B(page, "Choose Capture", 540, 86, 146, delegate {
+            using (OpenFileDialog dialog = new OpenFileDialog { Title = "Choose a Wireshark capture", Filter = "Capture files (*.pcap;*.pcapng;*.cap)|*.pcap;*.pcapng;*.cap|All files (*.*)|*.*", CheckFileExists = true })
+                if (dialog.ShowDialog(this) == DialogResult.OK) { capturePath.Text = dialog.FileName; captureReport.Clear(); captureExport.Enabled = false; captureStatus.Text = "Ready to analyze."; }
+        }, "Open a saved Wireshark packet capture.", Cobalt);
+        captureAnalyze = B(page, "Analyze", 18, 126, 120, AnalyzeCapture, "Analyze the selected capture without uploading it.", Green);
+        captureCancel = B(page, "Stop", 150, 126, 90, delegate { if (captureCancellation != null) captureCancellation.Cancel(); }, "Stop capture analysis.", Slate);
+        captureCancel.Enabled = false;
+        captureExport = B(page, "Export Report", 252, 126, 150, ExportCaptureReport, "Save the analysis as a text file.", Cobalt);
+        captureExport.Enabled = false;
+        captureStatus = L("Choose a capture to begin.", 418, 133, 420); page.Controls.Add(captureStatus);
+        page.Controls.Add(L("Record a new capture", 18, 177, 230));
+        liveInterfaceChoice = new ComboBox { Left = 18, Top = 204, Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
+        page.Controls.Add(liveInterfaceChoice);
+        liveRefresh = B(page, "Find Interfaces", 310, 200, 135, RefreshCaptureInterfaces,
+            "List network interfaces available to Wireshark and Npcap.", Cobalt);
+        liveDurationChoice = new ComboBox { Left = 458, Top = 204, Width = 100, DropDownStyle = ComboBoxStyle.DropDownList };
+        liveDurationChoice.Items.AddRange(new object[] { "30 seconds", "60 seconds", "120 seconds", "300 seconds" });
+        liveDurationChoice.SelectedIndex = 1; page.Controls.Add(liveDurationChoice);
+        liveStart = B(page, "Start Capture", 18, 242, 140, StartLiveCapture,
+            "Save local network packets for the selected duration, then analyze them.", Green);
+        liveStop = B(page, "Stop", 170, 242, 90,
+            delegate { if (liveCancellation != null) liveCancellation.Cancel(); }, "Stop the current capture.", Slate);
+        liveStop.Enabled = false;
+        captureReport = new TextBox { Left = 18, Top = 292, Width = 790, Height = 300, ReadOnly = true,
+            Multiline = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 9f) };
+        page.Controls.Add(captureReport);
+        Action fit = delegate {
+            int width = Math.Max(620, page.ClientSize.Width - 36);
+            capturePath.Width = Math.Max(180, width - 158);
+            captureBrowse.Left = capturePath.Right + 12;
+            captureReport.Width = width;
+            captureReport.Height = Math.Max(280, page.ClientSize.Height - captureReport.Top - 18);
+            captureStatus.Width = Math.Max(150, page.ClientSize.Width - captureStatus.Left - 18);
+            liveInterfaceChoice.Width = Math.Max(180, Math.Min(300, width - 300));
+            liveRefresh.Left = liveInterfaceChoice.Right + 12;
+            liveDurationChoice.Left = liveRefresh.Right + 12;
+        };
+        page.Resize += delegate { fit(); };
+        fit();
+    }
+
+    private void RefreshCaptureInterfaces()
+    {
+        liveRefresh.Enabled = false;
+        captureStatus.Text = "Finding Wireshark interfaces...";
+        ThreadPool.QueueUserWorkItem(delegate {
+            List<CaptureAnalyzer.CaptureInterface> interfaces = null;
+            string error = null;
+            try { interfaces = CaptureAnalyzer.ListInterfaces(); }
+            catch (Exception failure) { error = failure.Message; }
+            if (!IsDisposed && IsHandleCreated)
+                try { BeginInvoke(new Action(delegate {
+                    if (IsDisposed) return;
+                    liveRefresh.Enabled = true;
+                    liveInterfaceChoice.Items.Clear();
+                    if (interfaces != null) foreach (CaptureAnalyzer.CaptureInterface item in interfaces) liveInterfaceChoice.Items.Add(item);
+                    if (liveInterfaceChoice.Items.Count > 0) liveInterfaceChoice.SelectedIndex = 0;
+                    captureStatus.Text = error ?? (liveInterfaceChoice.Items.Count + " interfaces found.");
+                })); }
+                catch (InvalidOperationException) { }
+        });
+    }
+
+    private void StartLiveCapture()
+    {
+        CaptureAnalyzer.CaptureInterface selected = liveInterfaceChoice.SelectedItem as CaptureAnalyzer.CaptureInterface;
+        if (selected == null) throw new InvalidOperationException("Click Find Interfaces and choose a network interface first.");
+        int[] durations = { 30, 60, 120, 300 };
+        int duration = durations[Math.Max(0, liveDurationChoice.SelectedIndex)];
+        string path;
+        using (SaveFileDialog dialog = new SaveFileDialog { Filter = "Wireshark capture (*.pcapng)|*.pcapng", FileName = "TEC_Capture_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".pcapng" })
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            path = dialog.FileName;
+        }
+        CancellationTokenSource source = new CancellationTokenSource();
+        liveCancellation = source;
+        liveRefresh.Enabled = false; liveStart.Enabled = false; liveStop.Enabled = true;
+        liveInterfaceChoice.Enabled = false; liveDurationChoice.Enabled = false;
+        captureBrowse.Enabled = false; captureAnalyze.Enabled = false; captureExport.Enabled = false;
+        captureReport.Clear(); captureStatus.Text = "Capturing for up to " + duration + " seconds...";
+        ThreadPool.QueueUserWorkItem(delegate {
+            string error = null;
+            bool stopped = false;
+            try { CaptureAnalyzer.Capture(selected.Number, duration, path, source.Token); }
+            catch (OperationCanceledException) { stopped = true; }
+            catch (Exception failure) { error = failure.Message; }
+            if (!IsDisposed && IsHandleCreated)
+                try { BeginInvoke(new Action(delegate {
+                    if (IsDisposed) return;
+                    liveCancellation = null;
+                    liveRefresh.Enabled = true; liveStart.Enabled = true; liveStop.Enabled = false;
+                    liveInterfaceChoice.Enabled = true; liveDurationChoice.Enabled = true;
+                    captureBrowse.Enabled = true; captureAnalyze.Enabled = true;
+                    if (File.Exists(path) && new FileInfo(path).Length > 0) capturePath.Text = path;
+                    captureStatus.Text = error ?? (stopped ? "Capture stopped; any saved packets can be analyzed." : "Capture saved; analyzing...");
+                    if (error != null) captureReport.Text = error;
+                    Log("Capture", error == null ? "OK" : "ERROR", error ?? (stopped ? "Stopped capture" : "Saved capture") + ": " + path);
+                    source.Dispose();
+                    if (error == null && !stopped) AnalyzeCapture();
+                })); }
+                catch (InvalidOperationException) { source.Dispose(); }
+            else source.Dispose();
+        });
+    }
+
+    private void AnalyzeCapture()
+    {
+        string path = capturePath.Text;
+        if (String.IsNullOrWhiteSpace(path)) throw new InvalidOperationException("Choose a capture file first.");
+        if (captureCancellation != null) return;
+        CancellationTokenSource source = new CancellationTokenSource();
+        captureCancellation = source;
+        captureBrowse.Enabled = false; captureAnalyze.Enabled = false; captureCancel.Enabled = true; captureExport.Enabled = false;
+        liveStart.Enabled = false;
+        captureStatus.Text = "Analyzing capture...";
+        ThreadPool.QueueUserWorkItem(delegate {
+            string report = null, error = null;
+            try { report = CaptureAnalyzer.Analyze(path, source.Token); }
+            catch (OperationCanceledException) { error = "Analysis stopped."; }
+            catch (Exception failure) { error = failure.Message; }
+            if (!IsDisposed && IsHandleCreated)
+                try { BeginInvoke(new Action(delegate {
+                    if (IsDisposed) return;
+                    captureReport.Text = report ?? error;
+                    captureStatus.Text = report == null ? error : "Analysis complete.";
+                    captureBrowse.Enabled = true; captureAnalyze.Enabled = true; captureCancel.Enabled = false;
+                    liveStart.Enabled = true;
+                    captureExport.Enabled = report != null;
+                    captureCancellation = null;
+                    Log("Capture", report == null ? "ERROR" : "OK", report == null ? error : "Analyzed " + Path.GetFileName(path));
+                    source.Dispose();
+                })); }
+                catch (InvalidOperationException) { source.Dispose(); }
+            else source.Dispose();
+        });
+    }
+
+    private void ExportCaptureReport()
+    {
+        if (String.IsNullOrWhiteSpace(captureReport.Text)) return;
+        using (SaveFileDialog dialog = new SaveFileDialog { Filter = "Text report (*.txt)|*.txt", FileName = "Packet_Report_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".txt" })
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+            {
+                File.WriteAllText(dialog.FileName, captureReport.Text, Encoding.UTF8);
+                Log("Capture", "OK", "Saved packet report to " + dialog.FileName);
+            }
     }
 
     private void BuildWindowsPage(TabPage page)
@@ -2194,7 +2364,9 @@ internal sealed partial class ToolkitWindow : Form
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
                 throw new InvalidOperationException("Release checksum line ending handling failed.");
-            if (tabs.TabPages.Count != 7) throw new InvalidOperationException("Expected seven active tabs.");
+            if (tabs.TabPages.Count != 8 || !tabs.TabPages.Cast<TabPage>().Any(p => p.Text == "Packet Analyzer"))
+                throw new InvalidOperationException("Expected the packet analyzer tab.");
+            CaptureSummary.SelfTest();
             if (!headerPanel.Controls.Cast<Control>().Any(c => c.Text == "Version " + version))
                 throw new InvalidOperationException("Current toolkit version is not visible in the header.");
             if (tabs.TabPages[1].Text != "IP Shifter" || tabs.TabPages[2].Text != "IP Scanner" || tabs.TabPages[3].Text != "RDP" ||

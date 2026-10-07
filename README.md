@@ -12,6 +12,8 @@ Windows field toolkit for TEC Systems technicians. The installed app is native C
 
 The toolkit follows the Windows app theme on launch and responds to Windows theme changes while running. The header theme button sets a manual light/dark choice; use **Follow Windows Theme** in the tray menu to return to automatic mode.
 
+The **Packet Analyzer** tab can record a timed `.pcapng` capture from a chosen interface or open an existing `.pcap`, `.pcapng`, or `.cap` file. It summarizes protocols, endpoints, conversations, DNS queries and errors, HTTP activity, TLS server names, and TCP retransmissions and resets. Reports can be saved as text. This tab requires Wireshark with its TShark command-line component; recording also requires Npcap. Captures and reports stay on the laptop and are not uploaded by the toolkit. The report summarizes observable traffic; inspect the original capture in Wireshark for packet-level detail.
+
 The toolkit checks GitHub Releases when it opens and every 30 minutes while running. A newer release leaves an **Update Available** button visible and shows a notification-area balloon; clicking the button or notification prompts the technician before downloading; the downloaded installer must match the published SHA-256 checksum before it runs. The **Check Updates** button checks on demand.
 
 ## Build and publish
