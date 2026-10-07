@@ -80,7 +80,7 @@ internal static class ToolkitSetup
                 }
                 catch (ArgumentException) { /* The toolkit already exited. */ }
                 InstallPayload(null);
-                Process.Start(Path.Combine(InstallFolder, ExeName));
+                Process.Start(Path.Combine(InstallFolder, ExeName), "/updated");
                 return 0;
             }
             Application.EnableVisualStyles();
@@ -149,7 +149,8 @@ internal static class ToolkitSetup
              install.Enabled = false;
              try {
                 InstallPayload(desktop.Checked);
-                MessageBox.Show("The toolkit is ready.", ProductName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(updating ? "Successfully updated to version " + PayloadVersion() + "." :
+                    "The toolkit is installed and ready.", ProductName, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 if (launch.Checked) Process.Start(Path.Combine(InstallFolder, ExeName));
                 form.Close();
             }

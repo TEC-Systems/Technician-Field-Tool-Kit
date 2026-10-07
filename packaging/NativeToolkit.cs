@@ -75,6 +75,7 @@ internal static class NativeToolkit
                 catch (ArgumentException) { }
             }
             bool startup = args.Any(arg => arg == "/startup");
+            bool updated = args.Any(arg => arg == "/updated");
             bool selfTest = args.Length > 0 && args[0] == "/self-test";
             if (args.Length > 0 && args[0] == "/startup-self-test")
             {
@@ -95,7 +96,7 @@ internal static class NativeToolkit
                 }
                 try
                 {
-                    using (ToolkitWindow window = new ToolkitWindow(startup)) Application.Run(window);
+                    using (ToolkitWindow window = new ToolkitWindow(startup, updated)) Application.Run(window);
                 }
                 finally { instance.ReleaseMutex(); }
             }
@@ -354,7 +355,7 @@ internal sealed partial class ToolkitWindow : Form
     private bool scanSortDescending;
     private Button scanButton;
 
-    public ToolkitWindow(bool startup = false)
+    public ToolkitWindow(bool startup = false, bool updated = false)
     {
         folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TEC Systems", "Field Toolkit");
         Directory.CreateDirectory(folder);
@@ -376,7 +377,18 @@ internal sealed partial class ToolkitWindow : Form
         activation = new ToolkitActivationWindow(RestoreFromTray);
         if (startup) ShowInTaskbar = false;
         ApplyTheme();
-        Shown += delegate { SetInitialSplit(); ApplyTitleBarTheme(); if (startup) Hide(); if (testing) return; RefreshProfiles(); RefreshAdaptersAsync(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true); Log("Startup", "OK", Product + " " + version); };
+        Shown += delegate {
+            SetInitialSplit(); ApplyTitleBarTheme();
+            if (startup) Hide();
+            if (testing) return;
+            RefreshProfiles(); RefreshAdaptersAsync(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true);
+            Log("Startup", "OK", Product + " " + version);
+            if (updated) BeginInvoke(new Action(delegate {
+                Log("Updates", "OK", "Successfully updated to version " + version + ".");
+                MessageBox.Show(this, "Successfully updated to version " + version + ".", "Toolkit Update Complete",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }));
+        };
         FormClosing += OnClosing;
         SystemEvents.UserPreferenceChanged += OnWindowsPreferenceChanged;
     }
