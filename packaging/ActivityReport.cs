@@ -28,6 +28,7 @@ internal sealed class ActivitySnapshot
     internal int SavedIpProfiles;
     internal int NewRdpSites;
     internal int Sessions;
+    internal long ForegroundSeconds;
 
     private static string Category(string area, string message)
     {
@@ -79,6 +80,12 @@ internal sealed class ActivitySnapshot
         if (when < WeekStart || when > today) return;
         string area = match.Groups[3].Value, message = match.Groups[4].Value;
         if (area == "Startup" && match.Groups[2].Value == "OK") Sessions++;
+        if (area == "Usage" && message.StartsWith("Foreground seconds: "))
+        {
+            long seconds;
+            if (Int64.TryParse(message.Substring(20), out seconds) && seconds > 0 && seconds <= 3600)
+                ForegroundSeconds += seconds;
+        }
         string category = Category(area, message);
         if (category == null) return;
         Entries.Add(new ActivityEntry { When = when, Category = category, Message = message });
@@ -98,6 +105,7 @@ internal sealed class ActivitySnapshot
         report.AppendLine("RDP sites added this week: " + NewRdpSites);
         report.AppendLine("Actions recorded this week: " + Entries.Count);
         report.AppendLine("Toolkit starts this week: " + Sessions);
+        report.AppendLine("Toolkit foreground time this week: " + FormatDuration(ForegroundSeconds));
         report.AppendLine().AppendLine("ACTIONS BY DAY");
         for (int i = 0; i < 7; i++) report.AppendLine("  " + WeekStart.AddDays(i).ToString("ddd MMM d") + ": " + ByDay[i]);
         report.AppendLine().AppendLine("ACTIONS BY TOOL");
@@ -110,13 +118,47 @@ internal sealed class ActivitySnapshot
         return report.ToString();
     }
 
+    internal static string FormatDuration(long seconds)
+    {
+        long minutes = seconds / 60;
+        return minutes >= 60 ? (minutes / 60) + "h " + (minutes % 60) + "m" : minutes + "m";
+    }
+
     internal static void SelfTest()
     {
         ActivitySnapshot sample = new ActivitySnapshot { WeekStart = new DateTime(2026, 10, 5) };
         sample.AddLine(new DateTime(2026, 10, 7), "[09:30:00] [OK] [RDP] Added site: Example", new DateTime(2026, 10, 7, 18, 0, 0));
         sample.AddLine(new DateTime(2026, 10, 7), "[10:00:00] [INFO] [IP Scanner] Scanning 192.0.2.1 - 192.0.2.10", new DateTime(2026, 10, 7, 18, 0, 0));
-        if (sample.NewRdpSites != 1 || sample.Entries.Count != 2 || sample.ByDay[2] != 2)
+        sample.AddLine(new DateTime(2026, 10, 7), "[11:00:00] [INFO] [Usage] Foreground seconds: 120", new DateTime(2026, 10, 7, 18, 0, 0));
+        if (sample.NewRdpSites != 1 || sample.Entries.Count != 2 || sample.ByDay[2] != 2 || sample.ForegroundSeconds != 120)
             throw new InvalidOperationException("Weekly activity parsing failed.");
+    }
+
+    internal static ActivitySnapshot Preview()
+    {
+        DateTime today = DateTime.Today;
+        ActivitySnapshot sample = new ActivitySnapshot();
+        sample.WeekStart = today.AddDays(-((int)today.DayOfWeek + 6) % 7);
+        sample.SavedRdpSites = 18; sample.SavedIpProfiles = 7; sample.NewRdpSites = 3;
+        sample.Sessions = 5; sample.ForegroundSeconds = 3 * 3600 + 45 * 60;
+        string[] categories = { "RDP", "IP Shifter", "IP Scanner", "Packet Reports", "Windows", "Network & Support" };
+        string[] messages = { "Added site: Demo Building", "Added profile: Demo Site", "Scanning 192.0.2.1 - 192.0.2.50",
+            "Analyzed demo-capture.pcapng", "Opened Event Viewer", "Opened live ping for 192.0.2.1" };
+        for (int i = 0; i <= (today - sample.WeekStart).Days && i < 7; i++)
+        {
+            int count = 3 + i * 2;
+            sample.ByDay[i] = count;
+            for (int j = 0; j < count; j++)
+            {
+                int index = (i + j) % categories.Length;
+                string category = categories[index];
+                int total; sample.ByCategory.TryGetValue(category, out total); sample.ByCategory[category] = total + 1;
+                sample.Entries.Add(new ActivityEntry { When = sample.WeekStart.AddDays(i).AddHours(9).AddMinutes(j * 12),
+                    Category = category, Message = messages[index] });
+            }
+        }
+        sample.Entries.Sort((a, b) => b.When.CompareTo(a.When));
+        return sample;
     }
 }
 
@@ -181,8 +223,9 @@ internal sealed class ActivityWindow : Form
     private readonly Func<int> rdpCount;
     private readonly Func<int> ipCount;
     private readonly bool dark;
-    private readonly Label[] values = new Label[4];
-    private readonly Panel[] cards = new Panel[4];
+    private readonly bool preview;
+    private readonly Label[] values = new Label[5];
+    private readonly Panel[] cards = new Panel[5];
     private readonly Label subtitle = new Label();
     private readonly ActivityChart chart = new ActivityChart();
     private readonly ListView recent = new ListView();
@@ -190,10 +233,11 @@ internal sealed class ActivityWindow : Form
     private readonly Button export = new Button();
     private ActivitySnapshot snapshot;
 
-    internal ActivityWindow(string dataFolder, Func<int> getRdpCount, Func<int> getIpCount, bool darkTheme)
+    internal ActivityWindow(string dataFolder, Func<int> getRdpCount, Func<int> getIpCount, bool darkTheme, bool previewMode = false)
     {
-        folder = dataFolder; rdpCount = getRdpCount; ipCount = getIpCount; dark = darkTheme;
-        Text = "TEC Systems — Activity Report"; ClientSize = new Size(930, 700); MinimumSize = new Size(840, 630);
+        folder = dataFolder; rdpCount = getRdpCount; ipCount = getIpCount; dark = darkTheme; preview = previewMode;
+        Text = preview ? "TEC Systems — Activity Report (Sample Data)" : "TEC Systems — Activity Report";
+        ClientSize = new Size(930, 700); MinimumSize = new Size(840, 630);
         StartPosition = FormStartPosition.CenterParent; Font = new Font("Segoe UI", 9f);
         Color canvas = dark ? Color.FromArgb(27, 36, 43) : Color.FromArgb(240, 244, 248);
         Color surface = dark ? Color.FromArgb(38, 50, 59) : Color.White;
@@ -204,6 +248,7 @@ internal sealed class ActivityWindow : Form
         subtitle.Left = 24; subtitle.Top = 61; subtitle.Width = 560; subtitle.Height = 24; subtitle.ForeColor = ink;
         subtitle.Text = "Loading this week's local activity..."; Controls.Add(subtitle);
         refresh.Text = "Refresh"; refresh.SetBounds(635, 29, 120, 34); refresh.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        refresh.Enabled = !preview;
         refresh.Click += delegate { RefreshActivity(); }; Controls.Add(refresh);
         export.Text = "Export Report"; export.SetBounds(765, 29, 140, 34); export.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         export.Enabled = false; export.Click += delegate { ExportReport(); }; Controls.Add(export);
@@ -212,14 +257,14 @@ internal sealed class ActivityWindow : Form
             button.FlatStyle = FlatStyle.Flat; button.FlatAppearance.BorderSize = 0;
             button.BackColor = button == refresh ? Color.FromArgb(0, 104, 220) : Color.FromArgb(22, 139, 109); button.ForeColor = Color.White;
         }
-        string[] titles = { "Saved RDP sites", "Saved IP profiles", "Sites added this week", "Actions this week" };
-        for (int i = 0; i < 4; i++)
+        string[] titles = { "Saved RDP sites", "Saved IP profiles", "Sites added this week", "Actions this week", "Active time" };
+        for (int i = 0; i < 5; i++)
         {
-            Panel card = new Panel { Left = 22 + i * 222, Top = 100, Width = 210, Height = 92, BackColor = surface };
+            Panel card = new Panel { Left = 22 + i * 178, Top = 100, Width = 168, Height = 92, BackColor = surface };
             cards[i] = card;
-            card.Controls.Add(new Label { Text = titles[i], Left = 12, Top = 10, Width = 185, Height = 22, ForeColor = ink });
-            values[i] = new Label { Text = "—", Left = 12, Top = 35, Width = 185, Height = 47,
-                Font = new Font("Segoe UI", 21f, FontStyle.Bold), ForeColor = ActivityChartColor(i) };
+            card.Controls.Add(new Label { Text = titles[i], Left = 12, Top = 10, Width = 150, Height = 22, ForeColor = ink });
+            values[i] = new Label { Text = "—", Left = 12, Top = 35, Width = 150, Height = 47,
+                Font = new Font("Segoe UI", 18f, FontStyle.Bold), ForeColor = ActivityChartColor(i) };
             card.Controls.Add(values[i]); Controls.Add(card);
         }
         chart.SetBounds(22, 210, 884, 240); chart.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
@@ -247,16 +292,16 @@ internal sealed class ActivityWindow : Form
             };
         }
         Resize += delegate {
-            int width = Math.Max(170, (ClientSize.Width - 80) / 4);
+            int width = Math.Max(145, (ClientSize.Width - 92) / 5);
             for (int i = 0; i < cards.Length; i++) { cards[i].Left = 22 + i * (width + 12); cards[i].Width = width; }
         };
-        Shown += delegate { RefreshActivity(); };
+        Shown += delegate { if (!preview) RefreshActivity(); };
     }
 
     private static Color ActivityChartColor(int index)
     {
         return new[] { Color.FromArgb(0, 104, 220), Color.FromArgb(22, 139, 109),
-            Color.FromArgb(216, 130, 45), Color.FromArgb(147, 96, 201) }[index];
+            Color.FromArgb(216, 130, 45), Color.FromArgb(147, 96, 201), Color.FromArgb(30, 150, 180) }[index];
     }
 
     private void RefreshActivity()
@@ -273,21 +318,28 @@ internal sealed class ActivityWindow : Form
                     if (IsDisposed) return;
                     refresh.Enabled = true;
                     if (loaded == null) { subtitle.Text = "Could not read activity: " + error; return; }
-                    snapshot = loaded; export.Enabled = true;
-                    subtitle.Text = "Week of " + loaded.WeekStart.ToString("MMMM d, yyyy") + "  •  " + loaded.Sessions + " toolkit starts recorded";
-                    int[] totals = { loaded.SavedRdpSites, loaded.SavedIpProfiles, loaded.NewRdpSites, loaded.Entries.Count };
-                    for (int i = 0; i < values.Length; i++) values[i].Text = totals[i].ToString("N0");
-                    chart.Snapshot = loaded; chart.Invalidate();
-                    recent.BeginUpdate(); recent.Items.Clear();
-                    foreach (ActivityEntry entry in loaded.Entries.Take(100))
-                    {
-                        ListViewItem row = new ListViewItem(entry.When.ToString("MMM d HH:mm"));
-                        row.SubItems.Add(entry.Category); row.SubItems.Add(entry.Message); recent.Items.Add(row);
-                    }
-                    recent.EndUpdate();
+                    LoadSnapshot(loaded);
                 })); }
                 catch (InvalidOperationException) { }
         });
+    }
+
+    internal void LoadSnapshot(ActivitySnapshot loaded)
+    {
+        snapshot = loaded; export.Enabled = !preview;
+        subtitle.Text = (preview ? "SAMPLE DATA  •  " : "") + "Week of " + loaded.WeekStart.ToString("MMMM d, yyyy") +
+            "  •  " + loaded.Sessions + " toolkit starts recorded";
+        int[] totals = { loaded.SavedRdpSites, loaded.SavedIpProfiles, loaded.NewRdpSites, loaded.Entries.Count };
+        for (int i = 0; i < totals.Length; i++) values[i].Text = totals[i].ToString("N0");
+        values[4].Text = ActivitySnapshot.FormatDuration(loaded.ForegroundSeconds);
+        chart.Snapshot = loaded; chart.Invalidate();
+        recent.BeginUpdate(); recent.Items.Clear();
+        foreach (ActivityEntry entry in loaded.Entries.Take(100))
+        {
+            ListViewItem row = new ListViewItem(entry.When.ToString("MMM d HH:mm"));
+            row.SubItems.Add(entry.Category); row.SubItems.Add(entry.Message); recent.Items.Add(row);
+        }
+        recent.EndUpdate();
     }
 
     private void ExportReport()

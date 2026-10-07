@@ -66,6 +66,22 @@ internal static class NativeToolkit
             if (args.Any(arg => arg == "/self-test" || arg == "/startup-self-test")) Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            if (args.Length == 2 && args[0] == "/activity-preview")
+            {
+                using (ActivityWindow preview = new ActivityWindow(Path.GetTempPath(), delegate { return 0; },
+                    delegate { return 0; }, true, true))
+                {
+                    preview.LoadSnapshot(ActivitySnapshot.Preview());
+                    preview.Show(); Application.DoEvents();
+                    using (Bitmap image = new Bitmap(preview.Width, preview.Height))
+                    {
+                        preview.DrawToBitmap(image, new Rectangle(0, 0, image.Width, image.Height));
+                        image.Save(args[1], System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                    preview.Close();
+                }
+                return 0;
+            }
             if (args.Length > 0 && args[0] == "/activate") return RestoreExisting() ? 0 : 1;
             if (args.Length == 2 && args[0] == "/wait-for-exit")
             {
@@ -104,7 +120,7 @@ internal static class NativeToolkit
         }
         catch (Exception error)
         {
-            if (args.Length > 0 && (args[0] == "/self-test" || args[0] == "/startup-self-test"))
+            if (args.Length > 0 && (args[0] == "/self-test" || args[0] == "/startup-self-test" || args[0] == "/activity-preview"))
                 File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "self-test-error.txt"), error.ToString());
             else
                 MessageBox.Show(error.Message, "TEC Systems Field Toolkit", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -312,6 +328,8 @@ internal sealed partial class ToolkitWindow : Form
     private bool testing;
     private ContextMenuStrip trayMenu;
     private System.Windows.Forms.Timer internetTimer;
+    private System.Windows.Forms.Timer usageTimer;
+    private DateTime? usageStartedUtc;
     private SplitContainer split;
     private ToolkitTabs tabs;
     private Panel headerPanel;
@@ -389,7 +407,7 @@ internal sealed partial class ToolkitWindow : Form
             SetInitialSplit(); ApplyTitleBarTheme();
             if (startup) Hide();
             if (testing) return;
-            RefreshProfiles(); RefreshAdaptersAsync(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); CheckUpdates(true);
+            RefreshProfiles(); RefreshAdaptersAsync(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); usageTimer.Start(); CheckUpdates(true);
             Log("Startup", "OK", Product + " " + version);
             if (updated) BeginInvoke(new Action(delegate {
                 Log("Updates", "OK", "Successfully updated to version " + version + ".");
@@ -398,6 +416,10 @@ internal sealed partial class ToolkitWindow : Form
             }));
         };
         FormClosing += OnClosing;
+        Activated += delegate { StartUsage(); };
+        Deactivate += delegate { FlushUsage(); };
+        VisibleChanged += delegate { if (!Visible) FlushUsage(); };
+        SizeChanged += delegate { if (WindowState == FormWindowState.Minimized) FlushUsage(); };
         SystemEvents.UserPreferenceChanged += OnWindowsPreferenceChanged;
     }
 
@@ -620,6 +642,8 @@ internal sealed partial class ToolkitWindow : Form
         internetTimer.Tick += delegate { UpdateInternet(); };
         updateTimer = new System.Windows.Forms.Timer { Interval = 30 * 60 * 1000 };
         updateTimer.Tick += delegate { CheckUpdates(true); };
+        usageTimer = new System.Windows.Forms.Timer { Interval = 60 * 1000 };
+        usageTimer.Tick += delegate { FlushUsage(); if (ContainsFocus) StartUsage(); };
     }
 
     private void SetInitialSplit()
@@ -703,6 +727,22 @@ internal sealed partial class ToolkitWindow : Form
             delegate { return profiles.Count; }, dark)) report.ShowDialog(this);
     }
 
+    private void StartUsage()
+    {
+        if (!testing && Visible && WindowState != FormWindowState.Minimized && !usageStartedUtc.HasValue)
+            usageStartedUtc = DateTime.UtcNow;
+    }
+
+    private void FlushUsage()
+    {
+        if (!usageStartedUtc.HasValue) return;
+        int seconds = Math.Max(0, (int)(DateTime.UtcNow - usageStartedUtc.Value).TotalSeconds);
+        usageStartedUtc = null;
+        if (seconds > 0 && !testing)
+            try { File.AppendAllText(logPath, "[" + DateTime.Now.ToString("HH:mm:ss") + "] [INFO] [Usage] Foreground seconds: " + seconds + Environment.NewLine); }
+            catch { /* Usage totals are best effort if the log is unavailable. */ }
+    }
+
     private void ConfigureTray()
     {
         string trayFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "TEC Systems Field Toolkit Tray.ico");
@@ -766,9 +806,11 @@ internal sealed partial class ToolkitWindow : Form
     private void OnClosing(object sender, FormClosingEventArgs args)
     {
         if (!exitRequested && args.CloseReason == CloseReason.UserClosing) { args.Cancel = true; Hide(); return; }
+        FlushUsage();
         SystemEvents.UserPreferenceChanged -= OnWindowsPreferenceChanged;
         if (internetTimer != null) { internetTimer.Stop(); internetTimer.Dispose(); }
         if (updateTimer != null) { updateTimer.Stop(); updateTimer.Dispose(); }
+        if (usageTimer != null) { usageTimer.Stop(); usageTimer.Dispose(); }
         if (activation != null) { activation.Dispose(); activation = null; }
         if (tray != null) { tray.Visible = false; tray.Dispose(); }
         if (trayMenu != null) trayMenu.Dispose();

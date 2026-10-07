@@ -51,6 +51,7 @@ jobs:
             dist/SHA256SUMS.txt
             dist/app-icon.png
             dist/tray-icon.png
+            dist/activity-report-preview.png
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/') || inputs.publish_release
         shell: pwsh
@@ -58,5 +59,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = 'v' + (Get-Content version.txt -First 1).Trim()
-          gh release create $tag dist/TEC-Systems-FieldToolkit-Setup.exe dist/TEC-Systems-FieldToolkit-Install.zip dist/TEC-Systems-FieldToolkit-Install.7z dist/SHA256SUMS.txt --target '${{ github.sha }}' --title "TEC Systems Field Toolkit $tag" --generate-notes
+          gh release create $tag dist/TEC-Systems-FieldToolkit-Setup.exe dist/TEC-Systems-FieldToolkit-Install.zip dist/TEC-Systems-FieldToolkit-Install.7z dist/SHA256SUMS.txt dist/activity-report-preview.png --target '${{ github.sha }}' --title "TEC Systems Field Toolkit $tag" --generate-notes
           if ($LASTEXITCODE -ne 0) { throw "Could not publish $tag." }

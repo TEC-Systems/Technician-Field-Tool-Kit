@@ -132,6 +132,12 @@ if ($selfTest.ExitCode -ne 0) {
     $detail = if (Test-Path -LiteralPath $selfTestError) { Get-Content -LiteralPath $selfTestError -Raw } else { 'No error details were written.' }
     throw "Native toolkit self-test failed: $detail"
 }
+$activityPreview = Join-Path $dist 'activity-report-preview.png'
+$previewTest = Start-Process -FilePath $launcher -ArgumentList ('/activity-preview "{0}"' -f $activityPreview) -PassThru -Wait
+if ($previewTest.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $activityPreview)) {
+    $detail = if (Test-Path -LiteralPath $selfTestError) { Get-Content -LiteralPath $selfTestError -Raw } else { 'No error details were written.' }
+    throw "Activity report preview failed: $detail"
+}
 
 $payloadFiles = @($launcher, (Join-Path $root 'version.txt'), (Join-Path $root 'assets'))
 $archiveError = $null
