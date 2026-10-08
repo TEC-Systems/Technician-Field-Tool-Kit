@@ -8,6 +8,31 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
+internal sealed class CaptureFinding
+{
+    internal readonly int Priority;
+    internal readonly string Severity;
+    internal readonly string Title;
+    internal readonly string Explanation;
+    internal readonly string NextCheck;
+
+    internal CaptureFinding(int priority, string severity, string title, string explanation, string nextCheck)
+    {
+        Priority = priority; Severity = severity; Title = title; Explanation = explanation; NextCheck = nextCheck;
+    }
+}
+
+internal sealed class CaptureAnalysis
+{
+    internal readonly string Report;
+    internal readonly List<CaptureFinding> Findings;
+
+    internal CaptureAnalysis(string report, List<CaptureFinding> findings)
+    {
+        Report = report; Findings = findings;
+    }
+}
+
 internal sealed class CaptureSummary
 {
     private readonly Dictionary<string, long> protocols = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
@@ -139,6 +164,76 @@ internal sealed class CaptureSummary
         if (values.Count > limit) report.AppendLine("  ... and " + (values.Count - limit) + " more");
     }
 
+    internal List<CaptureFinding> PrioritizedFindings()
+    {
+        List<CaptureFinding> findings = new List<CaptureFinding>();
+        if (packets == 0)
+        {
+            findings.Add(new CaptureFinding(0, "Info", "No packets decoded", "The selected file produced no packet records.",
+                "Confirm the file contains packets and can be opened in Wireshark."));
+            return findings;
+        }
+        foreach (KeyValuePair<string, HashSet<string>> device in deviceSources.Where(item => item.Value.Count > 1).OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
+            findings.Add(new CaptureFinding(0, "High", "Possible duplicate BACnet device ID " + device.Key,
+                "I-Am messages for this device ID came from " + String.Join(", ", device.Value.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray()) + ". A router or capture point can also make one device appear under multiple IPs.",
+                "Compare the source devices and BACnet routing in Wireshark before changing device IDs."));
+        foreach (KeyValuePair<string, HashSet<string>> ip in arpSources.Where(item => item.Value.Count > 1).OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
+            findings.Add(new CaptureFinding(1, "High", "Possible IP address conflict: " + ip.Key,
+                "ARP advertised this IP from " + String.Join(", ", ip.Value.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray()) + ". Failover or proxy ARP may also explain it.",
+                "Check the switch MAC table and the devices using this IP before changing an address."));
+        if (bacnetFailurePackets > 0)
+            findings.Add(new CaptureFinding(2, "High", "BACnet error responses",
+                bacnetFailurePackets.ToString("N0") + " Error, Reject, or Abort packets appeared. BMS reads or writes may be failing.",
+                "Review BACNET ERROR DETAILS below, then inspect the matching request and response in Wireshark."));
+        if (whoIsPackets > 0 && iAmPackets == 0)
+            findings.Add(new CaptureFinding(3, "Medium", "No I-Am replies seen",
+                whoIsPackets.ToString("N0") + " Who-Is requests appeared without an I-Am in this file. A short or one-sided capture may miss replies.",
+                "Verify the target is powered and reachable, then capture near the device or BACnet router."));
+        if (retransmissions > 0)
+            findings.Add(new CaptureFinding(4, "Medium", "TCP retransmissions",
+                retransmissions.ToString("N0") + " retransmissions appeared. Packets may have been lost or delayed.",
+                "Compare captures at both ends of the connection and check link errors or congestion."));
+        long dnsFailures = dnsErrors.Values.Sum();
+        if (dnsFailures > 0)
+            findings.Add(new CaptureFinding(5, "Medium", "DNS lookup errors",
+                dnsFailures.ToString("N0") + " DNS replies reported an error.",
+                "Review the DNS names and error codes below; verify the configured DNS server."));
+        long httpFailures = httpStatuses.Where(item => item.Key.StartsWith("4") || item.Key.StartsWith("5")).Sum(item => item.Value);
+        if (httpFailures > 0)
+            findings.Add(new CaptureFinding(6, "Medium", "HTTP error responses",
+                httpFailures.ToString("N0") + " HTTP 4xx or 5xx responses appeared.",
+                "Review the HTTP response codes and affected host before troubleshooting the service."));
+        if (resets > 3)
+            findings.Add(new CaptureFinding(7, "Medium", "Repeated TCP resets",
+                resets.ToString("N0") + " TCP resets appeared. Some resets are normal; repeated ones may interrupt a session.",
+                "Inspect the affected conversation and which endpoint sent the resets."));
+        if (bacnetPackets == 0)
+            findings.Add(new CaptureFinding(8, "Info", "No BACnet traffic decoded",
+                "No BACnet packets were identified in this file. The capture may be from another network segment or use a port TShark did not decode.",
+                "Confirm the capture location and inspect the BACnet/IP UDP traffic in Wireshark."));
+        if (packets < 20)
+            findings.Add(new CaptureFinding(9, "Info", "Short capture",
+                "Only " + packets.ToString("N0") + " packets were decoded; the network score is withheld.",
+                "Capture a longer sample while the reported problem is happening."));
+        if (findings.Count == 0)
+            findings.Add(new CaptureFinding(10, "Info", "No priority findings",
+                "These basic checks did not flag a BACnet or network problem in the recorded packets.",
+                "Review the detailed report if the site still has symptoms."));
+        return findings.OrderBy(item => item.Priority).ThenBy(item => item.Title, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static void AppendPriorityFindings(StringBuilder report, List<CaptureFinding> findings)
+    {
+        report.AppendLine().AppendLine("PRIORITY FINDINGS");
+        report.AppendLine("These are clues from the recorded traffic, not a confirmed diagnosis.");
+        foreach (CaptureFinding finding in findings)
+        {
+            report.AppendLine("  [" + finding.Severity.ToUpperInvariant() + "] " + finding.Title);
+            report.AppendLine("    What it means: " + finding.Explanation);
+            report.AppendLine("    Next check: " + finding.NextCheck);
+        }
+    }
+
     private void AppendFindings(StringBuilder report)
     {
         report.AppendLine().AppendLine("AT A GLANCE");
@@ -252,7 +347,7 @@ internal sealed class CaptureSummary
         Section(report, "BACNET ERROR DETAILS", bacnetErrors, 15);
     }
 
-    internal string Report(string capturePath)
+    internal CaptureAnalysis Analyze(string capturePath)
     {
         FileInfo file = new FileInfo(capturePath);
         StringBuilder report = new StringBuilder();
@@ -267,6 +362,8 @@ internal sealed class CaptureSummary
             report.AppendLine("Last packet:  " + DateTimeOffset.FromUnixTimeMilliseconds((long)(last * 1000)).UtcDateTime.ToString("u"));
             report.AppendLine("Duration: " + Math.Max(0, last - first).ToString("N2", CultureInfo.InvariantCulture) + " seconds");
         }
+        List<CaptureFinding> findings = PrioritizedFindings();
+        AppendPriorityFindings(report, findings);
         AppendScore(report);
         AppendFindings(report);
         AppendBmsFindings(report);
@@ -284,7 +381,7 @@ internal sealed class CaptureSummary
         report.AppendLine("  ICMP packets: " + icmpPackets.ToString("N0"));
         report.AppendLine().AppendLine("This is a traffic summary, not a verdict about security or root cause. Review packets in Wireshark for details.");
         report.AppendLine("The capture stays on this computer; the toolkit does not upload it.");
-        return report.ToString();
+        return new CaptureAnalysis(report.ToString(), findings);
     }
 
     internal static void SelfTest()
@@ -309,6 +406,20 @@ internal sealed class CaptureSummary
         bacnet[28] = "00:11:22:33:44:66"; sample.AddPacket(String.Join("|", bacnet));
         if (sample.arpSources["192.0.2.1"].Count != 2)
             throw new InvalidOperationException("ARP duplicate-IP evidence is missing.");
+        bacnet[2] = "BACnet"; bacnet[20] = "1"; bacnet[22] = "0"; bacnet[25] = "123";
+        bacnet[3] = "192.0.2.10"; sample.AddPacket(String.Join("|", bacnet));
+        bacnet[3] = "192.0.2.11"; sample.AddPacket(String.Join("|", bacnet));
+        bacnet[20] = "5"; bacnet[22] = ""; sample.AddPacket(String.Join("|", bacnet));
+        List<CaptureFinding> prioritized = sample.PrioritizedFindings();
+        if (prioritized.Count < 3 || prioritized[0].Title != "Possible duplicate BACnet device ID 123" ||
+            prioritized[1].Title != "Possible IP address conflict: 192.0.2.1" ||
+            prioritized[2].Title != "BACnet error responses" || prioritized[0].Severity != "High" ||
+            prioritized[0].NextCheck.Length == 0 || prioritized.Any(item => item.Title == "No I-Am replies seen"))
+            throw new InvalidOperationException("Priority findings are missing or out of order.");
+        StringBuilder priorityReport = new StringBuilder();
+        AppendPriorityFindings(priorityReport, prioritized);
+        if (!priorityReport.ToString().Contains("Next check: Compare the source devices"))
+            throw new InvalidOperationException("Export report omitted priority finding guidance.");
     }
 }
 
@@ -331,7 +442,7 @@ internal static class CaptureAnalyzer
         throw new FileNotFoundException("TShark was not found. Install Wireshark with its TShark command-line component, then try again.");
     }
 
-    internal static string Analyze(string capturePath, CancellationToken cancellation)
+    internal static CaptureAnalysis Analyze(string capturePath, CancellationToken cancellation)
     {
         if (!File.Exists(capturePath)) throw new FileNotFoundException("Capture file not found.", capturePath);
         string extension = Path.GetExtension(capturePath);
@@ -368,6 +479,6 @@ internal static class CaptureAnalyzer
             if (process.ExitCode != 0)
                 throw new InvalidOperationException("TShark could not read this capture: " + (error.Length > 500 ? error.Substring(0, 500) : error));
         }
-        return summary.Report(capturePath);
+        return summary.Analyze(capturePath);
     }
 }

@@ -379,6 +379,7 @@ internal sealed partial class ToolkitWindow : Form
     private Button scanButton;
     private TextBox capturePath;
     private TextBox captureReport;
+    private ListView captureFindings;
     private Label captureStatus;
     private Button captureBrowse;
     private Button captureAnalyze;
@@ -1078,7 +1079,7 @@ internal sealed partial class ToolkitWindow : Form
         capturePath = T(18, 90, 510, ""); capturePath.ReadOnly = true; page.Controls.Add(capturePath);
         captureBrowse = B(page, "Open Packet File", 540, 86, 146, delegate {
             using (OpenFileDialog dialog = new OpenFileDialog { Title = "Choose a Wireshark capture", Filter = "Capture files (*.pcap;*.pcapng;*.cap)|*.pcap;*.pcapng;*.cap|All files (*.*)|*.*", CheckFileExists = true })
-                if (dialog.ShowDialog(this) == DialogResult.OK) { capturePath.Text = dialog.FileName; captureReport.Clear(); captureExport.Enabled = false; captureStatus.Text = "Ready to analyze."; }
+                if (dialog.ShowDialog(this) == DialogResult.OK) { capturePath.Text = dialog.FileName; captureReport.Clear(); captureFindings.Items.Clear(); captureExport.Enabled = false; captureStatus.Text = "Ready to analyze."; }
         }, "Open a saved Wireshark packet capture.", Cobalt);
         captureAnalyze = B(page, "Analyze", 18, 126, 120, AnalyzeCapture, "Analyze the selected capture without uploading it.", Green);
         captureCancel = B(page, "Stop Analysis", 150, 126, 120, delegate { if (captureCancellation != null) captureCancellation.Cancel(); }, "Stop reading the selected file.", Slate);
@@ -1087,15 +1088,30 @@ internal sealed partial class ToolkitWindow : Form
         captureExport.Enabled = false;
         captureStatus = L("Choose a capture to begin.", 448, 133, 390); page.Controls.Add(captureStatus);
         page.Controls.Add(L("Requires Wireshark's TShark component. The toolkit does not record packets.", 18, 172, 790));
-        captureReport = new TextBox { Left = 18, Top = 202, Width = 790, Height = 390, ReadOnly = true,
+        page.Controls.Add(L("Priority findings", 18, 197, 300));
+        captureFindings = new ListView { Left = 18, Top = 222, Width = 790, Height = 165, View = View.Details,
+            FullRowSelect = true, GridLines = true, ShowItemToolTips = true, HideSelection = false };
+        captureFindings.Columns.Add("Priority", 72);
+        captureFindings.Columns.Add("Finding", 188);
+        captureFindings.Columns.Add("What it means", 250);
+        captureFindings.Columns.Add("Next check", 270);
+        page.Controls.Add(captureFindings);
+        page.Controls.Add(L("Detailed report", 18, 399, 300));
+        captureReport = new TextBox { Left = 18, Top = 424, Width = 790, Height = 170, ReadOnly = true,
             Multiline = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 9f) };
         page.Controls.Add(captureReport);
         Action fit = delegate {
             int width = Math.Max(620, page.ClientSize.Width - 36);
             capturePath.Width = Math.Max(180, width - 158);
             captureBrowse.Left = capturePath.Right + 12;
+            captureFindings.Width = width;
             captureReport.Width = width;
-            captureReport.Height = Math.Max(280, page.ClientSize.Height - captureReport.Top - 18);
+            captureReport.Height = Math.Max(120, page.ClientSize.Height - captureReport.Top - 18);
+            int detailsWidth = Math.Max(120, width - 72 - 180 - 245 - 8);
+            captureFindings.Columns[0].Width = 72;
+            captureFindings.Columns[1].Width = 180;
+            captureFindings.Columns[2].Width = 245;
+            captureFindings.Columns[3].Width = detailsWidth;
             captureStatus.Width = Math.Max(150, page.ClientSize.Width - captureStatus.Left - 18);
         };
         page.Resize += delegate { fit(); };
@@ -1112,19 +1128,35 @@ internal sealed partial class ToolkitWindow : Form
         captureBrowse.Enabled = false; captureAnalyze.Enabled = false; captureCancel.Enabled = true; captureExport.Enabled = false;
         captureStatus.Text = "Analyzing capture...";
         ThreadPool.QueueUserWorkItem(delegate {
-            string report = null, error = null;
-            try { report = CaptureAnalyzer.Analyze(path, source.Token); }
+            CaptureAnalysis analysis = null;
+            string error = null;
+            try { analysis = CaptureAnalyzer.Analyze(path, source.Token); }
             catch (OperationCanceledException) { error = "Analysis stopped."; }
             catch (Exception failure) { error = failure.Message; }
             if (!IsDisposed && IsHandleCreated)
                 try { BeginInvoke(new Action(delegate {
                     if (IsDisposed) return;
-                    captureReport.Text = report ?? error;
-                    captureStatus.Text = report == null ? error : "Analysis complete.";
+                    captureFindings.BeginUpdate();
+                    try
+                    {
+                        captureFindings.Items.Clear();
+                        if (analysis != null)
+                            foreach (CaptureFinding finding in analysis.Findings)
+                            {
+                                ListViewItem item = new ListViewItem(new[] { finding.Severity, finding.Title, finding.Explanation, finding.NextCheck });
+                                item.ToolTipText = finding.Explanation + Environment.NewLine + "Next check: " + finding.NextCheck;
+                                item.ForeColor = finding.Severity == "High" ? Color.FromArgb(232, 132, 76) :
+                                    finding.Severity == "Medium" ? Color.FromArgb(232, 186, 87) : Color.FromArgb(84, 187, 221);
+                                captureFindings.Items.Add(item);
+                            }
+                    }
+                    finally { captureFindings.EndUpdate(); }
+                    captureReport.Text = analysis == null ? error : analysis.Report;
+                    captureStatus.Text = analysis == null ? error : "Analysis complete: " + analysis.Findings.Count + " findings.";
                     captureBrowse.Enabled = true; captureAnalyze.Enabled = true; captureCancel.Enabled = false;
-                    captureExport.Enabled = report != null;
+                    captureExport.Enabled = analysis != null;
                     captureCancellation = null;
-                    Log("Capture", report == null ? "ERROR" : "OK", report == null ? error : "Analyzed " + Path.GetFileName(path));
+                    Log("Capture", analysis == null ? "ERROR" : "OK", analysis == null ? error : "Analyzed " + Path.GetFileName(path));
                     source.Dispose();
                 })); }
                 catch (InvalidOperationException) { source.Dispose(); }
