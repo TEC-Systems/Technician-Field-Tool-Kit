@@ -216,6 +216,7 @@ internal sealed class RdpSiteProfile
     public string Domain = "";
     public string Resolution = "Full screen";
     public string ProtectedPassword = "";
+    public bool Favorite;
     public override string ToString() { return Name + "  |  " + Host; }
 }
 
@@ -357,6 +358,7 @@ internal sealed partial class ToolkitWindow : Form
     private TextBox playbookText;
     private ComboBox bundleType;
     private ListView profileView;
+    private ComboBox profileSort;
     private ComboBox adapterChoice;
     private TextBox profileName;
     private TextBox ipField;
@@ -524,7 +526,8 @@ internal sealed partial class ToolkitWindow : Form
                     rdpSites.Add(new RdpSiteProfile { Id = RdpManager.ValidProfileId(Value(row, "Id")), Name = name, Host = host, Group = Value(row, "Group"),
                         User = Value(row, "User"), Domain = Value(row, "Domain"),
                         Resolution = String.IsNullOrEmpty(Value(row, "Resolution")) ? "Full screen" : Value(row, "Resolution"),
-                        ProtectedPassword = Value(row, "ProtectedPassword") });
+                        ProtectedPassword = Value(row, "ProtectedPassword"),
+                        Favorite = String.Equals(Value(row, "Favorite"), "True", StringComparison.OrdinalIgnoreCase) });
                 }
             }
             if (bmsProfiles.Count == 0 && ValidTarget(Value(settings, "EbiHost")))
@@ -554,7 +557,7 @@ internal sealed partial class ToolkitWindow : Form
         }).ToArray();
         settings["RdpSites"] = rdpSites.Select(p => new Dictionary<string, object> {
             { "Id", p.Id }, { "Name", p.Name }, { "Host", p.Host }, { "Group", p.Group }, { "User", p.User },
-            { "Domain", p.Domain }, { "Resolution", p.Resolution }, { "ProtectedPassword", p.ProtectedPassword }
+            { "Domain", p.Domain }, { "Resolution", p.Resolution }, { "ProtectedPassword", p.ProtectedPassword }, { "Favorite", p.Favorite }
         }).ToArray();
         SaveWorkspaceSettings();
         settings.Remove("EbiHost");
@@ -1221,13 +1224,18 @@ internal sealed partial class ToolkitWindow : Form
     private void BuildIpPage(TabPage page)
     {
         page.Controls.Add(L("Saved profiles", 18, 15, 200));
+        Label sortLabel = L("Sort", 555, 15, 45); page.Controls.Add(sortLabel);
+        profileSort = new ComboBox { Left = 605, Top = 10, Width = 112, DropDownStyle = ComboBoxStyle.DropDownList };
+        profileSort.Items.AddRange(new object[] { "A–Z", "Z–A" }); profileSort.SelectedIndex = 0;
+        profileSort.SelectedIndexChanged += delegate { if (profileView != null) RefreshProfiles(); };
+        page.Controls.Add(profileSort);
         profileView = new ListView { Left = 18, Top = 41, Width = 700, Height = 160, View = View.Details, FullRowSelect = true, GridLines = true };
         profileView.Columns.Add("Profile", 110); profileView.Columns.Add("Adapter", 120); profileView.Columns.Add("IP", 105);
         profileView.Columns.Add("Mask", 105); profileView.Columns.Add("Gateway", 92);
         profileView.DoubleClick += delegate { LoadProfile(); };
         page.Controls.Add(profileView);
         profileView.SizeChanged += delegate { UpdateProfileColumns(); };
-        page.SizeChanged += delegate { profileView.Width = Math.Max(550, page.ClientSize.Width - 36); UpdateProfileColumns(); };
+        page.SizeChanged += delegate { profileView.Width = Math.Max(550, page.ClientSize.Width - 36); profileSort.Left = profileView.Right - profileSort.Width; sortLabel.Left = profileSort.Left - 50; UpdateProfileColumns(); };
         B(page, "Load Profile", 18, 214, 130, LoadProfile, "Load the selected saved site profile.", Cobalt);
         B(page, "Save Profile", 164, 214, 130, SaveProfile, "Save this adapter and IP configuration for reuse.", Green);
         B(page, "Delete Profile", 310, 214, 130, DeleteProfile, "Delete the selected profile; this does not change Windows IP settings.", Slate);
@@ -1246,6 +1254,7 @@ internal sealed partial class ToolkitWindow : Form
         B(page, "Restore Previous IP", 320, 510, 168, RestorePreviousIp, "Restore this adapter's settings from before the last IP Shifter change.", Green);
         B(page, "IP History", 504, 510, 112, ShowIpHistory, "View verified and failed IP changes on this laptop.", Cobalt);
         profileView.Width = Math.Max(550, page.ClientSize.Width - 36);
+        profileSort.Left = profileView.Right - profileSort.Width; sortLabel.Left = profileSort.Left - 50;
         UpdateProfileColumns();
     }
 
@@ -1435,12 +1444,17 @@ internal sealed partial class ToolkitWindow : Form
 
     private void RefreshProfiles()
     {
+        ToolkitProfile selectedProfile = profileView.SelectedItems.Count == 0 ? null : profileView.SelectedItems[0].Tag as ToolkitProfile;
         profileView.Items.Clear();
-        foreach (ToolkitProfile p in profiles.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
+        IEnumerable<ToolkitProfile> ordered = profileSort != null && profileSort.SelectedIndex == 1 ?
+            profiles.OrderByDescending(p => p.Name, StringComparer.OrdinalIgnoreCase) :
+            profiles.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase);
+        foreach (ToolkitProfile p in ordered)
         {
             ListViewItem row = new ListViewItem(p.Name) { Tag = p };
             row.SubItems.Add(p.Adapter); row.SubItems.Add(p.IPAddress); row.SubItems.Add(p.SubnetMask); row.SubItems.Add(p.Gateway);
             profileView.Items.Add(row);
+            if (Object.ReferenceEquals(p, selectedProfile)) row.Selected = true;
         }
     }
 
@@ -2498,6 +2512,22 @@ internal sealed partial class ToolkitWindow : Form
             if (ParseNodeStatusName(nodeStatus, 0x5445) != "EBISERV" || ParseNodeStatusName(new byte[3], 0x5445) != "")
                 throw new InvalidOperationException("NetBIOS hostname parsing failed.");
             if (typeof(ToolkitWindow).Assembly.GetReferencedAssemblies().Any(a => a.Name == "System.Management.Automation")) throw new InvalidOperationException("PowerShell runtime reference found.");
+            List<ToolkitProfile> originalProfiles = profiles.ToList();
+            try
+            {
+                profiles.Clear();
+                profiles.Add(new ToolkitProfile { Name = "Zebra" });
+                profiles.Add(new ToolkitProfile { Name = "Alpha" });
+                RefreshProfiles();
+                if (profileView.Items[0].Text != "Alpha") throw new InvalidOperationException("IP profile A-Z sorting failed.");
+                profileSort.SelectedIndex = 1;
+                if (profileView.Items[0].Text != "Zebra") throw new InvalidOperationException("IP profile Z-A sorting failed.");
+            }
+            finally
+            {
+                profiles.Clear(); profiles.AddRange(originalProfiles);
+                profileSort.SelectedIndex = 0; RefreshProfiles();
+            }
             Show(); Application.DoEvents();
             tabs.SelectedTab = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "IP Shifter");
             split.SplitterDistance = 650;

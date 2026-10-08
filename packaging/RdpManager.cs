@@ -19,12 +19,16 @@ internal sealed class RdpManager : UserControl
     private readonly Action<string> activity;
     private readonly string folder;
     private readonly TreeView tree = new TreeView { Dock = DockStyle.Fill, HideSelection = false };
+    private readonly TextBox search = new TextBox { Dock = DockStyle.Fill };
+    private readonly ComboBox sort = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly TextBox name = new TextBox(), group = new TextBox(), host = new TextBox(), user = new TextBox(), domain = new TextBox();
     private readonly TextBox password = new TextBox { UseSystemPasswordChar = true };
     private readonly CheckBox remember = new CheckBox { Text = "Save password for this Windows user", AutoSize = true };
     private readonly ComboBox resolution = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly Label notice = new Label { AutoSize = true, MaximumSize = new Size(480, 0) };
+    private Button favoriteButton;
     private RdpSiteProfile selected;
+    private bool reloadingTree;
 
     public RdpManager(List<RdpSiteProfile> profiles, Action persist, string dataFolder, Action<string> recordActivity = null)
     {
@@ -34,7 +38,22 @@ internal sealed class RdpManager : UserControl
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 35));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 65));
         Controls.Add(layout);
-        layout.Controls.Add(tree, 0, 0);
+        Panel browser = new Panel { Dock = DockStyle.Fill };
+        layout.Controls.Add(browser, 0, 0);
+        browser.Controls.Add(tree);
+        TableLayoutPanel browserTools = new TableLayoutPanel { Dock = DockStyle.Top, Height = 68, ColumnCount = 2, RowCount = 2 };
+        browserTools.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 72));
+        browserTools.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
+        browserTools.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        browserTools.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        browser.Controls.Add(browserTools);
+        browserTools.Controls.Add(new Label { Text = "Search sites", Dock = DockStyle.Fill }, 0, 0);
+        browserTools.Controls.Add(new Label { Text = "Sort", Dock = DockStyle.Fill }, 1, 0);
+        browserTools.Controls.Add(search, 0, 1);
+        sort.Items.AddRange(new object[] { "A–Z", "Z–A" }); sort.SelectedIndex = 0;
+        browserTools.Controls.Add(sort, 1, 1);
+        search.TextChanged += delegate { Reload(); };
+        sort.SelectedIndexChanged += delegate { Reload(); };
         Panel scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
         layout.Controls.Add(scroll, 1, 0);
         TableLayoutPanel editor = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, Padding = new Padding(12, 0, 0, 12) };
@@ -56,10 +75,12 @@ internal sealed class RdpManager : UserControl
         AddButton(buttons, "Save Site", SaveSite);
         AddButton(buttons, "Delete", DeleteSite);
         AddButton(buttons, "Connect", Connect);
+        favoriteButton = AddButton(buttons, "Add Favorite", ToggleFavorite);
+        favoriteButton.Enabled = false;
         AddRow(editor, "", buttons);
         AddRow(editor, "", notice);
         notice.Text = "Connections open in Windows Remote Desktop. Saved passwords are encrypted for your Windows account on this laptop. Leave password blank to keep an existing saved password; uncheck Save password to remove it. Server policies may still require a prompt.";
-        tree.AfterSelect += delegate { LoadSite(tree.SelectedNode == null ? null : tree.SelectedNode.Tag as RdpSiteProfile); };
+        tree.AfterSelect += delegate { if (!reloadingTree) LoadSite(tree.SelectedNode == null ? null : tree.SelectedNode.Tag as RdpSiteProfile); };
         tree.NodeMouseDoubleClick += delegate(object sender, TreeNodeMouseClickEventArgs e) { if (e.Node.Tag is RdpSiteProfile) Run(Connect); };
         Reload();
     }
@@ -73,10 +94,11 @@ internal sealed class RdpManager : UserControl
         panel.Controls.Add(control, 1, row);
     }
 
-    private void AddButton(Control panel, string caption, Action action)
+    private Button AddButton(Control panel, string caption, Action action)
     {
         Button button = new Button { Text = caption, AutoSize = true, Height = 34, FlatStyle = FlatStyle.Flat, Tag = caption == "Connect" ? Color.FromArgb(0, 67, 230) : caption == "Save Site" ? Color.FromArgb(31, 128, 78) : Color.FromArgb(75, 94, 116), Margin = new Padding(0, 0, 8, 8) };
         button.Click += delegate { Run(action); }; panel.Controls.Add(button);
+        return button;
     }
 
     private void Run(Action action)
@@ -88,24 +110,70 @@ internal sealed class RdpManager : UserControl
     public void Reload()
     {
         RdpSiteProfile current = selected;
+        IEnumerable<RdpSiteProfile> visible = sites.Where(site => MatchesSearch(site, search.Text));
+        IOrderedEnumerable<RdpSiteProfile> ordered = sort.SelectedIndex == 1 ?
+            visible.OrderByDescending(site => site.Name, StringComparer.OrdinalIgnoreCase) :
+            visible.OrderBy(site => site.Name, StringComparer.OrdinalIgnoreCase);
+        reloadingTree = true;
         tree.BeginUpdate(); tree.Nodes.Clear();
-        foreach (IGrouping<string, RdpSiteProfile> folderSites in sites.OrderBy(s => s.Group, StringComparer.OrdinalIgnoreCase).ThenBy(s => s.Name, StringComparer.OrdinalIgnoreCase).GroupBy(s => String.IsNullOrWhiteSpace(s.Group) ? "Sites" : s.Group, StringComparer.OrdinalIgnoreCase))
+        TreeNode selectedNode = null;
+        RdpSiteProfile[] favorites = ordered.Where(site => site.Favorite).ToArray();
+        if (favorites.Length > 0)
+        {
+            TreeNode parent = tree.Nodes.Add("★ Favorites");
+            foreach (RdpSiteProfile site in favorites)
+            {
+                TreeNode node = parent.Nodes.Add(site.Name); node.Tag = site;
+                if (Object.ReferenceEquals(site, current)) selectedNode = node;
+            }
+            parent.Expand();
+        }
+        IEnumerable<IGrouping<string, RdpSiteProfile>> groups = ordered.GroupBy(site => String.IsNullOrWhiteSpace(site.Group) ? "Sites" : site.Group, StringComparer.OrdinalIgnoreCase);
+        groups = sort.SelectedIndex == 1 ? groups.OrderByDescending(item => item.Key, StringComparer.OrdinalIgnoreCase) : groups.OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase);
+        foreach (IGrouping<string, RdpSiteProfile> folderSites in groups)
         {
             TreeNode parent = tree.Nodes.Add(folderSites.Key);
             foreach (RdpSiteProfile site in folderSites)
             {
                 TreeNode node = parent.Nodes.Add(site.Name); node.Tag = site;
-                if (Object.ReferenceEquals(site, current)) tree.SelectedNode = node;
+                if (selectedNode == null && Object.ReferenceEquals(site, current)) selectedNode = node;
             }
             parent.Expand();
         }
+        tree.SelectedNode = selectedNode;
         tree.EndUpdate();
+        reloadingTree = false;
         if (current != null && !sites.Contains(current)) NewSite();
+    }
+
+    private static bool MatchesSearch(RdpSiteProfile site, string query)
+    {
+        query = (query ?? "").Trim();
+        return query.Length == 0 || new[] { site.Name, site.Group, site.Host }.Any(value =>
+            (value ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0);
+    }
+
+    private void ToggleFavorite()
+    {
+        if (selected == null) throw new InvalidOperationException("Select a saved site first.");
+        selected.Favorite = !selected.Favorite;
+        try { save(); }
+        catch { selected.Favorite = !selected.Favorite; throw; }
+        if (activity != null) activity((selected.Favorite ? "Favorited site: " : "Removed favorite: ") + selected.Name);
+        Reload(); UpdateFavoriteButton();
+    }
+
+    private void UpdateFavoriteButton()
+    {
+        if (favoriteButton == null) return;
+        favoriteButton.Enabled = selected != null;
+        favoriteButton.Text = selected != null && selected.Favorite ? "Remove Favorite" : "Add Favorite";
     }
 
     private void LoadSite(RdpSiteProfile site)
     {
         selected = site;
+        UpdateFavoriteButton();
         if (site == null) { ClearFields(); return; }
         name.Text = site.Name; group.Text = site.Group; host.Text = site.Host; user.Text = site.User; domain.Text = site.Domain;
         password.Clear(); remember.Checked = !String.IsNullOrEmpty(site.ProtectedPassword);
@@ -117,7 +185,7 @@ internal sealed class RdpManager : UserControl
         name.Clear(); group.Clear(); host.Clear(); user.Clear(); domain.Clear(); password.Clear(); remember.Checked = false; resolution.SelectedIndex = 0;
     }
 
-    private void NewSite() { selected = null; tree.SelectedNode = null; ClearFields(); name.Focus(); }
+    private void NewSite() { selected = null; tree.SelectedNode = null; ClearFields(); UpdateFavoriteButton(); name.Focus(); }
 
     private RdpSiteProfile ReadFields()
     {
@@ -134,7 +202,8 @@ internal sealed class RdpManager : UserControl
             else if (sameIdentity) encrypted = selected.ProtectedPassword;
         }
         return new RdpSiteProfile { Id = selected == null ? Guid.NewGuid().ToString("N") : selected.Id, Name = name.Text.Trim(), Group = group.Text.Trim(), Host = server,
-            User = user.Text.Trim(), Domain = domain.Text.Trim(), Resolution = Convert.ToString(resolution.SelectedItem), ProtectedPassword = encrypted };
+            User = user.Text.Trim(), Domain = domain.Text.Trim(), Resolution = Convert.ToString(resolution.SelectedItem), ProtectedPassword = encrypted,
+            Favorite = selected != null && selected.Favorite };
     }
 
     private void SaveSite()
@@ -150,7 +219,7 @@ internal sealed class RdpManager : UserControl
         catch { if (index < 0) sites.Remove(edited); else sites[index] = previous; selected = previous; throw; }
         if (!String.IsNullOrEmpty(folder)) WriteConnectionFile(edited, Screen.FromControl(this).WorkingArea.Size);
         if (activity != null) activity((index < 0 ? "Added site: " : "Updated site: ") + edited.Name);
-        password.Clear(); Reload();
+        password.Clear(); Reload(); UpdateFavoriteButton();
     }
 
     private void DeleteSite()
@@ -285,6 +354,16 @@ internal sealed class RdpManager : UserControl
             if (saves != 1 || data.Count != 1 || manager.tree.Nodes[0].Text != "Office" || manager.password.Text.Length != 0)
                 throw new InvalidOperationException("RDP site saving or folder display failed.");
             RdpSiteProfile site = data[0];
+            manager.search.Text = "192.0.2.10";
+            if (manager.tree.Nodes.Count != 1 || manager.tree.Nodes[0].Nodes.Count != 1)
+                throw new InvalidOperationException("RDP search did not match server address.");
+            manager.search.Text = "no-matching-site";
+            if (manager.tree.Nodes.Count != 0 || manager.selected != site)
+                throw new InvalidOperationException("RDP search lost the selected site.");
+            manager.search.Clear();
+            manager.ToggleFavorite();
+            if (!site.Favorite || manager.tree.Nodes[0].Text != "★ Favorites" || saves != 2)
+                throw new InvalidOperationException("RDP favorite was not saved or shown first.");
             string temporaryFolder = Path.Combine(Path.GetTempPath(), "TEC-Rdp-Test-" + Guid.NewGuid().ToString("N"));
             try
             {
@@ -310,7 +389,7 @@ internal sealed class RdpManager : UserControl
             finally { Array.Clear(plain, 0, plain.Length); }
             JavaScriptSerializer serializer = new JavaScriptSerializer();
             RdpSiteProfile restored = serializer.Deserialize<RdpSiteProfile>(serializer.Serialize(site));
-            if (restored.Id != site.Id || restored.Host != site.Host || restored.Group != "Office" || restored.Resolution != "1280 x 720" || restored.ProtectedPassword != site.ProtectedPassword)
+            if (restored.Id != site.Id || restored.Host != site.Host || restored.Group != "Office" || restored.Resolution != "1280 x 720" || restored.ProtectedPassword != site.ProtectedPassword || !restored.Favorite)
                 throw new InvalidOperationException("RDP profile persistence failed.");
             string file = BuildRdpFile(restored, new Size(1920, 1080));
             if (!file.Contains("username:s:TEC\\technician") || !file.Contains("desktopwidth:i:1280") || !file.Contains("desktopheight:i:720") || file.Contains("self-test-password"))
@@ -324,6 +403,15 @@ internal sealed class RdpManager : UserControl
             manager.resolution.SelectedItem = "Full screen"; manager.SaveSite();
             if (!BuildRdpFile(data[0], new Size(1920, 1080)).Contains("screen mode id:i:2")) throw new InvalidOperationException("RDP full screen selection failed.");
             manager.NewSite(); if (manager.host.Text.Length != 0 || manager.selected != null) throw new InvalidOperationException("RDP new-site fields failed.");
+            manager.name.Text = "Zebra site"; manager.group.Text = "Office"; manager.host.Text = "192.0.2.20"; manager.SaveSite();
+            manager.sort.SelectedIndex = 1;
+            TreeNode office = manager.tree.Nodes.Cast<TreeNode>().First(node => node.Text == "Office");
+            if (office.Nodes[0].Text != "Zebra site" || office.Nodes[1].Text != "Office server")
+                throw new InvalidOperationException("RDP reverse alphabetical sorting failed.");
+            manager.sort.SelectedIndex = 0;
+            if (office == manager.tree.Nodes.Cast<TreeNode>().First(node => node.Text == "Office") ||
+                manager.tree.Nodes.Cast<TreeNode>().First(node => node.Text == "Office").Nodes[0].Text != "Office server")
+                throw new InvalidOperationException("RDP alphabetical sorting failed.");
         }
     }
 }
