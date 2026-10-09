@@ -218,6 +218,7 @@ internal sealed class RdpSiteProfile
     public string Domain = "";
     public string Resolution = "Full screen";
     public string ProtectedPassword = "";
+    public bool UseWindowsCredentials;
     public bool Favorite;
     public override string ToString() { return Name + "  |  " + Host; }
 }
@@ -529,6 +530,7 @@ internal sealed partial class ToolkitWindow : Form
                         User = Value(row, "User"), Domain = Value(row, "Domain"),
                         Resolution = String.IsNullOrEmpty(Value(row, "Resolution")) ? "Full screen" : Value(row, "Resolution"),
                         ProtectedPassword = Value(row, "ProtectedPassword"),
+                        UseWindowsCredentials = String.Equals(Value(row, "UseWindowsCredentials"), "True", StringComparison.OrdinalIgnoreCase),
                         Favorite = String.Equals(Value(row, "Favorite"), "True", StringComparison.OrdinalIgnoreCase) });
                 }
             }
@@ -559,7 +561,8 @@ internal sealed partial class ToolkitWindow : Form
         }).ToArray();
         settings["RdpSites"] = rdpSites.Select(p => new Dictionary<string, object> {
             { "Id", p.Id }, { "Name", p.Name }, { "Host", p.Host }, { "Group", p.Group }, { "User", p.User },
-            { "Domain", p.Domain }, { "Resolution", p.Resolution }, { "ProtectedPassword", p.ProtectedPassword }, { "Favorite", p.Favorite }
+            { "Domain", p.Domain }, { "Resolution", p.Resolution }, { "ProtectedPassword", p.ProtectedPassword },
+            { "UseWindowsCredentials", p.UseWindowsCredentials }, { "Favorite", p.Favorite }
         }).ToArray();
         SaveWorkspaceSettings();
         settings.Remove("EbiHost");

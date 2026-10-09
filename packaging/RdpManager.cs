@@ -28,6 +28,7 @@ internal sealed class RdpManager : UserControl
     private readonly TextBox name = new TextBox(), group = new TextBox(), host = new TextBox(), user = new TextBox(), domain = new TextBox();
     private readonly TextBox password = new TextBox { UseSystemPasswordChar = true };
     private readonly CheckBox remember = new CheckBox { Text = "Save password for this Windows user", AutoSize = true };
+    private readonly CheckBox windowsLogin = new CheckBox { Text = "Use login saved in Windows Remote Desktop for this site", AutoSize = true };
     private readonly ComboBox resolution = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly Label notice = new Label { AutoSize = true, MaximumSize = new Size(480, 0) };
     private Button favoriteButton;
@@ -72,6 +73,9 @@ internal sealed class RdpManager : UserControl
         AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = "For BMS sites using a local login, leave Domain blank. Enter a domain only if the site uses a domain account." });
         AddRow(editor, "Password", password);
         AddRow(editor, "", remember);
+        AddRow(editor, "", windowsLogin);
+        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = "Use this when the same IP connects without a prompt in Windows Remote Desktop. The toolkit will leave the RDP username blank and will not write a password to Windows Credential Manager." });
+        windowsLogin.CheckedChanged += delegate { UpdateLoginFields(); };
         resolution.Items.AddRange(Resolutions); resolution.SelectedIndex = 0;
         AddRow(editor, "Resolution", resolution);
         FlowLayoutPanel buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
@@ -182,12 +186,22 @@ internal sealed class RdpManager : UserControl
         if (site == null) { ClearFields(); return; }
         name.Text = site.Name; group.Text = site.Group; host.Text = site.Host; user.Text = site.User; domain.Text = site.Domain;
         password.Clear(); remember.Checked = !String.IsNullOrEmpty(site.ProtectedPassword);
+        windowsLogin.Checked = site.UseWindowsCredentials;
+        UpdateLoginFields();
         resolution.SelectedItem = Resolutions.Contains(site.Resolution) ? site.Resolution : Resolutions[0];
+    }
+
+    private void UpdateLoginFields()
+    {
+        if (windowsLogin.Checked) remember.Checked = false;
+        user.Enabled = domain.Enabled = password.Enabled = remember.Enabled = !windowsLogin.Checked;
+        if (windowsLogin.Checked) password.Clear();
     }
 
     private void ClearFields()
     {
-        name.Clear(); group.Clear(); host.Clear(); user.Clear(); domain.Clear(); password.Clear(); remember.Checked = false; resolution.SelectedIndex = 0;
+        name.Clear(); group.Clear(); host.Clear(); user.Clear(); domain.Clear(); password.Clear(); remember.Checked = false;
+        windowsLogin.Checked = false; UpdateLoginFields(); resolution.SelectedIndex = 0;
     }
 
     private void NewSite() { selected = null; tree.SelectedNode = null; ClearFields(); UpdateFavoriteButton(); name.Focus(); }
@@ -198,16 +212,17 @@ internal sealed class RdpManager : UserControl
         if (!Regex.IsMatch(server, @"^[A-Za-z0-9][A-Za-z0-9.\-]{0,252}$")) throw new InvalidOperationException("Enter a server hostname or IPv4 address without a port or path.");
         foreach (string value in new[] { user.Text, domain.Text })
             if (value.Any(c => Char.IsControl(c))) throw new InvalidOperationException("Username and domain cannot contain control characters.");
-        if (remember.Checked && String.IsNullOrWhiteSpace(user.Text)) throw new InvalidOperationException("Enter a username before saving a password.");
+        if (!windowsLogin.Checked && remember.Checked && String.IsNullOrWhiteSpace(user.Text)) throw new InvalidOperationException("Enter a username before saving a password.");
         bool sameIdentity = selected != null && selected.Host.Equals(server, StringComparison.OrdinalIgnoreCase) && selected.User == user.Text.Trim() && selected.Domain == domain.Text.Trim();
         string encrypted = "";
-        if (remember.Checked)
+        if (!windowsLogin.Checked && remember.Checked)
         {
             if (password.Text.Length > 0) encrypted = ProtectPassword(password.Text);
             else if (sameIdentity) encrypted = selected.ProtectedPassword;
         }
         return new RdpSiteProfile { Id = selected == null ? Guid.NewGuid().ToString("N") : selected.Id, Name = name.Text.Trim(), Group = group.Text.Trim(), Host = server,
             User = user.Text.Trim(), Domain = domain.Text.Trim(), Resolution = Convert.ToString(resolution.SelectedItem), ProtectedPassword = encrypted,
+            UseWindowsCredentials = windowsLogin.Checked,
             Favorite = selected != null && selected.Favorite };
     }
 
@@ -218,13 +233,14 @@ internal sealed class RdpManager : UserControl
         if (sites.Any(s => !Object.ReferenceEquals(s, selected) && s.Name.Equals(edited.Name, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("That site name already exists. Choose another name or select the existing site to edit it.");
         RdpSiteProfile previous = selected;
         int index = previous == null ? -1 : sites.IndexOf(previous);
-        if (previous != null && (previous.Host != edited.Host || previous.ProtectedPassword != edited.ProtectedPassword))
+        if (previous != null && (previous.Host != edited.Host || previous.ProtectedPassword != edited.ProtectedPassword ||
+            (!previous.UseWindowsCredentials && edited.UseWindowsCredentials)))
             RdpCredentials.RemoveIfOwned(previous);
         if (index < 0) sites.Add(edited); else sites[index] = edited;
         selected = edited;
         try { save(); }
         catch { if (index < 0) sites.Remove(edited); else sites[index] = previous; selected = previous; throw; }
-        if (remember.Checked && password.Text.Length > 0) RdpCredentials.Store(edited, true);
+        if (!edited.UseWindowsCredentials && remember.Checked && password.Text.Length > 0) RdpCredentials.Store(edited, true);
         if (!String.IsNullOrEmpty(folder)) WriteConnectionFile(edited, Screen.FromControl(this).WorkingArea.Size);
         if (activity != null) activity((index < 0 ? "Added site: " : "Updated site: ") + edited.Name);
         password.Clear(); Reload(); UpdateFavoriteButton();
@@ -259,7 +275,7 @@ internal sealed class RdpManager : UserControl
             path = Path.Combine(connections, "temporary-" + Guid.NewGuid().ToString("N") + ".rdp");
             File.WriteAllText(path, BuildRdpFile(connection, screen), Encoding.Unicode);
         }
-        if (persistent && !String.IsNullOrEmpty(connection.ProtectedPassword))
+        if (persistent && !connection.UseWindowsCredentials && !String.IsNullOrEmpty(connection.ProtectedPassword))
             RdpCredentials.Store(connection);
         try
         {
@@ -418,7 +434,7 @@ internal sealed class RdpManager : UserControl
     {
         StringBuilder text = new StringBuilder();
         text.AppendLine("full address:s:" + site.Host);
-        text.AppendLine("username:s:" + LoginName(site));
+        if (!site.UseWindowsCredentials) text.AppendLine("username:s:" + LoginName(site));
         text.AppendLine("screen mode id:i:" + (site.Resolution == "Full screen" ? "2" : "1"));
         Size size = screen;
         Match match = Regex.Match(site.Resolution ?? "", @"^(\d+) x (\d+)$");
@@ -428,7 +444,7 @@ internal sealed class RdpManager : UserControl
         text.AppendLine("authentication level:i:2"); text.AppendLine("enablecredsspsupport:i:1");
         text.AppendLine("prompt for credentials:i:0");
         text.AppendLine("redirectclipboard:i:1"); text.AppendLine("redirectprinters:i:0");
-        if (includePassword && !String.IsNullOrEmpty(site.ProtectedPassword))
+        if (includePassword && !site.UseWindowsCredentials && !String.IsNullOrEmpty(site.ProtectedPassword))
         {
             if (!Regex.IsMatch(site.ProtectedPassword, @"\A(?:[0-9A-F]{2})+\z")) throw new InvalidOperationException("The saved password is invalid. Enter it again and save the site.");
             text.AppendLine("password 51:b:" + site.ProtectedPassword);
@@ -529,6 +545,12 @@ internal sealed class RdpManager : UserControl
             if (office == manager.tree.Nodes.Cast<TreeNode>().First(node => node.Text == "Office") ||
                 manager.tree.Nodes.Cast<TreeNode>().First(node => node.Text == "Office").Nodes[0].Text != "Office server")
                 throw new InvalidOperationException("RDP alphabetical sorting failed.");
+            manager.windowsLogin.Checked = true; manager.SaveSite();
+            RdpSiteProfile windowsSite = data.First(item => item.Name == "Zebra site");
+            if (!windowsSite.UseWindowsCredentials || windowsSite.ProtectedPassword.Length != 0 ||
+                BuildRdpFile(windowsSite, new Size(1920, 1080)).Contains("username:s:") ||
+                !serializer.Deserialize<RdpSiteProfile>(serializer.Serialize(windowsSite)).UseWindowsCredentials)
+                throw new InvalidOperationException("Windows-saved RDP login mode was not persisted or still sent a toolkit username.");
         }
     }
 }
@@ -610,6 +632,24 @@ internal static class RdpCredentials
         string logon = DescribeType(site, WindowsLogonCredential, "Windows logon");
         string legacy = DescribeType(site, GenericCredential, "Generic");
         return logon + " " + legacy;
+    }
+
+    internal static string DescribeWindowsSavedLogin(RdpSiteProfile site)
+    {
+        IntPtr pointer;
+        if (!CredRead(Target(site), GenericCredential, 0, out pointer))
+        {
+            int error = Marshal.GetLastWin32Error();
+            return error == NotFound ? "No Windows-saved login found for this exact IP. Connect once in Windows Remote Desktop and check Remember me." :
+                "Windows-saved login could not be checked (error " + error + ").";
+        }
+        try
+        {
+            Credential stored = (Credential)Marshal.PtrToStructure(pointer, typeof(Credential));
+            return "Windows-saved login is present for this IP (account: " +
+                (stored.UserName ?? "").Replace("\r", "").Replace("\n", "") + ").";
+        }
+        finally { CredFree(pointer); }
     }
 
     private static bool HasOtherGenericCredential(RdpSiteProfile site)
@@ -776,10 +816,10 @@ internal static partial class RdpPolicyDiagnostics
         report.AppendLine("RDP SAVED-CREDENTIAL CHECK");
         report.AppendLine("Site: " + site.Name);
         report.AppendLine("Connection target: " + target);
-        report.AppendLine("Account sent to Remote Desktop: " + RdpManager.LoginName(site));
+        report.AppendLine("Account sent to Remote Desktop: " + (site.UseWindowsCredentials ? "Windows saved login (no username in RDP file)" : RdpManager.LoginName(site)));
         report.AppendLine("Signed-in Windows domain: " + Environment.UserDomainName);
         report.AppendLine("Connection by IP: " + (byIp ? "Yes; NTLM-only credential delegation may apply." : "No"));
-        report.AppendLine("Saved credential: " + RdpCredentials.Describe(site));
+        report.AppendLine("Saved credential: " + (site.UseWindowsCredentials ? RdpCredentials.DescribeWindowsSavedLogin(site) : RdpCredentials.Describe(site)));
         report.AppendLine("A matching saved credential only matches the toolkit profile; it does not prove the remote PC accepts that password.");
         report.AppendLine("If Windows saves a corrected password after a prompt, Connect keeps that Windows entry. Enter a new password and Save Site to replace it intentionally.");
         report.AppendLine("A missing NTLM-only policy entry alone does not explain a failed logon. Compare a working site.");
