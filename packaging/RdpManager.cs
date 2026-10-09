@@ -68,7 +68,7 @@ internal sealed class RdpManager : UserControl
         AddRow(editor, "Folder", group);
         AddRow(editor, "Server / IP", host);
         AddRow(editor, "Windows login", user);
-        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = @"Use the exact account shown by Windows Remote Desktop: DOMAIN\user or .\user for a local account." });
+        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = @"Use the exact account shown by Windows Remote Desktop: SERVERNAME\user for a site-local account, or DOMAIN\user for a domain account." });
         AddRow(editor, "Password", password);
         password.TextChanged += delegate { if (password.Text.Length > 0) remember.Checked = true; };
         AddRow(editor, "", remember);
@@ -199,7 +199,7 @@ internal sealed class RdpManager : UserControl
         if (user.Text.Any(c => Char.IsControl(c))) throw new InvalidOperationException("Windows login cannot contain control characters.");
         if (remember.Checked && String.IsNullOrWhiteSpace(user.Text)) throw new InvalidOperationException("Enter a Windows login before saving a password.");
         if (!String.IsNullOrWhiteSpace(user.Text) && !user.Text.Contains("\\") && !user.Text.Contains("@"))
-            throw new InvalidOperationException(@"Enter the complete Windows login, such as DOMAIN\user or .\user.");
+            throw new InvalidOperationException(@"Enter the complete Windows login, such as SERVERNAME\user or DOMAIN\user.");
         bool sameIdentity = selected != null && selected.Host.Equals(server, StringComparison.OrdinalIgnoreCase) &&
             String.Equals(LoginName(selected), user.Text.Trim(), StringComparison.OrdinalIgnoreCase);
         string encrypted = "";
