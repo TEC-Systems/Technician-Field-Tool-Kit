@@ -10,6 +10,9 @@ using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using System.Threading;
 using System.Runtime.InteropServices;
+using System.Net;
+using System.Net.Sockets;
+using Microsoft.Win32;
 using System.Web.Script.Serialization;
 
 internal sealed class RdpManager : UserControl
@@ -77,6 +80,7 @@ internal sealed class RdpManager : UserControl
         AddButton(buttons, "Delete", DeleteSite);
         AddButton(buttons, "Connect", Connect);
         favoriteButton = AddButton(buttons, "Add Favorite", ToggleFavorite);
+        AddButton(buttons, "Credential Help", ShowCredentialHelp);
         favoriteButton.Enabled = false;
         AddRow(editor, "", buttons);
         AddRow(editor, "", notice);
@@ -270,6 +274,33 @@ internal sealed class RdpManager : UserControl
         password.Clear();
     }
 
+    private void ShowCredentialHelp()
+    {
+        if (selected == null) throw new InvalidOperationException("Select a saved RDP site first.");
+        string report = RdpPolicyDiagnostics.Report(selected);
+        bool darkTheme = Parent != null && Parent.BackColor.GetBrightness() < 0.5f;
+        Color background = darkTheme ? Color.FromArgb(27, 36, 43) : Color.White;
+        Color foreground = darkTheme ? Color.FromArgb(235, 242, 246) : Color.FromArgb(20, 36, 57);
+        using (Form dialog = new Form { Text = "RDP Credential Help", StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(780, 600), MinimumSize = new Size(620, 440), BackColor = background, ForeColor = foreground,
+            Font = new Font("Segoe UI", 9f) })
+        {
+            TextBox text = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical, Text = report, BackColor = darkTheme ? Color.FromArgb(38, 50, 59) : Color.White,
+                ForeColor = foreground, Font = new Font("Consolas", 9f), WordWrap = true };
+            FlowLayoutPanel actions = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48, FlowDirection = FlowDirection.RightToLeft };
+            Button close = new Button { Text = "Close", Width = 110, Height = 32, DialogResult = DialogResult.OK };
+            Button copy = new Button { Text = "Copy for IT", Width = 120, Height = 32 };
+            copy.Click += delegate {
+                try { Clipboard.SetText(report); }
+                catch (Exception error) { MessageBox.Show(dialog, "Could not copy the report: " + error.Message, "RDP Credential Help", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            };
+            actions.Controls.Add(close); actions.Controls.Add(copy);
+            dialog.Controls.Add(text); dialog.Controls.Add(actions);
+            dialog.AcceptButton = close; dialog.ShowDialog(this);
+        }
+    }
+
     public void OpenSavedSite(string id)
     {
         RdpSiteProfile site = sites.FirstOrDefault(item => item.Id == id);
@@ -425,6 +456,10 @@ internal sealed class RdpManager : UserControl
             if (LoginName(new RdpSiteProfile { User = "localuser" }) != @".\localuser" ||
                 LoginName(new RdpSiteProfile { User = @"OTHER\admin" }) != @"OTHER\admin")
                 throw new InvalidOperationException("RDP local and qualified account names failed.");
+            string policyReport = RdpPolicyDiagnostics.Report(site);
+            if (!policyReport.Contains("TERMSRV/192.0.2.10") ||
+                policyReport.Contains("self-test-password") || policyReport.Contains(site.ProtectedPassword))
+                throw new InvalidOperationException("RDP policy report omitted the target or exposed a password.");
             manager.SaveSite(); if (data[0].Id != site.Id || data[0].ProtectedPassword != site.ProtectedPassword) throw new InvalidOperationException("RDP saved password was lost on edit.");
             manager.host.Text = "192.0.2.11"; manager.SaveSite();
             if (data[0].ProtectedPassword.Length != 0) throw new InvalidOperationException("RDP credentials carried over to a different server.");
@@ -488,6 +523,26 @@ internal static class RdpCredentials
     private static string Target(RdpSiteProfile site) { return "TERMSRV/" + site.Host; }
     private static string Owner(RdpSiteProfile site) { return "TEC Systems Field Toolkit site " + site.Id; }
 
+    internal static string Describe(RdpSiteProfile site)
+    {
+        if (String.IsNullOrEmpty(site.ProtectedPassword)) return "No password is saved for this site in the toolkit.";
+        IntPtr pointer;
+        if (!CredRead(Target(site), GenericCredential, 0, out pointer))
+        {
+            int error = Marshal.GetLastWin32Error();
+            return error == NotFound ? "No Windows Credential Manager entry found yet. Connect from the toolkit to register the saved password." :
+                "Windows Credential Manager could not be checked (error " + error + ").";
+        }
+        try
+        {
+            Credential stored = (Credential)Marshal.PtrToStructure(pointer, typeof(Credential));
+            return String.Equals(stored.Comment, Owner(site), StringComparison.Ordinal) ?
+                "A toolkit credential is registered for this IP and Windows user." :
+                "A different Windows credential is registered for this IP. Connecting from the toolkit will update it.";
+        }
+        finally { CredFree(pointer); }
+    }
+
     internal static void Store(RdpSiteProfile site)
     {
         byte[] plain = RdpManager.UnprotectPassword(site.ProtectedPassword);
@@ -526,5 +581,83 @@ internal static class RdpCredentials
         finally { CredFree(pointer); }
         if (owned && !CredDelete(Target(site), GenericCredential, 0))
             throw new InvalidOperationException("Windows Credential Manager could not remove the old RDP credential (error " + Marshal.GetLastWin32Error() + ").");
+    }
+}
+
+internal static class RdpPolicyDiagnostics
+{
+    private const string DelegationPath = @"SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation";
+    private const string TerminalServicesPath = @"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services";
+
+    private static int? ReadFlag(RegistryKey root, string path, string name)
+    {
+        using (RegistryKey key = root.OpenSubKey(path))
+        {
+            object value = key == null ? null : key.GetValue(name);
+            if (value == null) return null;
+            try { return Convert.ToInt32(value); }
+            catch (FormatException) { return null; }
+        }
+    }
+
+    private static string[] ReadTargets(RegistryKey root, string path)
+    {
+        using (RegistryKey key = root.OpenSubKey(path))
+            return key == null ? new string[0] : key.GetValueNames().Select(name => Convert.ToString(key.GetValue(name)))
+                .Where(value => !String.IsNullOrWhiteSpace(value)).ToArray();
+    }
+
+    private static bool MatchesTarget(string rule, string target)
+    {
+        rule = (rule ?? "").Trim();
+        if (rule.EndsWith("*", StringComparison.Ordinal))
+            return target.StartsWith(rule.Substring(0, rule.Length - 1), StringComparison.OrdinalIgnoreCase);
+        return String.Equals(rule, target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static string Report(RdpSiteProfile site)
+    {
+        string target = "TERMSRV/" + site.Host;
+        IPAddress address;
+        bool byIp = IPAddress.TryParse(site.Host, out address) && address.AddressFamily == AddressFamily.InterNetwork;
+        StringBuilder report = new StringBuilder();
+        report.AppendLine("RDP SAVED-CREDENTIAL CHECK");
+        report.AppendLine("Site: " + site.Name);
+        report.AppendLine("Connection target: " + target);
+        report.AppendLine("Account sent to Remote Desktop: " + RdpManager.LoginName(site));
+        report.AppendLine("Signed-in Windows domain: " + Environment.UserDomainName);
+        report.AppendLine("Connection by IP: " + (byIp ? "Yes; NTLM-only credential delegation may apply." : "No"));
+        report.AppendLine("Saved credential: " + RdpCredentials.Describe(site));
+        report.AppendLine();
+        report.AppendLine("APPLIED CLIENT POLICY (read-only)");
+        try
+        {
+            using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine,
+                Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Default))
+            {
+                int? allowed = ReadFlag(root, DelegationPath, "AllowSavedCredentialsWhenNTLMOnly");
+                string[] allowedTargets = ReadTargets(root, DelegationPath + @"\AllowSavedCredentialsWhenNTLMOnly");
+                int? denied = ReadFlag(root, DelegationPath, "DenySavedCredentialsWhenNTLMOnly");
+                string[] deniedTargets = ReadTargets(root, DelegationPath + @"\DenySavedCredentialsWhenNTLMOnly");
+                int? blockedSaving = ReadFlag(root, TerminalServicesPath, "DisablePasswordSaving");
+                report.AppendLine("NTLM-only saved credential delegation: " + (allowed == 1 ? "Enabled" : allowed == 0 ? "Disabled" : "No explicit setting found"));
+                report.AppendLine("Exact target listed: " + (allowedTargets.Any(rule => String.Equals(rule.Trim(), target, StringComparison.OrdinalIgnoreCase)) ? "Yes" : "No"));
+                report.AppendLine("Matching allow rule: " + (allowed == 1 && allowedTargets.Any(rule => MatchesTarget(rule, target)) ? "Yes" : "No"));
+                report.AppendLine("Matching deny rule: " + (denied == 1 && deniedTargets.Any(rule => MatchesTarget(rule, target)) ? "Yes - ask IT to review" : "No explicit match found"));
+                report.AppendLine("Password saving blocked by client policy: " + (blockedSaving == 1 ? "Yes - ask IT to review" : "No explicit block found"));
+            }
+        }
+        catch (Exception error) { report.AppendLine("Policy could not be read: " + error.Message); }
+        report.AppendLine();
+        report.AppendLine("REQUEST FOR COMPANY IT");
+        report.AppendLine("For this approved site, review the domain Group Policy at:");
+        report.AppendLine("Computer Configuration > Administrative Templates > System > Credentials Delegation");
+        report.AppendLine("  Allow delegating saved credentials with NTLM-only server authentication");
+        report.AppendLine("  Approved target: " + target);
+        report.AppendLine("Also review 'Do not allow passwords to be saved' on the laptop and");
+        report.AppendLine("'Always prompt for password upon connection' on the remote PC.");
+        report.AppendLine("A domain policy can replace a local registry setting. This tool changes no policy.");
+        report.AppendLine("No password or credential secret is included in this report.");
+        return report.ToString();
     }
 }
