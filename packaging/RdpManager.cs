@@ -473,8 +473,8 @@ internal sealed class RdpManager : UserControl
             try
             {
                 RdpCredentials.Store(credentialTest);
-                if (!RdpCredentials.Describe(credentialTest).Contains("Windows logon credential: toolkit entry matches the saved account and password."))
-                    throw new InvalidOperationException("Windows logon credential did not survive read-back.");
+                if (!RdpCredentials.Describe(credentialTest).Contains("Generic credential: toolkit entry matches the saved account and password."))
+                    throw new InvalidOperationException("RDP credential did not survive read-back.");
             }
             finally { RdpCredentials.RemoveIfOwned(credentialTest); }
             JavaScriptSerializer serializer = new JavaScriptSerializer();
@@ -607,12 +607,12 @@ internal static class RdpCredentials
         {
             blob = Marshal.AllocHGlobal(plain.Length);
             Marshal.Copy(plain, 0, blob, plain.Length);
-            Credential credential = new Credential { Type = WindowsLogonCredential, TargetName = Target(site), Comment = Owner(site),
+            Credential credential = new Credential { Type = GenericCredential, TargetName = Target(site), Comment = Owner(site),
                 CredentialBlobSize = plain.Length, CredentialBlob = blob, Persist = LocalMachinePersistence,
                 UserName = RdpManager.LoginName(site) };
             if (!CredWrite(ref credential, 0))
                 throw new InvalidOperationException("Windows Credential Manager could not save this RDP password (error " + Marshal.GetLastWin32Error() + "). Enter the password again and save the site.");
-            RemoveIfOwned(site, GenericCredential);
+            RemoveIfOwned(site, WindowsLogonCredential);
         }
         finally
         {
