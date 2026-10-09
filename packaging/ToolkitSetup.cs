@@ -74,12 +74,11 @@ internal static class ToolkitSetup
                 {
                     using (Process previous = Process.GetProcessById(previousProcessId))
                     {
-                        if (!previous.WaitForExit(15000))
-                            throw new IOException("The toolkit did not exit in time. Use the TEC notification-area icon to exit it, then run Setup again.");
+                        previous.WaitForExit(15000);
                     }
                 }
                 catch (ArgumentException) { /* The toolkit already exited. */ }
-                InstallPayload(null);
+                InstallPayload(null, false);
                 Process.Start(Path.Combine(InstallFolder, ExeName), "/updated");
                 return 0;
             }
@@ -125,7 +124,7 @@ internal static class ToolkitSetup
             ForeColor = System.Drawing.Color.DimGray
         };
         Label exitSteps = new Label {
-            Text = automaticUpdate ? "The toolkit has exited automatically. Continue with the update below; your saved profiles and logs will remain." : updating ? "Before updating: click the notification-area arrow near the clock, right-click the TEC icon, then choose Exit Toolkit. Closing the window only hides it." : "Closing the toolkit window keeps it in the notification area. To close it fully, right-click the TEC icon and choose Exit Toolkit.",
+            Text = automaticUpdate ? "Setup will close the toolkit and update it. Your saved profiles and logs will remain." : updating ? "Click Update. If the toolkit is still running, Setup will ask to close it before replacing the files. Saved profiles and logs will remain." : "Closing the toolkit window keeps it in the notification area. To close it fully, right-click the TEC icon and choose Exit Toolkit.",
             Left = 30, Top = 181, Width = 475, Height = 50,
             ForeColor = System.Drawing.Color.FromArgb(60, 70, 83)
         };
@@ -148,12 +147,13 @@ internal static class ToolkitSetup
         install.Click += (sender, e) => {
              install.Enabled = false;
              try {
-                InstallPayload(desktop.Checked);
+                InstallPayload(desktop.Checked, true);
                 MessageBox.Show(updating ? "Successfully updated to version " + PayloadVersion() + "." :
                     "The toolkit is installed and ready.", ProductName, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 if (launch.Checked) Process.Start(Path.Combine(InstallFolder, ExeName));
                 form.Close();
             }
+            catch (OperationCanceledException) { install.Enabled = true; }
             catch (Exception error) {
                 MessageBox.Show(error.Message, ProductName + " Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 install.Enabled = true;
@@ -185,10 +185,9 @@ internal static class ToolkitSetup
         catch (ArgumentException) { /* The parent already exited. */ }
     }
 
-    private static void InstallPayload(bool? desktopShortcut)
+    private static void InstallPayload(bool? desktopShortcut, bool confirmStop)
     {
-        if (IsInstalledToolkitRunning())
-            throw new IOException("The installed toolkit is still running on this laptop. Click the notification-area arrow near the clock, right-click the TEC icon, choose Exit Toolkit, then try again. Closing the window alone is not enough.");
+        StopInstalledToolkit(confirmStop);
         ExtractPayload(InstallFolder);
         string legacyScript = Path.Combine(InstallFolder, "TEC-Systems-FieldToolkit.ps1");
         if (File.Exists(legacyScript)) File.Delete(legacyScript);
@@ -224,6 +223,37 @@ internal static class ToolkitSetup
             }
         }
         return false;
+    }
+
+    private static void StopInstalledToolkit(bool confirm)
+    {
+        if (!IsInstalledToolkitRunning()) return;
+        if (confirm && MessageBox.Show("The toolkit is still running. Close it now and continue the update? Saved profiles and settings will remain.",
+            ProductName + " Setup", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            throw new OperationCanceledException();
+        string installedExe = Path.Combine(InstallFolder, ExeName);
+        foreach (Process process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(ExeName)))
+        {
+            using (process)
+            {
+                string path;
+                try { path = process.MainModule.FileName; }
+                catch (InvalidOperationException) { continue; }
+                catch (System.ComponentModel.Win32Exception) { continue; }
+                if (!String.Equals(path, installedExe, StringComparison.OrdinalIgnoreCase)) continue;
+                try
+                {
+                    // Older toolkit versions hide on window close, so use a bounded wait before stopping the exact installed process.
+                    process.CloseMainWindow();
+                    if (!process.WaitForExit(2000)) process.Kill();
+                    if (!process.WaitForExit(10000))
+                        throw new IOException("The toolkit could not be stopped. Exit it from the notification-area icon and retry setup.");
+                }
+                catch (InvalidOperationException) { /* The process exited during the check. */ }
+            }
+        }
+        if (IsInstalledToolkitRunning())
+            throw new IOException("The toolkit is still running after the close attempt. Exit it from the notification-area icon and retry setup.");
     }
 
     private static string StartShortcut {
