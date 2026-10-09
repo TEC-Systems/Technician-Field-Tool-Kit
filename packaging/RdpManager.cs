@@ -69,7 +69,7 @@ internal sealed class RdpManager : UserControl
         AddRow(editor, "Server / IP", host);
         AddRow(editor, "Username", user);
         AddRow(editor, "Domain", domain);
-        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = "For a site-local account, enter the remote PC name in Domain. Enter only the IP address in Server / IP." });
+        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = "If Windows asks for the password again on a site-local account, enter the remote PC name in Domain. Keep only the IP in Server / IP." });
         AddRow(editor, "Password", password);
         password.TextChanged += delegate { if (password.Text.Length > 0) remember.Checked = true; };
         AddRow(editor, "", remember);
@@ -81,7 +81,7 @@ internal sealed class RdpManager : UserControl
         AddButton(buttons, "Delete", DeleteSite);
         AddButton(buttons, "Connect", Connect);
         favoriteButton = AddButton(buttons, "Add Favorite", ToggleFavorite);
-        AddButton(buttons, "Troubleshoot Login", ShowCredentialHelp);
+        AddButton(buttons, "Password Help", ShowCredentialHelp);
         favoriteButton.Enabled = false;
         AddRow(editor, "", buttons);
         AddRow(editor, "", notice);
@@ -293,14 +293,27 @@ internal sealed class RdpManager : UserControl
         }
         catch { if (!persistent) File.Delete(path); throw; }
         if (activity != null) activity("Opened connection: " + connection.Name);
+        notice.Text = "Opened " + connection.Name + ". " + PasswordPromptHint(connection);
         password.Clear();
+    }
+
+    private static string PasswordPromptHint(RdpSiteProfile site)
+    {
+        if (RdpPolicyDiagnostics.IsExactIpv4(site.Host))
+            return "If Windows asks for the password again, enter the remote PC name in Domain for a site-local account, then Save Site and reconnect. Keep only the IP in Server / IP.";
+        return "If Windows asks for the password again, check the Username and Domain, then Save Site and reconnect.";
+    }
+
+    private static string PasswordHelpReport(RdpSiteProfile site)
+    {
+        return "PASSWORD PROMPT HELP\r\n" + PasswordPromptHint(site) + "\r\n\r\n" + RdpPolicyDiagnostics.Report(site);
     }
 
     private void ShowCredentialHelp()
     {
         if (selected == null) throw new InvalidOperationException("Select a saved RDP site first.");
         RdpSiteProfile site = selected;
-        string report = RdpPolicyDiagnostics.Report(site);
+        string report = PasswordHelpReport(site);
         bool darkTheme = Parent != null && Parent.BackColor.GetBrightness() < 0.5f;
         Color background = darkTheme ? Color.FromArgb(27, 36, 43) : Color.White;
         Color foreground = darkTheme ? Color.FromArgb(235, 242, 246) : Color.FromArgb(20, 36, 57);
@@ -322,7 +335,7 @@ internal sealed class RdpManager : UserControl
             Button apply = new Button { Text = "Allow this IP", Width = 120, Height = 32 };
             Button undo = new Button { Text = "Undo local rule", Width = 120, Height = 32 };
             Button clear = new Button { Text = "Clear conflicting login", Width = 155, Height = 32 };
-            refresh.Click += delegate { text.Text = RdpPolicyDiagnostics.Report(site); clear.Enabled = RdpCredentials.HasConflictingWindowsLogon(site); };
+            refresh.Click += delegate { text.Text = PasswordHelpReport(site); clear.Enabled = RdpCredentials.HasConflictingWindowsLogon(site); };
             bool supported = RdpPolicyDiagnostics.IsExactIpv4(site.Host);
             apply.Enabled = undo.Enabled = supported;
             clear.Enabled = RdpCredentials.HasConflictingWindowsLogon(site);
@@ -337,7 +350,7 @@ internal sealed class RdpManager : UserControl
                 {
                     RdpCredentials.RemoveConflictingWindowsLogon(site);
                     if (activity != null) activity("Cleared conflicting RDP login: " + site.Name);
-                    text.Text = RdpPolicyDiagnostics.Report(site);
+                    text.Text = PasswordHelpReport(site);
                     clear.Enabled = RdpCredentials.HasConflictingWindowsLogon(site);
                     MessageBox.Show(dialog, "The conflicting Windows logon was removed. Close existing Remote Desktop windows, then connect to this site again.",
                         "RDP Login Help", MessageBoxButtons.OK, MessageBoxIcon.Information);
