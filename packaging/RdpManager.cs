@@ -224,6 +224,7 @@ internal sealed class RdpManager : UserControl
         selected = edited;
         try { save(); }
         catch { if (index < 0) sites.Remove(edited); else sites[index] = previous; selected = previous; throw; }
+        if (remember.Checked && password.Text.Length > 0) RdpCredentials.Store(edited, true);
         if (!String.IsNullOrEmpty(folder)) WriteConnectionFile(edited, Screen.FromControl(this).WorkingArea.Size);
         if (activity != null) activity((index < 0 ? "Added site: " : "Updated site: ") + edited.Name);
         password.Clear(); Reload(); UpdateFavoriteButton();
@@ -495,6 +496,7 @@ internal sealed class RdpManager : UserControl
                     throw new InvalidOperationException("RDP credential did not survive read-back.");
             }
             finally { RdpCredentials.RemoveIfOwned(credentialTest); }
+            RdpCredentials.SelfTestPreserveWindowsEntry();
             JavaScriptSerializer serializer = new JavaScriptSerializer();
             RdpSiteProfile restored = serializer.Deserialize<RdpSiteProfile>(serializer.Serialize(site));
             if (restored.Id != site.Id || restored.Host != site.Host || restored.Group != "Office" || restored.Resolution != "1280 x 720" || restored.ProtectedPassword != site.ProtectedPassword || !restored.Favorite)
@@ -573,12 +575,58 @@ internal static class RdpCredentials
     private static string Target(RdpSiteProfile site) { return "TERMSRV/" + site.Host; }
     private static string Owner(RdpSiteProfile site) { return "TEC Systems Field Toolkit site " + site.Id; }
 
+    internal static void SelfTestPreserveWindowsEntry()
+    {
+        RdpSiteProfile site = new RdpSiteProfile { Id = Guid.NewGuid().ToString("N"),
+            Host = "selftest-" + Guid.NewGuid().ToString("N") + ".invalid", User = "selftest",
+            ProtectedPassword = RdpManager.ProtectPassword("toolkit-password") };
+        byte[] otherPassword = Encoding.Unicode.GetBytes("windows-password");
+        IntPtr blob = Marshal.AllocHGlobal(otherPassword.Length);
+        try
+        {
+            Marshal.Copy(otherPassword, 0, blob, otherPassword.Length);
+            Credential other = new Credential { Type = GenericCredential, TargetName = Target(site),
+                Comment = "Windows Remote Desktop", CredentialBlobSize = otherPassword.Length,
+                CredentialBlob = blob, Persist = LocalMachinePersistence, UserName = RdpManager.LoginName(site) };
+            if (!CredWrite(ref other, 0)) throw new InvalidOperationException("Could not create a temporary Windows credential for the RDP self-test.");
+            Store(site);
+            if (!HasOtherGenericCredential(site)) throw new InvalidOperationException("Connect overwrote a Windows-saved RDP credential.");
+            Store(site, true);
+            if (!Describe(site).Contains("Generic credential: toolkit entry matches the saved account and password."))
+                throw new InvalidOperationException("Save Site did not replace the Windows RDP credential.");
+        }
+        finally
+        {
+            CredDelete(Target(site), GenericCredential, 0);
+            Marshal.Copy(new byte[otherPassword.Length], 0, blob, otherPassword.Length);
+            Marshal.FreeHGlobal(blob);
+            Array.Clear(otherPassword, 0, otherPassword.Length);
+        }
+    }
+
     internal static string Describe(RdpSiteProfile site)
     {
         if (String.IsNullOrEmpty(site.ProtectedPassword)) return "No password is saved for this site in the toolkit.";
         string logon = DescribeType(site, WindowsLogonCredential, "Windows logon");
         string legacy = DescribeType(site, GenericCredential, "Generic");
         return logon + " " + legacy;
+    }
+
+    private static bool HasOtherGenericCredential(RdpSiteProfile site)
+    {
+        IntPtr pointer;
+        if (!CredRead(Target(site), GenericCredential, 0, out pointer))
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == NotFound) return false;
+            throw new InvalidOperationException("Windows Credential Manager could not check this RDP entry (error " + error + ").");
+        }
+        try
+        {
+            Credential stored = (Credential)Marshal.PtrToStructure(pointer, typeof(Credential));
+            return !String.Equals(stored.Comment, Owner(site), StringComparison.Ordinal);
+        }
+        finally { CredFree(pointer); }
     }
 
     internal static bool HasConflictingWindowsLogon(RdpSiteProfile site)
@@ -637,8 +685,11 @@ internal static class RdpCredentials
         finally { CredFree(pointer); }
     }
 
-    internal static void Store(RdpSiteProfile site)
+    internal static void Store(RdpSiteProfile site, bool replaceWindowsCredential = false)
     {
+        // MSTSC may save the password entered after a failed logon. Keep that Windows entry
+        // unless the technician explicitly enters a new password and saves this site.
+        if (!replaceWindowsCredential && HasOtherGenericCredential(site)) return;
         byte[] plain = RdpManager.UnprotectPassword(site.ProtectedPassword);
         IntPtr blob = IntPtr.Zero;
         try
@@ -729,6 +780,8 @@ internal static partial class RdpPolicyDiagnostics
         report.AppendLine("Signed-in Windows domain: " + Environment.UserDomainName);
         report.AppendLine("Connection by IP: " + (byIp ? "Yes; NTLM-only credential delegation may apply." : "No"));
         report.AppendLine("Saved credential: " + RdpCredentials.Describe(site));
+        report.AppendLine("A matching saved credential only matches the toolkit profile; it does not prove the remote PC accepts that password.");
+        report.AppendLine("If Windows saves a corrected password after a prompt, Connect keeps that Windows entry. Enter a new password and Save Site to replace it intentionally.");
         report.AppendLine("A missing NTLM-only policy entry alone does not explain a failed logon. Compare a working site.");
         report.AppendLine();
         report.AppendLine("APPLIED CLIENT POLICY (read-only)");
