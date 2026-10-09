@@ -25,7 +25,7 @@ internal sealed class RdpManager : UserControl
     private readonly TreeView tree = new TreeView { Dock = DockStyle.Fill, HideSelection = false };
     private readonly TextBox search = new TextBox { Dock = DockStyle.Fill };
     private readonly ComboBox sort = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
-    private readonly TextBox name = new TextBox(), group = new TextBox(), host = new TextBox(), user = new TextBox();
+    private readonly TextBox name = new TextBox(), group = new TextBox(), host = new TextBox(), user = new TextBox(), domain = new TextBox();
     private readonly TextBox password = new TextBox { UseSystemPasswordChar = true };
     private readonly CheckBox remember = new CheckBox { Text = "Save password for this Windows user", AutoSize = true };
     private readonly ComboBox resolution = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
@@ -68,7 +68,8 @@ internal sealed class RdpManager : UserControl
         AddRow(editor, "Folder", group);
         AddRow(editor, "Server / IP", host);
         AddRow(editor, "Username", user);
-        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = @"For a site-local account, enter SERVERNAME\username. Use the account that works in Remote Desktop." });
+        AddRow(editor, "Domain", domain);
+        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = "For a site-local account, enter the remote PC name in Domain. Enter only the IP address in Server / IP." });
         AddRow(editor, "Password", password);
         password.TextChanged += delegate { if (password.Text.Length > 0) remember.Checked = true; };
         AddRow(editor, "", remember);
@@ -180,14 +181,21 @@ internal sealed class RdpManager : UserControl
         selected = site;
         UpdateFavoriteButton();
         if (site == null) { ClearFields(); return; }
-        name.Text = site.Name; group.Text = site.Group; host.Text = site.Host; user.Text = LoginName(site);
+        name.Text = site.Name; group.Text = site.Group; host.Text = site.Host;
+        int separator = site.User.IndexOf('\\');
+        if (separator > 0 && separator < site.User.Length - 1)
+        {
+            domain.Text = site.User.Substring(0, separator);
+            user.Text = site.User.Substring(separator + 1);
+        }
+        else { user.Text = site.User; domain.Text = site.Domain; }
         password.Clear(); remember.Checked = !String.IsNullOrEmpty(site.ProtectedPassword);
         resolution.SelectedItem = Resolutions.Contains(site.Resolution) ? site.Resolution : Resolutions[0];
     }
 
     private void ClearFields()
     {
-        name.Clear(); group.Clear(); host.Clear(); user.Clear(); password.Clear(); remember.Checked = false; resolution.SelectedIndex = 0;
+        name.Clear(); group.Clear(); host.Clear(); user.Clear(); domain.Clear(); password.Clear(); remember.Checked = false; resolution.SelectedIndex = 0;
     }
 
     private void NewSite() { selected = null; tree.SelectedNode = null; ClearFields(); UpdateFavoriteButton(); name.Focus(); }
@@ -195,13 +203,20 @@ internal sealed class RdpManager : UserControl
     private RdpSiteProfile ReadFields()
     {
         string server = host.Text.Trim();
+        if (server.Contains("\\")) throw new InvalidOperationException("Enter only the IP address or host in Server / IP. Put the remote PC name in Domain for a site-local account.");
         if (!Regex.IsMatch(server, @"^[A-Za-z0-9][A-Za-z0-9.\-]{0,252}$")) throw new InvalidOperationException("Enter a server hostname or IPv4 address without a port or path.");
-        if (user.Text.Any(c => Char.IsControl(c))) throw new InvalidOperationException("Windows login cannot contain control characters.");
-        if (remember.Checked && String.IsNullOrWhiteSpace(user.Text)) throw new InvalidOperationException("Enter a Windows login before saving a password.");
-        if (!String.IsNullOrWhiteSpace(user.Text) && !user.Text.Contains("\\") && !user.Text.Contains("@"))
-            throw new InvalidOperationException(@"Enter the complete username, such as SERVERNAME\user or DOMAIN\user.");
+        if (new[] { user.Text, domain.Text }.Any(value => value.Any(c => Char.IsControl(c)))) throw new InvalidOperationException("Username and Domain cannot contain control characters.");
+        if (remember.Checked && String.IsNullOrWhiteSpace(user.Text)) throw new InvalidOperationException("Enter a username before saving a password.");
+        string loginUser = user.Text.Trim(), loginDomain = domain.Text.Trim();
+        int separator = loginUser.IndexOf('\\');
+        if (separator > 0 && separator < loginUser.Length - 1)
+        {
+            loginDomain = loginUser.Substring(0, separator);
+            loginUser = loginUser.Substring(separator + 1);
+        }
+        RdpSiteProfile account = new RdpSiteProfile { User = loginUser, Domain = loginDomain };
         bool sameIdentity = selected != null && selected.Host.Equals(server, StringComparison.OrdinalIgnoreCase) &&
-            String.Equals(LoginName(selected), user.Text.Trim(), StringComparison.OrdinalIgnoreCase);
+            String.Equals(LoginName(selected), LoginName(account), StringComparison.OrdinalIgnoreCase);
         string encrypted = "";
         if (remember.Checked)
         {
@@ -209,7 +224,7 @@ internal sealed class RdpManager : UserControl
             else if (sameIdentity) encrypted = selected.ProtectedPassword;
         }
         return new RdpSiteProfile { Id = selected == null ? Guid.NewGuid().ToString("N") : selected.Id, Name = name.Text.Trim(), Group = group.Text.Trim(), Host = server,
-            User = user.Text.Trim(), Domain = "", Resolution = Convert.ToString(resolution.SelectedItem), ProtectedPassword = encrypted,
+            User = loginUser, Domain = loginDomain, Resolution = Convert.ToString(resolution.SelectedItem), ProtectedPassword = encrypted,
             Favorite = selected != null && selected.Favorite };
     }
 
@@ -229,7 +244,7 @@ internal sealed class RdpManager : UserControl
         if (remember.Checked && password.Text.Length > 0) RdpCredentials.Store(edited, true);
         if (!String.IsNullOrEmpty(folder)) WriteConnectionFile(edited, Screen.FromControl(this).WorkingArea.Size);
         if (activity != null) activity((index < 0 ? "Added site: " : "Updated site: ") + edited.Name);
-        user.Text = LoginName(edited);
+        user.Text = edited.User; domain.Text = edited.Domain;
         password.Clear(); remember.Checked = !String.IsNullOrEmpty(edited.ProtectedPassword);
         Reload(); UpdateFavoriteButton();
         notice.Text = "Saved " + edited.Name + " with username " + LoginName(edited) + ". " +
@@ -469,13 +484,21 @@ internal sealed class RdpManager : UserControl
             manager.ToggleFavorite();
             if (!site.Favorite || manager.tree.Nodes[0].Text != "★ Favorites" || saves != 2)
                 throw new InvalidOperationException("RDP favorite was not saved or shown first.");
-            site.User = "technician"; site.Domain = "TEC";
+            site.User = @"TEC\technician"; site.Domain = "";
             manager.LoadSite(site);
-            if (manager.user.Text != @"TEC\technician") throw new InvalidOperationException("Legacy RDP domain login was not shown in full.");
+            if (manager.user.Text != "technician" || manager.domain.Text != "TEC")
+                throw new InvalidOperationException("Qualified RDP login was not split into Username and Domain.");
             manager.SaveSite();
-            if (data[0].ProtectedPassword != site.ProtectedPassword || data[0].User != @"TEC\technician")
-                throw new InvalidOperationException("Legacy RDP login or password was lost when saved.");
+            if (data[0].ProtectedPassword != site.ProtectedPassword || data[0].User != "technician" || data[0].Domain != "TEC")
+                throw new InvalidOperationException("RDP login or password was lost when saved.");
             site = data[0];
+            manager.host.Text = @"TEC\192.0.2.10";
+            try { manager.ReadFields(); throw new InvalidOperationException("RDP server accepted a username prefix."); }
+            catch (InvalidOperationException error)
+            {
+                if (!error.Message.Contains("remote PC name in Domain")) throw;
+            }
+            manager.host.Text = site.Host;
             string temporaryFolder = Path.Combine(Path.GetTempPath(), "TEC-Rdp-Test-" + Guid.NewGuid().ToString("N"));
             try
             {
