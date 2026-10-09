@@ -88,6 +88,8 @@ internal static class NativeToolkit
                 return 0;
             }
             if (args.Length > 0 && args[0] == "/activate") return RestoreExisting() ? 0 : 1;
+            if (args.Length == 3 && args[0] == "/rdp-policy")
+                return RdpPolicyDiagnostics.RunElevated(args[1], args[2]);
             if (args.Length == 2 && args[0] == "/wait-for-exit")
             {
                 int previousId;

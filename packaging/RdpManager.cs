@@ -277,7 +277,8 @@ internal sealed class RdpManager : UserControl
     private void ShowCredentialHelp()
     {
         if (selected == null) throw new InvalidOperationException("Select a saved RDP site first.");
-        string report = RdpPolicyDiagnostics.Report(selected);
+        RdpSiteProfile site = selected;
+        string report = RdpPolicyDiagnostics.Report(site);
         bool darkTheme = Parent != null && Parent.BackColor.GetBrightness() < 0.5f;
         Color background = darkTheme ? Color.FromArgb(27, 36, 43) : Color.White;
         Color foreground = darkTheme ? Color.FromArgb(235, 242, 246) : Color.FromArgb(20, 36, 57);
@@ -292,12 +293,37 @@ internal sealed class RdpManager : UserControl
             Button close = new Button { Text = "Close", Width = 110, Height = 32, DialogResult = DialogResult.OK };
             Button copy = new Button { Text = "Copy for IT", Width = 120, Height = 32 };
             copy.Click += delegate {
-                try { Clipboard.SetText(report); }
+                try { Clipboard.SetText(text.Text); }
                 catch (Exception error) { MessageBox.Show(dialog, "Could not copy the report: " + error.Message, "RDP Credential Help", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
             };
-            actions.Controls.Add(close); actions.Controls.Add(copy);
+            Button refresh = new Button { Text = "Refresh report", Width = 120, Height = 32 };
+            refresh.Click += delegate { text.Text = RdpPolicyDiagnostics.Report(site); };
+            Button apply = new Button { Text = "Allow this IP", Width = 120, Height = 32 };
+            Button undo = new Button { Text = "Undo local rule", Width = 120, Height = 32 };
+            bool supported = RdpPolicyDiagnostics.IsExactIpv4(site.Host);
+            apply.Enabled = undo.Enabled = supported;
+            apply.Click += delegate { StartPolicyHelper(dialog, "apply", site.Host); };
+            undo.Click += delegate { StartPolicyHelper(dialog, "undo", site.Host); };
+            actions.Controls.Add(close); actions.Controls.Add(copy); actions.Controls.Add(refresh);
+            actions.Controls.Add(undo); actions.Controls.Add(apply);
             dialog.Controls.Add(text); dialog.Controls.Add(actions);
             dialog.AcceptButton = close; dialog.ShowDialog(this);
+        }
+    }
+
+    private static void StartPolicyHelper(Form owner, string operation, string ip)
+    {
+        string action = operation == "apply" ? "allow saved RDP credentials for TERMSRV/" + ip : "remove the local rule created for TERMSRV/" + ip;
+        if (MessageBox.Show(owner, "This will " + action + " on this computer. Administrator approval is required. A company Group Policy may replace local settings. Continue?",
+            "RDP Credential Policy", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo(Application.ExecutablePath, "/rdp-policy " + operation + " " + ip)
+                { UseShellExecute = true, Verb = "runas" });
+        }
+        catch (System.ComponentModel.Win32Exception error)
+        {
+            if (error.NativeErrorCode != 1223) MessageBox.Show(owner, error.Message, "RDP Credential Policy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -621,7 +647,7 @@ internal static class RdpCredentials
     }
 }
 
-internal static class RdpPolicyDiagnostics
+internal static partial class RdpPolicyDiagnostics
 {
     private const string DelegationPath = @"SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation";
     private const string TerminalServicesPath = @"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services";
@@ -673,11 +699,18 @@ internal static class RdpPolicyDiagnostics
             using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine,
                 Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Default))
             {
+                int? standard = ReadFlag(root, DelegationPath, "AllowSavedCredentials");
+                string[] standardTargets = ReadTargets(root, DelegationPath + @"\AllowSavedCredentials");
+                int? standardDenied = ReadFlag(root, DelegationPath, "DenySavedCredentials");
+                string[] standardDeniedTargets = ReadTargets(root, DelegationPath + @"\DenySavedCredentials");
                 int? allowed = ReadFlag(root, DelegationPath, "AllowSavedCredentialsWhenNTLMOnly");
                 string[] allowedTargets = ReadTargets(root, DelegationPath + @"\AllowSavedCredentialsWhenNTLMOnly");
                 int? denied = ReadFlag(root, DelegationPath, "DenySavedCredentialsWhenNTLMOnly");
                 string[] deniedTargets = ReadTargets(root, DelegationPath + @"\DenySavedCredentialsWhenNTLMOnly");
                 int? blockedSaving = ReadFlag(root, TerminalServicesPath, "DisablePasswordSaving");
+                report.AppendLine("Saved credential delegation: " + (standard == 1 ? "Enabled" : standard == 0 ? "Disabled" : "No explicit setting found"));
+                report.AppendLine("Matching standard allow rule: " + (standard == 1 && standardTargets.Any(rule => MatchesTarget(rule, target)) ? "Yes" : "No"));
+                report.AppendLine("Matching standard deny rule: " + (standardDenied == 1 && standardDeniedTargets.Any(rule => MatchesTarget(rule, target)) ? "Yes - ask IT to review" : "No explicit match found"));
                 report.AppendLine("NTLM-only saved credential delegation: " + (allowed == 1 ? "Enabled" : allowed == 0 ? "Disabled" : "No explicit setting found"));
                 report.AppendLine("Exact target listed: " + (allowedTargets.Any(rule => String.Equals(rule.Trim(), target, StringComparison.OrdinalIgnoreCase)) ? "Yes" : "No"));
                 report.AppendLine("Matching allow rule: " + (allowed == 1 && allowedTargets.Any(rule => MatchesTarget(rule, target)) ? "Yes" : "No"));
@@ -690,13 +723,14 @@ internal static class RdpPolicyDiagnostics
         report.AppendLine("REQUEST FOR COMPANY IT");
         report.AppendLine("If Windows blocks saved credentials, review the domain Group Policy at:");
         report.AppendLine("Computer Configuration > Administrative Templates > System > Credentials Delegation");
+        report.AppendLine("  Allow delegating saved credentials");
         report.AppendLine("  Allow delegating saved credentials with NTLM-only server authentication");
         report.AppendLine("  Approved target: " + target);
         report.AppendLine("Also review 'Do not allow passwords to be saved' on the laptop and");
         report.AppendLine("'Always prompt for password upon connection' on the remote PC.");
         report.AppendLine("If Windows says 'Your credentials did not work', verify the saved site password");
         report.AppendLine("and remote local account before changing credential-delegation policy.");
-        report.AppendLine("A domain policy can replace a local registry setting. This tool changes no policy.");
+        report.AppendLine("A domain policy can replace a local registry setting. The optional Allow this IP button changes only a local rule for this exact target.");
         report.AppendLine("No password or credential secret is included in this report.");
         return report.ToString();
     }
