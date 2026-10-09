@@ -283,13 +283,13 @@ internal sealed class RdpManager : UserControl
         Color background = darkTheme ? Color.FromArgb(27, 36, 43) : Color.White;
         Color foreground = darkTheme ? Color.FromArgb(235, 242, 246) : Color.FromArgb(20, 36, 57);
         using (Form dialog = new Form { Text = "RDP Credential Help", StartPosition = FormStartPosition.CenterParent,
-            Size = new Size(780, 600), MinimumSize = new Size(620, 440), BackColor = background, ForeColor = foreground,
+            Size = new Size(900, 600), MinimumSize = new Size(760, 440), BackColor = background, ForeColor = foreground,
             Font = new Font("Segoe UI", 9f) })
         {
             TextBox text = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true,
                 ScrollBars = ScrollBars.Vertical, Text = report, BackColor = darkTheme ? Color.FromArgb(38, 50, 59) : Color.White,
                 ForeColor = foreground, Font = new Font("Consolas", 9f), WordWrap = true };
-            FlowLayoutPanel actions = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48, FlowDirection = FlowDirection.RightToLeft };
+            FlowLayoutPanel actions = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 82, FlowDirection = FlowDirection.RightToLeft };
             Button close = new Button { Text = "Close", Width = 110, Height = 32, DialogResult = DialogResult.OK };
             Button copy = new Button { Text = "Copy for IT", Width = 120, Height = 32 };
             copy.Click += delegate {
@@ -297,15 +297,33 @@ internal sealed class RdpManager : UserControl
                 catch (Exception error) { MessageBox.Show(dialog, "Could not copy the report: " + error.Message, "RDP Credential Help", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
             };
             Button refresh = new Button { Text = "Refresh report", Width = 120, Height = 32 };
-            refresh.Click += delegate { text.Text = RdpPolicyDiagnostics.Report(site); };
             Button apply = new Button { Text = "Allow this IP", Width = 120, Height = 32 };
             Button undo = new Button { Text = "Undo local rule", Width = 120, Height = 32 };
+            Button clear = new Button { Text = "Clear conflicting login", Width = 155, Height = 32 };
+            refresh.Click += delegate { text.Text = RdpPolicyDiagnostics.Report(site); clear.Enabled = RdpCredentials.HasConflictingWindowsLogon(site); };
             bool supported = RdpPolicyDiagnostics.IsExactIpv4(site.Host);
             apply.Enabled = undo.Enabled = supported;
+            clear.Enabled = RdpCredentials.HasConflictingWindowsLogon(site);
             apply.Click += delegate { StartPolicyHelper(dialog, "apply", site.Host); };
             undo.Click += delegate { StartPolicyHelper(dialog, "undo", site.Host); };
+            clear.Click += delegate {
+                if (MessageBox.Show(dialog, "Windows has a separate saved logon for TERMSRV/" + site.Host +
+                    " that was not created by this toolkit. Remove that Windows logon entry for your account? " +
+                    "The toolkit's saved password and other sites will remain. You can reconnect to register the toolkit credential again.",
+                    "Clear conflicting RDP login", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+                try
+                {
+                    RdpCredentials.RemoveConflictingWindowsLogon(site);
+                    if (activity != null) activity("Cleared conflicting RDP login: " + site.Name);
+                    text.Text = RdpPolicyDiagnostics.Report(site);
+                    clear.Enabled = RdpCredentials.HasConflictingWindowsLogon(site);
+                    MessageBox.Show(dialog, "The conflicting Windows logon was removed. Close existing Remote Desktop windows, then connect to this site again.",
+                        "RDP Credential Help", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception error) { MessageBox.Show(dialog, error.Message, "RDP Credential Help", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            };
             actions.Controls.Add(close); actions.Controls.Add(copy); actions.Controls.Add(refresh);
-            actions.Controls.Add(undo); actions.Controls.Add(apply);
+            actions.Controls.Add(clear); actions.Controls.Add(undo); actions.Controls.Add(apply);
             dialog.Controls.Add(text); dialog.Controls.Add(actions);
             dialog.AcceptButton = close; dialog.ShowDialog(this);
         }
@@ -563,6 +581,25 @@ internal static class RdpCredentials
         return logon + " " + legacy;
     }
 
+    internal static bool HasConflictingWindowsLogon(RdpSiteProfile site)
+    {
+        IntPtr pointer;
+        if (!CredRead(Target(site), WindowsLogonCredential, 0, out pointer)) return false;
+        try
+        {
+            Credential stored = (Credential)Marshal.PtrToStructure(pointer, typeof(Credential));
+            return !String.Equals(stored.Comment, Owner(site), StringComparison.Ordinal);
+        }
+        finally { CredFree(pointer); }
+    }
+
+    internal static void RemoveConflictingWindowsLogon(RdpSiteProfile site)
+    {
+        if (!HasConflictingWindowsLogon(site)) return;
+        if (!CredDelete(Target(site), WindowsLogonCredential, 0))
+            throw new InvalidOperationException("Windows could not remove the conflicting credential (error " + Marshal.GetLastWin32Error() + ").");
+    }
+
     private static string DescribeType(RdpSiteProfile site, int type, string label)
     {
         IntPtr pointer;
@@ -575,7 +612,8 @@ internal static class RdpCredentials
         {
             Credential stored = (Credential)Marshal.PtrToStructure(pointer, typeof(Credential));
             if (!String.Equals(stored.Comment, Owner(site), StringComparison.Ordinal))
-                return label + " credential: another Windows entry exists for this IP.";
+                return label + " credential: another Windows entry exists for this IP (account: " +
+                    (stored.UserName ?? "").Replace("\r", "").Replace("\n", "") + ").";
             bool accountMatches = String.Equals(stored.UserName, RdpManager.LoginName(site), StringComparison.OrdinalIgnoreCase);
             byte[] plain = RdpManager.UnprotectPassword(site.ProtectedPassword);
             try
@@ -716,6 +754,8 @@ internal static partial class RdpPolicyDiagnostics
                 report.AppendLine("Matching allow rule: " + (allowed == 1 && allowedTargets.Any(rule => MatchesTarget(rule, target)) ? "Yes" : "No"));
                 report.AppendLine("Matching deny rule: " + (denied == 1 && deniedTargets.Any(rule => MatchesTarget(rule, target)) ? "Yes - ask IT to review" : "No explicit match found"));
                 report.AppendLine("Password saving blocked by client policy: " + (blockedSaving == 1 ? "Yes - ask IT to review" : "No explicit block found"));
+                if (standardTargets.Concat(allowedTargets).Any(rule => String.Equals(rule.Trim(), site.Host, StringComparison.OrdinalIgnoreCase)))
+                    report.AppendLine("Warning: a policy list contains the bare IP. Use " + target + " instead; the IP alone is not an RDP delegation target.");
             }
         }
         catch (Exception error) { report.AppendLine("Policy could not be read: " + error.Message); }
