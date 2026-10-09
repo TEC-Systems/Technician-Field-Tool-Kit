@@ -67,8 +67,8 @@ internal sealed class RdpManager : UserControl
         AddRow(editor, "Site name", name);
         AddRow(editor, "Folder", group);
         AddRow(editor, "Server / IP", host);
-        AddRow(editor, "Windows login", user);
-        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = @"Use the exact account shown by Windows Remote Desktop: SERVERNAME\user for a site-local account, or DOMAIN\user for a domain account." });
+        AddRow(editor, "Username", user);
+        AddRow(editor, "", new Label { AutoSize = true, MaximumSize = new Size(480, 0), Text = @"For a site-local account, enter SERVERNAME\username. Use the account that works in Remote Desktop." });
         AddRow(editor, "Password", password);
         password.TextChanged += delegate { if (password.Text.Length > 0) remember.Checked = true; };
         AddRow(editor, "", remember);
@@ -84,7 +84,7 @@ internal sealed class RdpManager : UserControl
         favoriteButton.Enabled = false;
         AddRow(editor, "", buttons);
         AddRow(editor, "", notice);
-        notice.Text = "Enter the site's Windows login and password, then Save Site. Leave Password blank later to keep it. Connections open in Windows Remote Desktop.";
+        notice.Text = "Enter the site's username and password, then Save Site. Leave Password blank later to keep it.";
         tree.AfterSelect += delegate { if (!reloadingTree) LoadSite(tree.SelectedNode == null ? null : tree.SelectedNode.Tag as RdpSiteProfile); };
         tree.NodeMouseDoubleClick += delegate(object sender, TreeNodeMouseClickEventArgs e) { if (e.Node.Tag is RdpSiteProfile) Run(Connect); };
         Reload();
@@ -199,7 +199,7 @@ internal sealed class RdpManager : UserControl
         if (user.Text.Any(c => Char.IsControl(c))) throw new InvalidOperationException("Windows login cannot contain control characters.");
         if (remember.Checked && String.IsNullOrWhiteSpace(user.Text)) throw new InvalidOperationException("Enter a Windows login before saving a password.");
         if (!String.IsNullOrWhiteSpace(user.Text) && !user.Text.Contains("\\") && !user.Text.Contains("@"))
-            throw new InvalidOperationException(@"Enter the complete Windows login, such as SERVERNAME\user or DOMAIN\user.");
+            throw new InvalidOperationException(@"Enter the complete username, such as SERVERNAME\user or DOMAIN\user.");
         bool sameIdentity = selected != null && selected.Host.Equals(server, StringComparison.OrdinalIgnoreCase) &&
             String.Equals(LoginName(selected), user.Text.Trim(), StringComparison.OrdinalIgnoreCase);
         string encrypted = "";
@@ -232,7 +232,7 @@ internal sealed class RdpManager : UserControl
         user.Text = LoginName(edited);
         password.Clear(); remember.Checked = !String.IsNullOrEmpty(edited.ProtectedPassword);
         Reload(); UpdateFavoriteButton();
-        notice.Text = "Saved " + edited.Name + " with Windows login " + LoginName(edited) + ". " +
+        notice.Text = "Saved " + edited.Name + " with username " + LoginName(edited) + ". " +
             (remember.Checked ? "Click Connect to test it." : "Enter and save a password to connect without a prompt.");
     }
 
