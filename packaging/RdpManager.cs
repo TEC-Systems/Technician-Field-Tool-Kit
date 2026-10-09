@@ -9,6 +9,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using System.Threading;
+using System.Runtime.InteropServices;
 using System.Web.Script.Serialization;
 
 internal sealed class RdpManager : UserControl
@@ -213,6 +214,8 @@ internal sealed class RdpManager : UserControl
         if (sites.Any(s => !Object.ReferenceEquals(s, selected) && s.Name.Equals(edited.Name, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("That site name already exists. Choose another name or select the existing site to edit it.");
         RdpSiteProfile previous = selected;
         int index = previous == null ? -1 : sites.IndexOf(previous);
+        if (previous != null && (previous.Host != edited.Host || previous.ProtectedPassword != edited.ProtectedPassword))
+            RdpCredentials.RemoveIfOwned(previous);
         if (index < 0) sites.Add(edited); else sites[index] = edited;
         selected = edited;
         try { save(); }
@@ -226,7 +229,9 @@ internal sealed class RdpManager : UserControl
     {
         if (selected == null) throw new InvalidOperationException("Select a saved site first.");
         if (MessageBox.Show(this, "Delete saved site '" + selected.Name + "'?", "RDP", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-        RdpSiteProfile previous = selected; int index = sites.IndexOf(previous); sites.Remove(previous);
+        RdpSiteProfile previous = selected; int index = sites.IndexOf(previous);
+        RdpCredentials.RemoveIfOwned(previous);
+        sites.Remove(previous);
         try { save(); } catch { sites.Insert(index, previous); throw; }
         if (!String.IsNullOrEmpty(folder)) DeleteConnectionFile(folder, previous.Id);
         if (activity != null) activity("Deleted site: " + previous.Name);
@@ -249,6 +254,8 @@ internal sealed class RdpManager : UserControl
             path = Path.Combine(connections, "temporary-" + Guid.NewGuid().ToString("N") + ".rdp");
             File.WriteAllText(path, BuildRdpFile(connection, screen), Encoding.Unicode);
         }
+        if (persistent && !String.IsNullOrEmpty(connection.ProtectedPassword))
+            RdpCredentials.Store(connection);
         try
         {
             Process session = Process.Start(new ProcessStartInfo("mstsc.exe", "\"" + path + "\"") { UseShellExecute = true });
@@ -294,7 +301,7 @@ internal sealed class RdpManager : UserControl
         string path = ConnectionPath(folder, site.Id);
         Directory.CreateDirectory(Path.GetDirectoryName(path));
         string previous = File.Exists(path) ? File.ReadAllText(path, Encoding.Unicode) : "";
-        File.WriteAllText(path, MergeConnectionPreferences(previous, BuildRdpFile(site, screen)), Encoding.Unicode);
+        File.WriteAllText(path, MergeConnectionPreferences(previous, BuildRdpFile(site, screen, false)), Encoding.Unicode);
         return path;
     }
 
@@ -321,12 +328,21 @@ internal sealed class RdpManager : UserControl
         finally { Array.Clear(plain, 0, plain.Length); }
     }
 
-    internal static string BuildRdpFile(RdpSiteProfile site, Size screen)
+    internal static byte[] UnprotectPassword(string value)
+    {
+        if (String.IsNullOrEmpty(value) || !Regex.IsMatch(value, @"\A(?:[0-9A-F]{2})+\z"))
+            throw new InvalidOperationException("The saved RDP password is invalid. Enter it again and save the site.");
+        byte[] encrypted = Enumerable.Range(0, value.Length / 2).Select(i => Convert.ToByte(value.Substring(i * 2, 2), 16)).ToArray();
+        try { return ProtectedData.Unprotect(encrypted, null, DataProtectionScope.CurrentUser); }
+        catch (CryptographicException) { throw new InvalidOperationException("Windows could not unlock this saved RDP password. Enter it again and save the site."); }
+        finally { Array.Clear(encrypted, 0, encrypted.Length); }
+    }
+
+    internal static string BuildRdpFile(RdpSiteProfile site, Size screen, bool includePassword = true)
     {
         StringBuilder text = new StringBuilder();
         text.AppendLine("full address:s:" + site.Host);
-        string login = String.IsNullOrEmpty(site.Domain) || site.User.Contains("\\") || site.User.Contains("@") ? site.User : site.Domain + "\\" + site.User;
-        text.AppendLine("username:s:" + login);
+        text.AppendLine("username:s:" + LoginName(site));
         text.AppendLine("screen mode id:i:" + (site.Resolution == "Full screen" ? "2" : "1"));
         Size size = screen;
         Match match = Regex.Match(site.Resolution ?? "", @"^(\d+) x (\d+)$");
@@ -334,13 +350,20 @@ internal sealed class RdpManager : UserControl
         else if (site.Resolution != "Full screen") size = new Size(Math.Max(640, screen.Width - 80), Math.Max(480, screen.Height - 120));
         text.AppendLine("desktopwidth:i:" + size.Width); text.AppendLine("desktopheight:i:" + size.Height);
         text.AppendLine("authentication level:i:2"); text.AppendLine("enablecredsspsupport:i:1");
+        text.AppendLine("prompt for credentials:i:0");
         text.AppendLine("redirectclipboard:i:1"); text.AppendLine("redirectprinters:i:0");
-        if (!String.IsNullOrEmpty(site.ProtectedPassword))
+        if (includePassword && !String.IsNullOrEmpty(site.ProtectedPassword))
         {
             if (!Regex.IsMatch(site.ProtectedPassword, @"\A(?:[0-9A-F]{2})+\z")) throw new InvalidOperationException("The saved password is invalid. Enter it again and save the site.");
             text.AppendLine("password 51:b:" + site.ProtectedPassword);
         }
         return text.ToString();
+    }
+
+    internal static string LoginName(RdpSiteProfile site)
+    {
+        if (String.IsNullOrWhiteSpace(site.User) || site.User.Contains("\\") || site.User.Contains("@")) return site.User;
+        return String.IsNullOrWhiteSpace(site.Domain) ? @".\" + site.User : site.Domain + "\\" + site.User;
     }
 
     internal static void SelfTest()
@@ -370,6 +393,8 @@ internal sealed class RdpManager : UserControl
                 using (RdpManager fileManager = new RdpManager(data, delegate { }, temporaryFolder))
                 {
                     string path = fileManager.WriteConnectionFile(site, new Size(1920, 1080));
+                    if (File.ReadAllText(path, Encoding.Unicode).Contains("password 51:"))
+                        throw new InvalidOperationException("Saved RDP connection file retained a password blob instead of using Windows Credential Manager.");
                     File.AppendAllText(path, "redirectprinters:i:1\r\n", Encoding.Unicode);
                     string secondPath = fileManager.WriteConnectionFile(site, new Size(1920, 1080));
                     if (path != secondPath || !File.ReadAllText(path).Contains("redirectprinters:i:1")) throw new InvalidOperationException("Saved RDP file or Windows preferences were not retained.");
@@ -383,10 +408,13 @@ internal sealed class RdpManager : UserControl
             finally { if (Directory.Exists(temporaryFolder)) Directory.Delete(temporaryFolder, true); }
             string retained = MergeConnectionPreferences("redirectprinters:i:1\r\nauthentication level:i:0\r\npassword 51:b:DEAD\r\n", BuildRdpFile(site, new Size(1920, 1080)));
             if (!retained.Contains("redirectprinters:i:1") || !retained.Contains("authentication level:i:2") || retained.Contains("password 51:b:DEAD")) throw new InvalidOperationException("RDP preferences or authentication retention failed.");
-            byte[] encrypted = Enumerable.Range(0, site.ProtectedPassword.Length / 2).Select(i => Convert.ToByte(site.ProtectedPassword.Substring(i * 2, 2), 16)).ToArray();
-            byte[] plain = ProtectedData.Unprotect(encrypted, null, DataProtectionScope.CurrentUser);
+            byte[] plain = UnprotectPassword(site.ProtectedPassword);
             try { if (Encoding.Unicode.GetString(plain) != "self-test-password") throw new InvalidOperationException("RDP password encryption round-trip failed."); }
             finally { Array.Clear(plain, 0, plain.Length); }
+            RdpSiteProfile credentialTest = new RdpSiteProfile { Host = "selftest-" + Guid.NewGuid().ToString("N") + ".invalid",
+                User = "selftest", ProtectedPassword = site.ProtectedPassword };
+            try { RdpCredentials.Store(credentialTest); }
+            finally { RdpCredentials.RemoveIfOwned(credentialTest); }
             JavaScriptSerializer serializer = new JavaScriptSerializer();
             RdpSiteProfile restored = serializer.Deserialize<RdpSiteProfile>(serializer.Serialize(site));
             if (restored.Id != site.Id || restored.Host != site.Host || restored.Group != "Office" || restored.Resolution != "1280 x 720" || restored.ProtectedPassword != site.ProtectedPassword || !restored.Favorite)
@@ -394,6 +422,9 @@ internal sealed class RdpManager : UserControl
             string file = BuildRdpFile(restored, new Size(1920, 1080));
             if (!file.Contains("username:s:TEC\\technician") || !file.Contains("desktopwidth:i:1280") || !file.Contains("desktopheight:i:720") || file.Contains("self-test-password"))
                 throw new InvalidOperationException("RDP connection settings failed.");
+            if (LoginName(new RdpSiteProfile { User = "localuser" }) != @".\localuser" ||
+                LoginName(new RdpSiteProfile { User = @"OTHER\admin" }) != @"OTHER\admin")
+                throw new InvalidOperationException("RDP local and qualified account names failed.");
             manager.SaveSite(); if (data[0].Id != site.Id || data[0].ProtectedPassword != site.ProtectedPassword) throw new InvalidOperationException("RDP saved password was lost on edit.");
             manager.host.Text = "192.0.2.11"; manager.SaveSite();
             if (data[0].ProtectedPassword.Length != 0) throw new InvalidOperationException("RDP credentials carried over to a different server.");
@@ -413,5 +444,87 @@ internal sealed class RdpManager : UserControl
                 manager.tree.Nodes.Cast<TreeNode>().First(node => node.Text == "Office").Nodes[0].Text != "Office server")
                 throw new InvalidOperationException("RDP alphabetical sorting failed.");
         }
+    }
+}
+
+internal static class RdpCredentials
+{
+    private const int GenericCredential = 1;
+    private const int LocalMachinePersistence = 2;
+    private const int NotFound = 1168;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct Credential
+    {
+        internal int Flags;
+        internal int Type;
+        [MarshalAs(UnmanagedType.LPWStr)] internal string TargetName;
+        [MarshalAs(UnmanagedType.LPWStr)] internal string Comment;
+        internal long LastWritten;
+        internal int CredentialBlobSize;
+        internal IntPtr CredentialBlob;
+        internal int Persist;
+        internal int AttributeCount;
+        internal IntPtr Attributes;
+        [MarshalAs(UnmanagedType.LPWStr)] internal string TargetAlias;
+        [MarshalAs(UnmanagedType.LPWStr)] internal string UserName;
+    }
+
+    [DllImport("Advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CredWrite(ref Credential credential, int flags);
+
+    [DllImport("Advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CredRead(string target, int type, int flags, out IntPtr credential);
+
+    [DllImport("Advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CredDelete(string target, int type, int flags);
+
+    [DllImport("Advapi32.dll", EntryPoint = "CredFree")]
+    private static extern void CredFree(IntPtr credential);
+
+    private static string Target(RdpSiteProfile site) { return "TERMSRV/" + site.Host; }
+    private static string Owner(RdpSiteProfile site) { return "TEC Systems Field Toolkit site " + site.Id; }
+
+    internal static void Store(RdpSiteProfile site)
+    {
+        byte[] plain = RdpManager.UnprotectPassword(site.ProtectedPassword);
+        IntPtr blob = IntPtr.Zero;
+        try
+        {
+            blob = Marshal.AllocHGlobal(plain.Length);
+            Marshal.Copy(plain, 0, blob, plain.Length);
+            Credential credential = new Credential { Type = GenericCredential, TargetName = Target(site), Comment = Owner(site),
+                CredentialBlobSize = plain.Length, CredentialBlob = blob, Persist = LocalMachinePersistence,
+                UserName = RdpManager.LoginName(site) };
+            if (!CredWrite(ref credential, 0))
+                throw new InvalidOperationException("Windows Credential Manager could not save this RDP password (error " + Marshal.GetLastWin32Error() + "). Enter the password again and save the site.");
+        }
+        finally
+        {
+            if (blob != IntPtr.Zero)
+            {
+                Marshal.Copy(new byte[plain.Length], 0, blob, plain.Length);
+                Marshal.FreeHGlobal(blob);
+            }
+            Array.Clear(plain, 0, plain.Length);
+        }
+    }
+
+    internal static void RemoveIfOwned(RdpSiteProfile site)
+    {
+        IntPtr pointer;
+        if (!CredRead(Target(site), GenericCredential, 0, out pointer))
+        {
+            if (Marshal.GetLastWin32Error() == NotFound) return;
+            throw new InvalidOperationException("Windows Credential Manager could not check the old RDP credential (error " + Marshal.GetLastWin32Error() + ").");
+        }
+        bool owned;
+        try { owned = String.Equals(((Credential)Marshal.PtrToStructure(pointer, typeof(Credential))).Comment, Owner(site), StringComparison.Ordinal); }
+        finally { CredFree(pointer); }
+        if (owned && !CredDelete(Target(site), GenericCredential, 0))
+            throw new InvalidOperationException("Windows Credential Manager could not remove the old RDP credential (error " + Marshal.GetLastWin32Error() + ").");
     }
 }
