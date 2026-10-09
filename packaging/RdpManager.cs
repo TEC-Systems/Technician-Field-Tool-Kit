@@ -444,7 +444,12 @@ internal sealed class RdpManager : UserControl
             finally { Array.Clear(plain, 0, plain.Length); }
             RdpSiteProfile credentialTest = new RdpSiteProfile { Host = "selftest-" + Guid.NewGuid().ToString("N") + ".invalid",
                 User = "selftest", ProtectedPassword = site.ProtectedPassword };
-            try { RdpCredentials.Store(credentialTest); }
+            try
+            {
+                RdpCredentials.Store(credentialTest);
+                if (!RdpCredentials.Describe(credentialTest).Contains("Windows logon credential: toolkit entry matches the saved account and password."))
+                    throw new InvalidOperationException("Windows logon credential did not survive read-back.");
+            }
             finally { RdpCredentials.RemoveIfOwned(credentialTest); }
             JavaScriptSerializer serializer = new JavaScriptSerializer();
             RdpSiteProfile restored = serializer.Deserialize<RdpSiteProfile>(serializer.Serialize(site));
@@ -485,6 +490,7 @@ internal sealed class RdpManager : UserControl
 internal static class RdpCredentials
 {
     private const int GenericCredential = 1;
+    private const int WindowsLogonCredential = 2;
     private const int LocalMachinePersistence = 2;
     private const int NotFound = 1168;
 
@@ -526,19 +532,43 @@ internal static class RdpCredentials
     internal static string Describe(RdpSiteProfile site)
     {
         if (String.IsNullOrEmpty(site.ProtectedPassword)) return "No password is saved for this site in the toolkit.";
+        string logon = DescribeType(site, WindowsLogonCredential, "Windows logon");
+        string legacy = DescribeType(site, GenericCredential, "Generic");
+        return logon + " " + legacy;
+    }
+
+    private static string DescribeType(RdpSiteProfile site, int type, string label)
+    {
         IntPtr pointer;
-        if (!CredRead(Target(site), GenericCredential, 0, out pointer))
+        if (!CredRead(Target(site), type, 0, out pointer))
         {
             int error = Marshal.GetLastWin32Error();
-            return error == NotFound ? "No Windows Credential Manager entry found yet. Connect from the toolkit to register the saved password." :
-                "Windows Credential Manager could not be checked (error " + error + ").";
+            return error == NotFound ? label + " credential: not found." : label + " credential: could not be checked (error " + error + ").";
         }
         try
         {
             Credential stored = (Credential)Marshal.PtrToStructure(pointer, typeof(Credential));
-            return String.Equals(stored.Comment, Owner(site), StringComparison.Ordinal) ?
-                "A toolkit credential is registered for this IP and Windows user." :
-                "A different Windows credential is registered for this IP. Connecting from the toolkit will update it.";
+            if (!String.Equals(stored.Comment, Owner(site), StringComparison.Ordinal))
+                return label + " credential: another Windows entry exists for this IP.";
+            bool accountMatches = String.Equals(stored.UserName, RdpManager.LoginName(site), StringComparison.OrdinalIgnoreCase);
+            byte[] plain = RdpManager.UnprotectPassword(site.ProtectedPassword);
+            try
+            {
+                bool passwordMatches = stored.CredentialBlobSize == plain.Length && stored.CredentialBlob != IntPtr.Zero;
+                if (passwordMatches)
+                {
+                    byte[] storedPassword = new byte[plain.Length];
+                    try
+                    {
+                        Marshal.Copy(stored.CredentialBlob, storedPassword, 0, storedPassword.Length);
+                        passwordMatches = storedPassword.SequenceEqual(plain);
+                    }
+                    finally { Array.Clear(storedPassword, 0, storedPassword.Length); }
+                }
+                return label + " credential: toolkit entry " + (accountMatches && passwordMatches ?
+                    "matches the saved account and password." : "does not match the currently saved account or password.");
+            }
+            finally { Array.Clear(plain, 0, plain.Length); }
         }
         finally { CredFree(pointer); }
     }
@@ -551,11 +581,12 @@ internal static class RdpCredentials
         {
             blob = Marshal.AllocHGlobal(plain.Length);
             Marshal.Copy(plain, 0, blob, plain.Length);
-            Credential credential = new Credential { Type = GenericCredential, TargetName = Target(site), Comment = Owner(site),
+            Credential credential = new Credential { Type = WindowsLogonCredential, TargetName = Target(site), Comment = Owner(site),
                 CredentialBlobSize = plain.Length, CredentialBlob = blob, Persist = LocalMachinePersistence,
                 UserName = RdpManager.LoginName(site) };
             if (!CredWrite(ref credential, 0))
                 throw new InvalidOperationException("Windows Credential Manager could not save this RDP password (error " + Marshal.GetLastWin32Error() + "). Enter the password again and save the site.");
+            RemoveIfOwned(site, GenericCredential);
         }
         finally
         {
@@ -570,8 +601,14 @@ internal static class RdpCredentials
 
     internal static void RemoveIfOwned(RdpSiteProfile site)
     {
+        RemoveIfOwned(site, WindowsLogonCredential);
+        RemoveIfOwned(site, GenericCredential);
+    }
+
+    private static void RemoveIfOwned(RdpSiteProfile site, int type)
+    {
         IntPtr pointer;
-        if (!CredRead(Target(site), GenericCredential, 0, out pointer))
+        if (!CredRead(Target(site), type, 0, out pointer))
         {
             if (Marshal.GetLastWin32Error() == NotFound) return;
             throw new InvalidOperationException("Windows Credential Manager could not check the old RDP credential (error " + Marshal.GetLastWin32Error() + ").");
@@ -579,7 +616,7 @@ internal static class RdpCredentials
         bool owned;
         try { owned = String.Equals(((Credential)Marshal.PtrToStructure(pointer, typeof(Credential))).Comment, Owner(site), StringComparison.Ordinal); }
         finally { CredFree(pointer); }
-        if (owned && !CredDelete(Target(site), GenericCredential, 0))
+        if (owned && !CredDelete(Target(site), type, 0))
             throw new InvalidOperationException("Windows Credential Manager could not remove the old RDP credential (error " + Marshal.GetLastWin32Error() + ").");
     }
 }
@@ -628,6 +665,7 @@ internal static class RdpPolicyDiagnostics
         report.AppendLine("Signed-in Windows domain: " + Environment.UserDomainName);
         report.AppendLine("Connection by IP: " + (byIp ? "Yes; NTLM-only credential delegation may apply." : "No"));
         report.AppendLine("Saved credential: " + RdpCredentials.Describe(site));
+        report.AppendLine("A missing NTLM-only policy entry alone does not explain a failed logon. Compare a working site.");
         report.AppendLine();
         report.AppendLine("APPLIED CLIENT POLICY (read-only)");
         try
@@ -650,12 +688,14 @@ internal static class RdpPolicyDiagnostics
         catch (Exception error) { report.AppendLine("Policy could not be read: " + error.Message); }
         report.AppendLine();
         report.AppendLine("REQUEST FOR COMPANY IT");
-        report.AppendLine("For this approved site, review the domain Group Policy at:");
+        report.AppendLine("If Windows blocks saved credentials, review the domain Group Policy at:");
         report.AppendLine("Computer Configuration > Administrative Templates > System > Credentials Delegation");
         report.AppendLine("  Allow delegating saved credentials with NTLM-only server authentication");
         report.AppendLine("  Approved target: " + target);
         report.AppendLine("Also review 'Do not allow passwords to be saved' on the laptop and");
         report.AppendLine("'Always prompt for password upon connection' on the remote PC.");
+        report.AppendLine("If Windows says 'Your credentials did not work', verify the saved site password");
+        report.AppendLine("and remote local account before changing credential-delegation policy.");
         report.AppendLine("A domain policy can replace a local registry setting. This tool changes no policy.");
         report.AppendLine("No password or credential secret is included in this report.");
         return report.ToString();
