@@ -1739,7 +1739,8 @@ internal sealed partial class ToolkitWindow : Form
         playbookText = new TextBox { Left = 14, Top = 144, Width = 308, Height = 88, Multiline = true, ScrollBars = ScrollBars.Vertical, ReadOnly = true }; playbook.Controls.Add(playbookText);
         ShowPlaybook("Managed Switch");
 
-        page.Controls.Add(L("Support bundle", 376, 530, 220));
+        page.Controls.Add(L("Support bundle", 376, 530, 185));
+        B(page, "Export Summary", 574, 518, 130, ExportTroubleshootingSummary, "Save adapter, gateway, DNS, recent IP changes, and recent network checks as a readable text report.", Cobalt);
         bundleType = new ComboBox { Left = 376, Top = 560, Width = 190, DropDownStyle = ComboBoxStyle.DropDownList }; bundleType.Items.AddRange(new object[] { "Network", "Windows", "Both" }); bundleType.SelectedIndex = 0; page.Controls.Add(bundleType);
         B(page, "Export ZIP", 574, 556, 130, ExportBundle, "Export selected logs and diagnostic snapshots as a ZIP for review before sharing.", Green);
     }
@@ -1859,14 +1860,68 @@ internal sealed partial class ToolkitWindow : Form
         { string output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd(); p.WaitForExit(20000); return output; }
     }
 
+    private string[] RecentNetworkChecks()
+    {
+        string[] areas = { "Ping", "DNS", "Telnet", "Switch", "Trace", "PathPing" };
+        return logView.Items.Cast<ListViewItem>()
+            .Where(row => row.SubItems.Count >= 4 && areas.Contains(row.SubItems[2].Text))
+            .Reverse().Take(15).Reverse()
+            .Select(row => row.SubItems[0].Text + " | " + row.SubItems[1].Text + " | " + row.SubItems[2].Text + " | " +
+                row.SubItems[3].Text.Replace('\r', ' ').Replace('\n', ' ')).ToArray();
+    }
+
+    private static string BuildTroubleshootingSummary(IEnumerable<ToolkitAdapter> currentAdapters,
+        IEnumerable<IpChangeRecord> recentChanges, IEnumerable<string> recentChecks, string computer, DateTime createdUtc)
+    {
+        StringBuilder report = new StringBuilder();
+        report.AppendLine("TEC Systems Field Toolkit - Troubleshooting Summary");
+        report.AppendLine("Created (UTC): " + createdUtc.ToString("u"));
+        report.AppendLine("Computer: " + computer);
+        report.AppendLine(); report.AppendLine("Current network adapters:");
+        ToolkitAdapter[] snapshot = currentAdapters.ToArray();
+        if (snapshot.Length == 0) report.AppendLine("- No adapters available. Refresh in IP Shifter and check the technician log.");
+        foreach (ToolkitAdapter adapter in snapshot)
+            report.AppendLine("- " + adapter.Name + " | " + adapter.Status + " | IP " + adapter.IP + " / " + adapter.Mask +
+                " | Gateway " + adapter.Gateway + " | DNS " + adapter.Dns + " | MAC " + adapter.Mac);
+        report.AppendLine(); report.AppendLine("Recent IP Shifter changes:");
+        IpChangeRecord[] changes = recentChanges.Reverse().Take(10).Reverse().ToArray();
+        if (changes.Length == 0) report.AppendLine("- None recorded.");
+        foreach (IpChangeRecord change in changes)
+            report.AppendLine("- " + change.TimeUtc + " | " + change.AdapterName + " | " + change.Action + " | " +
+                change.Result + " | " + change.Before + " -> " + change.After);
+        report.AppendLine(); report.AppendLine("Recent network checks in this toolkit session:");
+        string[] checks = recentChecks.ToArray();
+        if (checks.Length == 0) report.AppendLine("- None recorded.");
+        foreach (string check in checks) report.AppendLine("- " + check);
+        report.AppendLine(); report.AppendLine("Ping opens in a separate Command Prompt; its result is not captured here.");
+        report.AppendLine("Review machine and network details before sharing this report.");
+        return report.ToString();
+    }
+
+    private void ExportTroubleshootingSummary()
+    {
+        using (SaveFileDialog dialog = new SaveFileDialog { Filter = "Text reports (*.txt)|*.txt",
+            FileName = "TEC-Troubleshooting-Summary-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt" })
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            RefreshAdapters();
+            string report = BuildTroubleshootingSummary(adapters, ipHistory, RecentNetworkChecks(), Environment.MachineName, DateTime.UtcNow);
+            File.WriteAllText(dialog.FileName, report, Encoding.UTF8);
+            Log("Support", "OK", "Exported troubleshooting summary. Review before sharing: " + dialog.FileName);
+        }
+    }
+
     private void ExportBundle()
     {
         using (SaveFileDialog dialog = new SaveFileDialog { Filter = "ZIP files (*.zip)|*.zip", FileName = "TEC_SupportBundle_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".zip" })
         {
             if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            RefreshAdapters();
             using (FileStream file = File.Create(dialog.FileName))
             using (ZipArchive archive = new ZipArchive(file, ZipArchiveMode.Create))
             {
+                AddZipText(archive, "troubleshooting-summary.txt", BuildTroubleshootingSummary(adapters, ipHistory,
+                    RecentNetworkChecks(), Environment.MachineName, DateTime.UtcNow));
                 AddZipText(archive, "technician.log", File.Exists(logPath) ? File.ReadAllText(logPath) : "");
                 string type = Convert.ToString(bundleType.SelectedItem);
                 if (type != "Windows") { AddZipText(archive, "ipconfig.txt", CaptureCommand("ipconfig.exe", "/all")); AddZipText(archive, "routes.txt", CaptureCommand("route.exe", "print")); AddZipText(archive, "arp.txt", CaptureCommand("arp.exe", "-a")); }
@@ -2408,6 +2463,16 @@ internal sealed partial class ToolkitWindow : Form
                 throw new InvalidOperationException("IP Scanner/RDP tab order or hidden Sites tab is incorrect.");
             SelfTestSiteWorkspace();
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
+            if (!networkPage.Controls.OfType<Button>().Any(c => c.Text == "Export Summary"))
+                throw new InvalidOperationException("Troubleshooting summary export is missing.");
+            string summarySample = BuildTroubleshootingSummary(
+                new[] { new ToolkitAdapter { Name = "Test Ethernet", Status = "Connected", IP = "192.0.2.5", Mask = "255.255.255.0", Gateway = "192.0.2.1", Dns = "1.1.1.1" } },
+                new[] { new IpChangeRecord { AdapterName = "Test Ethernet", Action = "Restore", Result = "Verified" } },
+                new[] { "12:00:00 | OK | DNS | example.test -> 192.0.2.8" }, "TEST-PC", DateTime.UtcNow);
+            if (!summarySample.Contains("Gateway 192.0.2.1") || !summarySample.Contains("DNS 1.1.1.1") ||
+                !summarySample.Contains("Restore | Verified") || !summarySample.Contains("example.test -> 192.0.2.8") ||
+                !summarySample.Contains("Ping opens in a separate Command Prompt"))
+                throw new InvalidOperationException("Troubleshooting summary omitted adapter settings or recent checks.");
             TabPage windowsPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Windows Troubleshooting");
             if (windowsPage.Controls.Cast<Control>().Any(c => c.Text == "Open Webpage" || c.Text == "Web URL" ||
                 c.Text == "Saved RDP sites" || c.Text == "Save Site" || c.Text == "Delete Site" || c.Text == "Site name"))
