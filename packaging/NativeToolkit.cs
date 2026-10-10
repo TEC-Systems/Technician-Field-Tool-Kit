@@ -1203,7 +1203,11 @@ internal sealed partial class ToolkitWindow : Form
             { "Shared Folders", "fsmgmt.msc", "" }, { "Windows Update", "ms-settings:windowsupdate", "" }, { "Remote Desktop", "mstsc.exe", "" },
             { "Printers", "control.exe", "printers" }, { "IPConfig /all", "cmd.exe", "/k ipconfig /all" }
         };
-        for (int i = 0; i < specs.GetLength(0); i++) { string name = specs[i, 0], exe = specs[i, 1], arg = specs[i, 2]; B(tools, name, 0, 0, 126, delegate { OpenTool(name, exe, arg); }, "Open " + name + " for Windows troubleshooting.", Slate).Margin = new Padding(0, 0, 8, 8); }
+        foreach (int i in Enumerable.Range(0, specs.GetLength(0)).OrderBy(index => specs[index, 0], StringComparer.OrdinalIgnoreCase))
+        {
+            string name = specs[i, 0], exe = specs[i, 1], arg = specs[i, 2];
+            B(tools, name, 0, 0, 126, delegate { OpenTool(name, exe, arg); }, "Open " + name + " for Windows troubleshooting.", Slate).Margin = new Padding(0, 0, 8, 8);
+        }
         Action fitTools = delegate {
             tools.Width = Math.Max(134, page.ClientSize.Width - 36);
             int columns = Math.Max(1, tools.ClientSize.Width / 134);
@@ -2481,6 +2485,9 @@ internal sealed partial class ToolkitWindow : Form
             if (!windowsTools.Controls.Cast<Control>().Any(c => c.Text == "IPConfig /all") ||
                 !windowsTools.Controls.Cast<Control>().Any(c => c.Text == "Display Settings"))
                 throw new InvalidOperationException("Windows tool shortcuts are missing.");
+            string[] toolNames = windowsTools.Controls.Cast<Control>().Select(c => c.Text).ToArray();
+            if (!toolNames.SequenceEqual(toolNames.OrderBy(name => name, StringComparer.OrdinalIgnoreCase)))
+                throw new InvalidOperationException("Open tools shortcuts are not in alphabetical order.");
             if (windowsTools.AutoScroll || windowsTools.Controls.Count != 18 ||
                 windowsTools.Controls.Cast<Control>().Any(c => !windowsTools.ClientRectangle.Contains(c.Bounds)))
                 throw new InvalidOperationException("Open tools shortcuts are clipped or require internal scrolling.");
