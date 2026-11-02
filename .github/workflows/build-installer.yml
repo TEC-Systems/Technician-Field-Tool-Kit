@@ -32,6 +32,12 @@ jobs:
             if (git ls-remote --tags origin "refs/tags/$expected") { throw "Release tag $expected already exists." }
           }
           elseif ('${{ github.ref_name }}' -ne $expected) { throw "Tag must be $expected" }
+          $notesPath = Join-Path 'release-notes' "$expected.md"
+          if (-not (Test-Path -LiteralPath $notesPath)) { throw "Release notes are missing: $notesPath" }
+          $notes = Get-Content -LiteralPath $notesPath -Raw
+          if ($notes -notmatch '(?m)^## Changed\s*$' -or $notes -notmatch '(?m)^## Removed\s*$') {
+            throw "Release notes must have Changed and Removed sections: $notesPath"
+          }
       - name: Build and verify installer
         shell: powershell
         run: |
@@ -72,5 +78,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = 'v' + (Get-Content version.txt -First 1).Trim()
-          gh release create $tag dist/TEC-Systems-FieldToolkit-Setup.exe dist/TEC-Systems-FieldToolkit-Install.zip dist/TEC-Systems-FieldToolkit-Install.7z dist/SHA256SUMS.txt dist/activity-report-preview.png --target '${{ github.sha }}' --title "TEC Systems Field Toolkit $tag" --generate-notes
+          $notesPath = Join-Path 'release-notes' "$tag.md"
+          gh release create $tag dist/TEC-Systems-FieldToolkit-Setup.exe dist/TEC-Systems-FieldToolkit-Install.zip dist/TEC-Systems-FieldToolkit-Install.7z dist/SHA256SUMS.txt dist/activity-report-preview.png --target '${{ github.sha }}' --title "TEC Systems Field Toolkit $tag" --notes-file $notesPath
           if ($LASTEXITCODE -ne 0) { throw "Could not publish $tag." }

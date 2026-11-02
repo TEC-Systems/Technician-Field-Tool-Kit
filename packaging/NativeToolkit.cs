@@ -2505,7 +2505,7 @@ internal sealed partial class ToolkitWindow : Form
     private void OfferUpdate(Dictionary<string, object> release, string latest)
     {
         if (IsDisposed) return;
-        if (MessageBox.Show(this, "Version " + latest + " is available (installed: " + version + ").\r\n\r\nUpdate now? The toolkit will exit, update in place, and reopen. Your saved profiles and logs will stay in place.", "Toolkit Update Available", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
+        if (!ConfirmUpdateWithNotes(release, latest)) return;
         ThreadPool.QueueUserWorkItem(delegate {
             try
             {
@@ -2536,6 +2536,36 @@ internal sealed partial class ToolkitWindow : Form
             }
             catch (Exception error) { if (!IsDisposed) BeginInvoke(new Action(delegate { Fail("Updates", error); })); }
         });
+    }
+
+    private bool ConfirmUpdateWithNotes(Dictionary<string, object> release, string latest)
+    {
+        string notes = Value(release, "body").Trim();
+        if (notes.Length == 0) notes = "Release notes are not available for this version.";
+        if (notes.Length > 12000) notes = notes.Substring(0, 12000) + "\r\n\r\nMore details are on the GitHub release page.";
+        Color background = dark ? Color.FromArgb(27, 36, 43) : Color.White;
+        Color foreground = dark ? Color.FromArgb(235, 242, 246) : Color.FromArgb(20, 36, 57);
+        using (Form dialog = new Form { Text = "Toolkit Update Available", StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(680, 530), MinimumSize = new Size(680, 530), FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false, MinimizeBox = false, BackColor = background, ForeColor = foreground, Font = new Font("Segoe UI", 9f) })
+        {
+            dialog.Controls.Add(new Label { Text = "Version " + latest + " is available", Left = 22, Top = 18, Width = 620, Height = 33,
+                Font = new Font("Segoe UI", 15f, FontStyle.Bold), ForeColor = foreground });
+            dialog.Controls.Add(new Label { Text = "Installed version: " + version + "    |    What's changed and what's removed:",
+                Left = 22, Top = 59, Width = 620, Height = 25, ForeColor = foreground });
+            dialog.Controls.Add(new TextBox { Text = notes, Left = 22, Top = 91, Width = 620, Height = 305,
+                Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, WordWrap = true,
+                BackColor = dark ? Color.FromArgb(38, 50, 59) : Color.White, ForeColor = foreground });
+            dialog.Controls.Add(new Label { Text = "Updating will close and reopen the toolkit. Saved profiles and logs will stay in place.",
+                Left = 22, Top = 410, Width = 620, Height = 28, ForeColor = foreground });
+            Button later = new Button { Text = "Later", Left = 394, Top = 446, Width = 115, Height = 34,
+                DialogResult = DialogResult.No, BackColor = Slate, ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            Button install = new Button { Text = "Update Now", Left = 525, Top = 446, Width = 117, Height = 34,
+                DialogResult = DialogResult.Yes, BackColor = Cobalt, ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            later.FlatAppearance.BorderSize = 0; install.FlatAppearance.BorderSize = 0;
+            dialog.Controls.Add(later); dialog.Controls.Add(install); dialog.CancelButton = later;
+            return dialog.ShowDialog(this) == DialogResult.Yes;
+        }
     }
 
     private static string ParseReleaseChecksum(string content)
