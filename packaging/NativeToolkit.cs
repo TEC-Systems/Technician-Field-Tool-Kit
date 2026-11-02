@@ -634,7 +634,8 @@ internal sealed partial class ToolkitWindow : Form
         footer.Controls.Add(statusLabel);
         updateButton = B(footer, "Check Updates", 338, 5, 148, OpenUpdateOffer, "Check for a newer toolkit release or install an available update.", Cobalt);
         B(footer, "Activity Report", 500, 5, 148, ShowActivityReport, "View this week's saved sites and technician activity.", Green);
-        internetLabel = new Label { Text = "Internet: Checking", Dock = DockStyle.Right, Width = 450, TextAlign = ContentAlignment.MiddleRight, Padding = new Padding(0, 0, 18, 0) };
+        B(footer, "Backup & Restore", 664, 5, 148, ShowBackupDialog, "Export or import saved IP and RDP profiles.", Slate);
+        internetLabel = new Label { Text = "Internet: Checking", Dock = DockStyle.Right, Width = 270, TextAlign = ContentAlignment.MiddleRight, Padding = new Padding(0, 0, 18, 0) };
         footer.Controls.Add(internetLabel);
 
         split = new SplitContainer { Dock = DockStyle.Fill };
@@ -1253,8 +1254,6 @@ internal sealed partial class ToolkitWindow : Form
         B(page, "Load Profile", 18, 214, 130, LoadProfile, "Load the selected saved site profile.", Cobalt);
         B(page, "Save Profile", 164, 214, 130, SaveProfile, "Save this adapter and IP configuration for reuse.", Green);
         B(page, "Delete Profile", 310, 214, 130, DeleteProfile, "Delete the selected profile; this does not change Windows IP settings.", Slate);
-        B(page, "Export Backup", 456, 214, 124, ExportProfileBackup, "Save IP and RDP profiles without passwords to a chosen location.", Green);
-        B(page, "Import Backup", 594, 214, 124, ImportProfileBackup, "Import a TEC profile backup or AllProfiles.xml without changing network settings.", Cobalt);
         page.Controls.Add(L("Adapter", 18, 261, 140));
         adapterChoice = new ComboBox { Left = 18, Top = 285, Width = 330, DropDownStyle = ComboBoxStyle.DropDownList }; page.Controls.Add(adapterChoice);
         adapterChoice.SelectedIndexChanged += delegate {
@@ -1557,6 +1556,26 @@ internal sealed partial class ToolkitWindow : Form
         ToolkitProfile p = (ToolkitProfile)profileView.SelectedItems[0].Tag;
         if (MessageBox.Show(this, "Delete saved profile '" + p.Name + "'?", "Delete Profile", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         profiles.Remove(p); SaveSettings(); RefreshProfiles(); Log("IP Shifter", "OK", "Deleted profile: " + p.Name);
+    }
+
+    private void ShowBackupDialog()
+    {
+        Color background = dark ? Color.FromArgb(27, 36, 43) : Color.White;
+        Color foreground = dark ? Color.FromArgb(235, 242, 246) : Color.FromArgb(20, 36, 57);
+        using (Form dialog = new Form { Text = "Backup & Restore", StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(475, 280), MinimumSize = new Size(475, 280), MaximizeBox = false, MinimizeBox = false,
+            FormBorderStyle = FormBorderStyle.FixedDialog, BackColor = background, ForeColor = foreground, Font = new Font("Segoe UI", 9f) })
+        {
+            dialog.Controls.Add(new Label { Text = "Saved IP profiles and RDP sites", Left = 24, Top = 22, Width = 420, Height = 30,
+                Font = new Font("Segoe UI", 13f, FontStyle.Bold), ForeColor = foreground });
+            dialog.Controls.Add(new Label { Text = "Export a password-free backup to a company-approved folder, or import one on this laptop. You can also import AllProfiles.xml from IP Shifter.",
+                Left = 24, Top = 66, Width = 420, Height = 54, ForeColor = foreground });
+            B(dialog, "Export Backup", 24, 138, 190, delegate { dialog.Close(); ExportProfileBackup(); },
+                "Save IP and RDP profiles without passwords.", Green);
+            B(dialog, "Import Backup", 230, 138, 190, delegate { dialog.Close(); ImportProfileBackup(); },
+                "Import a TEC profile backup or AllProfiles.xml.", Cobalt);
+            dialog.ShowDialog(this);
+        }
     }
 
     private void ExportProfileBackup()
@@ -2596,9 +2615,9 @@ internal sealed partial class ToolkitWindow : Form
             TabPage ipPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "IP Shifter");
             if (!ipPage.Controls.OfType<Button>().Any(c => c.Text == "Restore Previous IP"))
                 throw new InvalidOperationException("IP restore action is missing.");
-            if (!ipPage.Controls.OfType<Button>().Any(c => c.Text == "Export Backup") ||
-                !ipPage.Controls.OfType<Button>().Any(c => c.Text == "Import Backup"))
-                throw new InvalidOperationException("Profile backup actions are missing.");
+            if (!footerPanel.Controls.OfType<Button>().Any(c => c.Text == "Backup & Restore") ||
+                ipPage.Controls.OfType<Button>().Any(c => c.Text == "Export Backup" || c.Text == "Import Backup"))
+                throw new InvalidOperationException("Profile backups should be available from the toolkit-wide footer.");
             string checksumSample = new string('a', 64) + "  TEC-Systems-FieldToolkit-Setup.exe";
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
