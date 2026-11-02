@@ -1677,27 +1677,27 @@ internal sealed partial class ToolkitWindow : Form
                 if (row["DHCPEnabled"] == null) break;
                 IpRestorePoint point = new IpRestorePoint { AdapterGuid = adapter.Guid, AdapterName = adapter.Name,
                     CapturedUtc = DateTime.UtcNow.ToString("o"), DhcpEnabled = Convert.ToBoolean(row["DHCPEnabled"]) };
-                if (!point.DhcpEnabled)
-                {
-                    string[] addresses = row["IPAddress"] as string[] ?? new string[0];
-                    string[] masks = row["IPSubnet"] as string[] ?? new string[0];
-                    List<int> ipv4Indexes = new List<int>();
-                    for (int i = 0; i < addresses.Length; i++)
-                    {
-                        IPAddress parsed;
-                        if (IPAddress.TryParse(addresses[i], out parsed) && parsed.AddressFamily == AddressFamily.InterNetwork && addresses[i] != "0.0.0.0") ipv4Indexes.Add(i);
-                    }
-                    if (ipv4Indexes.Count != 1 || ipv4Indexes[0] >= masks.Length)
-                        throw new InvalidOperationException("This adapter has multiple or unavailable static IPv4 addresses. IP Shifter cannot safely save and restore that configuration, so no settings were changed.");
-                    point.IPAddress = ValidateIpv4(addresses[ipv4Indexes[0]], "Previous IP address", false);
-                    point.SubnetMask = ValidateIpv4(masks[ipv4Indexes[0]], "Previous subnet mask", false);
-                }
-                List<string> gateways = Ipv4Values(row["DefaultIPGateway"]);
-                if (gateways.Count > 1) throw new InvalidOperationException("This adapter has multiple IPv4 gateways. IP Shifter cannot safely restore them, so no settings were changed.");
-                point.Gateway = gateways.Count == 0 ? "" : ValidateIpv4(gateways[0], "Previous gateway", false);
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\" + adapter.Guid))
                 {
                     if (key == null) throw new InvalidOperationException("Could not read the adapter's DNS settings for restore. No settings were changed.");
+                    if (!point.DhcpEnabled)
+                    {
+                        // The live WMI list can include transient addresses. Prefer the configured static values.
+                        List<KeyValuePair<string, string>> configured = StaticIpv4Pairs(key.GetValue("IPAddress") as string[], key.GetValue("SubnetMask") as string[]);
+                        if (configured.Count == 0) configured = StaticIpv4Pairs(row["IPAddress"] as string[], row["IPSubnet"] as string[]);
+                        if (configured.Count == 0)
+                            throw new InvalidOperationException("Windows did not expose a static IPv4 address for " + adapter.Name +
+                                ". No settings were changed because a restore point could not be saved. Click Refresh and Details to inspect this adapter.");
+                        if (configured.Count > 1)
+                            throw new InvalidOperationException(adapter.Name + " has " + configured.Count + " configured IPv4 addresses: " +
+                                String.Join(", ", configured.Select(entry => entry.Key + " / " + entry.Value).ToArray()) +
+                                ". IP Shifter can restore only one static address, so no settings were changed. Review the extra addresses in Windows Network Connections.");
+                        point.IPAddress = configured[0].Key;
+                        point.SubnetMask = configured[0].Value;
+                    }
+                    List<string> gateways = Ipv4Values(row["DefaultIPGateway"]);
+                    if (gateways.Count > 1) throw new InvalidOperationException("This adapter has multiple IPv4 gateways. IP Shifter cannot safely restore them, so no settings were changed.");
+                    point.Gateway = gateways.Count == 0 ? "" : ValidateIpv4(gateways[0], "Previous gateway", false);
                     string nameServer = Convert.ToString(key.GetValue("NameServer")).Trim();
                     point.DnsAutomatic = nameServer.Length == 0;
                     if (!point.DnsAutomatic)
@@ -1711,6 +1711,22 @@ internal sealed partial class ToolkitWindow : Form
                 return point;
             }
         throw new InvalidOperationException("Could not read the selected adapter's Windows IP settings for restore. No settings were changed.");
+    }
+
+    private static List<KeyValuePair<string, string>> StaticIpv4Pairs(string[] addresses, string[] masks)
+    {
+        List<KeyValuePair<string, string>> result = new List<KeyValuePair<string, string>>();
+        if (addresses == null) return result;
+        for (int index = 0; index < addresses.Length; index++)
+        {
+            IPAddress parsed;
+            if (!IPAddress.TryParse(addresses[index], out parsed) || parsed.AddressFamily != AddressFamily.InterNetwork || addresses[index] == "0.0.0.0") continue;
+            if (masks == null || index >= masks.Length)
+                throw new InvalidOperationException("Windows reported static IP " + addresses[index] + " without its subnet mask. No settings were changed.");
+            result.Add(new KeyValuePair<string, string>(ValidateIpv4(addresses[index], "Previous IP address", false),
+                ValidateIpv4(masks[index], "Previous subnet mask", false)));
+        }
+        return result.Distinct().ToList();
     }
 
     private void SaveIpRestorePoint(ToolkitAdapter adapter)
@@ -1798,7 +1814,7 @@ internal sealed partial class ToolkitWindow : Form
         string summary = adapter.Name + "\r\nIP: " + ip + "\r\nMask: " + mask + "\r\nGateway: " + (gateway.Length == 0 ? "None" : gateway) + "\r\nDNS: " + (dns1.Length == 0 ? "Automatic" : dns1 + (dns2.Length == 0 ? "" : ", " + dns2));
         string probeNote = alreadyAssigned ? "This IP is already assigned to the selected adapter. Reapply these settings?" :
             probe.ArpChecked ? "No ARP or ping response was detected. This does not prove the IP is free; silent devices may still use it. Apply this configuration?" :
-            "No ping reply was detected. The target is outside this adapter's current subnet, so a direct ARP check was not possible. This does not prove the IP is free. Apply this configuration?";
+            "This IP is on a different subnet from the adapter's current address. That is normal when changing networks. A direct duplicate-IP check is not possible until connected to that subnet. Confirm the site address and continue?";
         if (MessageBox.Show(this, probeNote + "\r\n\r\n" + summary, "Confirm IP Change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         SaveIpRestorePoint(adapter);
         string before = adapter.IP + " / " + adapter.Mask, after = ip + " / " + mask;
@@ -2622,6 +2638,11 @@ internal sealed partial class ToolkitWindow : Form
                 IpConflictOwners(assignments, ipSelected, "192.168.2.251").Length != 0 ||
                 IpConflictOwners(assignments, ipSelected, "10.211.113.252").Length != 0)
                 throw new InvalidOperationException("Existing IP assignment detection failed.");
+            List<KeyValuePair<string, string>> configuredIp = StaticIpv4Pairs(
+                new[] { "0.0.0.0", "10.17.208.253" }, new[] { "0.0.0.0", "255.255.255.0" });
+            if (configuredIp.Count != 1 || configuredIp[0].Key != "10.17.208.253" || configuredIp[0].Value != "255.255.255.0" ||
+                StaticIpv4Pairs(new[] { "10.17.208.253", "10.17.208.254" }, new[] { "255.255.255.0", "255.255.255.0" }).Count != 2)
+                throw new InvalidOperationException("Configured static IPv4 capture failed.");
             ToolkitAdapter probeAdapter = new ToolkitAdapter { IP = "192.168.2.251", Mask = "255.255.255.0" };
             if (!SameIpv4Subnet(probeAdapter, "192.168.2.10") || SameIpv4Subnet(probeAdapter, "192.168.3.10"))
                 throw new InvalidOperationException("Duplicate IP subnet check failed.");
