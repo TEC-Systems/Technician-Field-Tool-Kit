@@ -1562,7 +1562,7 @@ internal sealed partial class ToolkitWindow : Form
     private void ExportProfileBackup()
     {
         using (SaveFileDialog dialog = new SaveFileDialog { Filter = "TEC profile backups (*.json)|*.json",
-            FileName = "TEC-Toolkit-Profiles-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".json" })
+            FileName = ToolkitBackup.FileName(Environment.UserName, Environment.MachineName, DateTime.Now) })
         {
             if (dialog.ShowDialog(this) != DialogResult.OK) return;
             File.WriteAllText(dialog.FileName, ToolkitBackup.Export(profiles, rdpSites, version), Encoding.UTF8);

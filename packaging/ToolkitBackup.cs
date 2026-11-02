@@ -22,11 +22,18 @@ internal static class ToolkitBackup
     private const string Format = "TEC-FieldToolkit-Profiles-1";
     private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer { MaxJsonLength = 2097152 };
 
+    internal static string FileName(string username, string hostname, DateTime created)
+    {
+        char[] invalid = Path.GetInvalidFileNameChars();
+        Func<string, string> safe = value => new string((value ?? "").Select(c => invalid.Contains(c) || c == '/' || c == '\\' ? '_' : c).ToArray());
+        return safe(username) + " - " + safe(hostname) + " - " + created.ToString("yyyyMMdd-HHmmss") + ".json";
+    }
+
     internal static string Export(IEnumerable<ToolkitProfile> ipProfiles, IEnumerable<RdpSiteProfile> rdpSites, string version)
     {
         return Serializer.Serialize(new Dictionary<string, object> {
             { "BackupFormat", Format }, { "ToolkitVersion", version }, { "CreatedUtc", DateTime.UtcNow.ToString("u") },
-            { "Computer", Environment.MachineName },
+            { "Computer", Environment.MachineName }, { "WindowsUser", Environment.UserName },
             { "IpProfiles", ipProfiles.Select(p => new Dictionary<string, object> {
                 { "Name", p.Name }, { "Adapter", p.Adapter }, { "IPAddress", p.IPAddress }, { "SubnetMask", p.SubnetMask },
                 { "Gateway", p.Gateway }, { "Dns1", p.Dns1 }, { "Dns2", p.Dns2 }
@@ -150,6 +157,9 @@ internal static class ToolkitBackup
 
     internal static void SelfTest()
     {
+        if (FileName("technician", "FIELD-LAPTOP", new DateTime(2026, 10, 1, 12, 30, 0)) !=
+            "technician - FIELD-LAPTOP - 20261001-123000.json")
+            throw new InvalidOperationException("Profile backup filename is missing the username or hostname.");
         ToolkitProfile ip = new ToolkitProfile { Name = "Test site", Adapter = "Ethernet", IPAddress = "192.0.2.10", SubnetMask = "255.255.255.0" };
         RdpSiteProfile rdp = new RdpSiteProfile { Name = "Test RDP", Host = "192.0.2.20", User = "tech", ProtectedPassword = "SECRET" };
         string exported = Export(new[] { ip }, new[] { rdp }, "0.0.0");
