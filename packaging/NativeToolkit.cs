@@ -234,6 +234,13 @@ internal sealed class ToolkitAdapter
     public string Mac = "";
 }
 
+internal sealed class DuplicateIpProbe
+{
+    public bool InUse;
+    public bool ArpChecked;
+    public string Evidence = "";
+}
+
 internal sealed class ScanHost
 {
     public string IP = "";
@@ -1246,8 +1253,13 @@ internal sealed partial class ToolkitWindow : Form
         B(page, "Load Profile", 18, 214, 130, LoadProfile, "Load the selected saved site profile.", Cobalt);
         B(page, "Save Profile", 164, 214, 130, SaveProfile, "Save this adapter and IP configuration for reuse.", Green);
         B(page, "Delete Profile", 310, 214, 130, DeleteProfile, "Delete the selected profile; this does not change Windows IP settings.", Slate);
+        B(page, "Export Backup", 456, 214, 124, ExportProfileBackup, "Save IP and RDP profiles without passwords to a chosen location.", Green);
+        B(page, "Import Backup", 594, 214, 124, ImportProfileBackup, "Import a TEC profile backup or AllProfiles.xml without changing network settings.", Cobalt);
         page.Controls.Add(L("Adapter", 18, 261, 140));
         adapterChoice = new ComboBox { Left = 18, Top = 285, Width = 330, DropDownStyle = ComboBoxStyle.DropDownList }; page.Controls.Add(adapterChoice);
+        adapterChoice.SelectedIndexChanged += delegate {
+            if (adapterChoice.SelectedItem != null) tips.SetToolTip(adapterChoice, Convert.ToString(adapterChoice.SelectedItem));
+        };
         B(page, "Refresh", 366, 280, 100, RefreshAdapters, "Refresh connected and disconnected adapters with saved IPv4 settings.", Cobalt);
         B(page, "Details", 482, 280, 100, AdapterDetails, "Show selected adapter status, IP, mask, gateway, DNS, and MAC in the log.", Cobalt);
         page.Controls.Add(L("Profile name", 18, 327, 140)); profileName = T(18, 351, 330, ""); page.Controls.Add(profileName);
@@ -1344,6 +1356,9 @@ internal sealed partial class ToolkitWindow : Form
         adapters.AddRange(found);
         adapterChoice.Items.Clear();
         foreach (ToolkitAdapter adapter in adapters) adapterChoice.Items.Add(adapter.Name + " [" + adapter.Status + "] - IP: " + adapter.IP + (String.IsNullOrEmpty(adapter.Mask) ? "" : " / " + adapter.Mask));
+        int widest = adapterChoice.Items.Cast<object>().Select(item => TextRenderer.MeasureText(Convert.ToString(item), adapterChoice.Font).Width + 38)
+            .DefaultIfEmpty(adapterChoice.Width).Max();
+        adapterChoice.DropDownWidth = Math.Min(Math.Max(adapterChoice.Width, widest), Math.Max(adapterChoice.Width, Screen.FromControl(adapterChoice).WorkingArea.Width - 40));
         if (adapters.Count > 0) adapterChoice.SelectedIndex = Math.Max(0, adapters.FindIndex(a => a.Name == selected));
         RefreshScannerAdapters();
         RefreshGatewayAdapters();
@@ -1395,6 +1410,54 @@ internal sealed partial class ToolkitWindow : Form
         return assignments.Where(a => a.IP == ip &&
             !(String.IsNullOrEmpty(selected.Guid) ? String.Equals(a.Name, selected.Name, StringComparison.OrdinalIgnoreCase) : String.Equals(a.Guid, selected.Guid, StringComparison.OrdinalIgnoreCase)))
             .Select(a => String.IsNullOrWhiteSpace(a.Name) ? a.Guid : a.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    [DllImport("iphlpapi.dll", ExactSpelling = true)]
+    private static extern int SendARP(uint destination, uint source, byte[] macAddress, ref int addressLength);
+
+    private static bool SameIpv4Subnet(ToolkitAdapter adapter, string target)
+    {
+        IPAddress address, mask;
+        return IPAddress.TryParse(adapter.IP, out address) && address.AddressFamily == AddressFamily.InterNetwork &&
+            IPAddress.TryParse(adapter.Mask, out mask) && mask.AddressFamily == AddressFamily.InterNetwork &&
+            (IpNumber(adapter.IP) & IpNumber(adapter.Mask)) == (IpNumber(target) & IpNumber(adapter.Mask));
+    }
+
+    private static DuplicateIpProbe ProbeDuplicateIp(string ip, ToolkitAdapter adapter)
+    {
+        DuplicateIpProbe result = new DuplicateIpProbe();
+        if (adapter.Status == "Connected" && SameIpv4Subnet(adapter, ip))
+        {
+            result.ArpChecked = true;
+            try
+            {
+                byte[] mac = new byte[6]; int length = mac.Length;
+                uint destination = BitConverter.ToUInt32(IPAddress.Parse(ip).GetAddressBytes(), 0);
+                uint source = BitConverter.ToUInt32(IPAddress.Parse(adapter.IP).GetAddressBytes(), 0);
+                if (SendARP(destination, source, mac, ref length) == 0 && length >= 6)
+                {
+                    result.InUse = true;
+                    result.Evidence = "An ARP responder was found at " + ip + " (MAC " + BitConverter.ToString(mac, 0, 6) + ").";
+                    return result;
+                }
+            }
+            catch (DllNotFoundException) { result.ArpChecked = false; }
+            catch (EntryPointNotFoundException) { result.ArpChecked = false; }
+        }
+        try
+        {
+            using (Ping ping = new Ping())
+            {
+                PingReply reply = ping.Send(ip, 650);
+                if (reply.Status == IPStatus.Success && ip == reply.Address.ToString())
+                {
+                    result.InUse = true;
+                    result.Evidence = ip + " replied to ping (" + reply.RoundtripTime + " ms).";
+                }
+            }
+        }
+        catch (PingException) { }
+        return result;
     }
 
     private static string JoinAddresses(object addresses)
@@ -1494,6 +1557,55 @@ internal sealed partial class ToolkitWindow : Form
         ToolkitProfile p = (ToolkitProfile)profileView.SelectedItems[0].Tag;
         if (MessageBox.Show(this, "Delete saved profile '" + p.Name + "'?", "Delete Profile", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         profiles.Remove(p); SaveSettings(); RefreshProfiles(); Log("IP Shifter", "OK", "Deleted profile: " + p.Name);
+    }
+
+    private void ExportProfileBackup()
+    {
+        using (SaveFileDialog dialog = new SaveFileDialog { Filter = "TEC profile backups (*.json)|*.json",
+            FileName = "TEC-Toolkit-Profiles-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".json" })
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            File.WriteAllText(dialog.FileName, ToolkitBackup.Export(profiles, rdpSites, version), Encoding.UTF8);
+            Log("Backup", "OK", "Exported password-free IP and RDP profile backup: " + dialog.FileName);
+            MessageBox.Show(this, "Saved " + profiles.Count + " IP profiles and " + rdpSites.Count +
+                " RDP sites without passwords. Store this file in an approved company backup location. RDP passwords must be entered again on a replacement laptop.",
+                "Backup Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    private void ImportProfileBackup()
+    {
+        using (OpenFileDialog dialog = new OpenFileDialog { Title = "Import toolkit profiles",
+            Filter = "Supported backups (*.json;*.xml)|*.json;*.xml|TEC profile backup (*.json)|*.json|AllProfiles XML (*.xml)|*.xml", CheckFileExists = true })
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            ToolkitBackupData backup = ToolkitBackup.Read(dialog.FileName);
+            if (MessageBox.Show(this, "Import " + backup.IpProfiles.Count + " IP profiles and " + backup.RdpSites.Count +
+                " RDP sites? Existing entries will remain. Duplicate names will receive a number. Importing does not apply IP settings. " +
+                (backup.SkippedDhcp > 0 ? backup.SkippedDhcp + " DHCP profiles cannot be imported and will be skipped. " : "") +
+                "Proxy settings and RDP passwords are not imported.", "Import Profiles", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            foreach (ToolkitProfile profile in backup.IpProfiles)
+            {
+                profile.Name = UniqueName(profile.Name, profiles.Select(p => p.Name));
+                profiles.Add(profile);
+            }
+            foreach (RdpSiteProfile site in backup.RdpSites)
+            {
+                site.Name = UniqueName(site.Name, rdpSites.Select(p => p.Name));
+                site.ProtectedPassword = "";
+                rdpSites.Add(site);
+            }
+            try { SaveSettings(); }
+            catch
+            {
+                foreach (ToolkitProfile profile in backup.IpProfiles) profiles.Remove(profile);
+                foreach (RdpSiteProfile site in backup.RdpSites) rdpSites.Remove(site);
+                throw;
+            }
+            RefreshProfiles(); rdpManager.Reload();
+            Log("Backup", "OK", "Imported " + backup.IpProfiles.Count + " IP profiles and " + backup.RdpSites.Count + " RDP sites from " + Path.GetFileName(dialog.FileName));
+            MessageBox.Show(this, "Profiles imported. Review adapter names and site settings before use.", "Import Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
     }
 
     private static string ValidateIpv4(string value, string field, bool optional)
@@ -1656,9 +1768,19 @@ internal sealed partial class ToolkitWindow : Form
             throw new InvalidOperationException("IP address " + ip + " is already assigned to: " + String.Join(", ", owners) +
                 ". No settings were changed. Choose another IP, or review and remove the existing assignment from that adapter before trying again.");
         bool alreadyAssigned = assignments.Any(a => a.IP == ip && (String.IsNullOrEmpty(adapter.Guid) ? String.Equals(a.Name, adapter.Name, StringComparison.OrdinalIgnoreCase) : String.Equals(a.Guid, adapter.Guid, StringComparison.OrdinalIgnoreCase)));
+        DuplicateIpProbe probe = alreadyAssigned ? new DuplicateIpProbe() : ProbeDuplicateIp(ip, adapter);
+        if (probe.InUse)
+        {
+            Log("IP Shifter", "WARN", "Possible duplicate IP: " + probe.Evidence);
+            throw new InvalidOperationException("Possible duplicate IP on the network. " + probe.Evidence +
+                " No settings were changed. Choose a different IP address or investigate the responding device.");
+        }
         RequireAdmin();
         string summary = adapter.Name + "\r\nIP: " + ip + "\r\nMask: " + mask + "\r\nGateway: " + (gateway.Length == 0 ? "None" : gateway) + "\r\nDNS: " + (dns1.Length == 0 ? "Automatic" : dns1 + (dns2.Length == 0 ? "" : ", " + dns2));
-        if (MessageBox.Show(this, (alreadyAssigned ? "This IP is already assigned to the selected adapter. Reapply these settings?" : "Apply this configuration?") + "\r\n\r\n" + summary, "Confirm IP Change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        string probeNote = alreadyAssigned ? "This IP is already assigned to the selected adapter. Reapply these settings?" :
+            probe.ArpChecked ? "No ARP or ping response was detected. This does not prove the IP is free; silent devices may still use it. Apply this configuration?" :
+            "No ping reply was detected. The target is outside this adapter's current subnet, so a direct ARP check was not possible. This does not prove the IP is free. Apply this configuration?";
+        if (MessageBox.Show(this, probeNote + "\r\n\r\n" + summary, "Confirm IP Change", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         SaveIpRestorePoint(adapter);
         string before = adapter.IP + " / " + adapter.Mask, after = ip + " / " + mask;
         try
@@ -1710,8 +1832,9 @@ internal sealed partial class ToolkitWindow : Form
         B(device, "Ping Gateway", 172, 106, 142, PingSelectedGateway, "Ping the gateway shown for the selected network adapter.", Green);
         B(device, "Tracert", 14, 146, 142, delegate { if (!ValidTarget(networkTarget.Text)) throw new InvalidOperationException("Enter a valid target."); RunExternal("Trace", "tracert.exe", "-d " + networkTarget.Text.Trim()); }, "Trace the route to the device.", Slate);
         B(device, "PathPing", 172, 146, 142, delegate { if (!ValidTarget(networkTarget.Text)) throw new InvalidOperationException("Enter a valid target."); RunExternal("PathPing", "pathping.exe", "-n " + networkTarget.Text.Trim()); }, "Find route and packet loss along the path.", Slate);
-        B(device, "DNS Lookup", 14, 186, 142, delegate { Lookup(networkTarget.Text); }, "Resolve the device hostname.", Cobalt);
-        B(device, "Open Webpage", 172, 186, 142, delegate { OpenWeb(networkTarget.Text); }, "Open the device's web interface.", Cobalt);
+        B(device, "DNS Lookup", 14, 186, 94, delegate { Lookup(networkTarget.Text); }, "Resolve the device hostname.", Cobalt);
+        B(device, "Open Web", 118, 186, 94, delegate { OpenWeb(networkTarget.Text); }, "Open the device's web interface.", Cobalt);
+        B(device, "Duplicate IP", 222, 186, 94, CheckDuplicateIp, "Check the device IP for a local assignment, ARP response, or ping reply. Uses the selected IP Shifter adapter.", Green);
 
         GroupBox access = new GroupBox { Text = "Device Access", Left = 376, Top = 18, Width = 340, Height = 230 }; page.Controls.Add(access);
         access.Controls.Add(L("Host / IP", 14, 28, 155)); switchTarget = T(14, 52, 220, "192.168.1.2"); access.Controls.Add(switchTarget);
@@ -1776,6 +1899,22 @@ internal sealed partial class ToolkitWindow : Form
         ToolkitAdapter adapter = gatewayAdapters[networkGatewayChoice.SelectedIndex];
         if (!IsUsableIpv4(adapter.Gateway)) throw new InvalidOperationException("The selected adapter does not have a valid IPv4 gateway. Refresh the adapters and try again.");
         PingTerminal(adapter.Gateway, false);
+    }
+
+    private void CheckDuplicateIp()
+    {
+        string ip = ValidateIpv4(networkTarget.Text, "Device IP", false);
+        ToolkitAdapter adapter = SelectedAdapter();
+        List<ToolkitAdapter> assignments = ReadIpAssignments();
+        string[] owners = assignments.Where(a => a.IP == ip).Select(a => String.IsNullOrWhiteSpace(a.Name) ? a.Guid : a.Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        DuplicateIpProbe probe = owners.Length > 0 ? new DuplicateIpProbe() : ProbeDuplicateIp(ip, adapter);
+        string result = owners.Length > 0 ? ip + " is already assigned on this laptop to " + String.Join(", ", owners) + "." :
+            probe.InUse ? "Possible duplicate IP: " + probe.Evidence + " Choose a different address or investigate the device." :
+            "No response found for " + ip + ". This does not prove the address is free. Devices may block ping, and ARP can only check the selected adapter's current subnet.";
+        Log("Duplicate IP", owners.Length > 0 || probe.InUse ? "WARN" : "INFO", result);
+        MessageBox.Show(this, result, "Duplicate IP Check", MessageBoxButtons.OK,
+            owners.Length > 0 || probe.InUse ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
     }
 
     private int SelectedTelnetPort()
@@ -1866,7 +2005,7 @@ internal sealed partial class ToolkitWindow : Form
 
     private string[] RecentNetworkChecks()
     {
-        string[] areas = { "Ping", "DNS", "Telnet", "Switch", "Trace", "PathPing" };
+        string[] areas = { "Ping", "DNS", "Telnet", "Switch", "Trace", "PathPing", "Duplicate IP" };
         return logView.Items.Cast<ListViewItem>()
             .Where(row => row.SubItems.Count >= 4 && areas.Contains(row.SubItems[2].Text))
             .Reverse().Take(15).Reverse()
@@ -2421,6 +2560,7 @@ internal sealed partial class ToolkitWindow : Form
         {
             testing = true;
             RdpManager.SelfTest();
+            ToolkitBackup.SelfTest();
             ActivitySnapshot.SelfTest();
             if (!IsBluetoothAdapter("Renamed adapter", "Bluetooth Device (Personal Area Network)", "", "") ||
                 !IsBluetoothAdapter("Renamed adapter", "", "BTH\\MS_BTHPAN", "") ||
@@ -2433,6 +2573,9 @@ internal sealed partial class ToolkitWindow : Form
                 IpConflictOwners(assignments, ipSelected, "192.168.2.251").Length != 0 ||
                 IpConflictOwners(assignments, ipSelected, "10.211.113.252").Length != 0)
                 throw new InvalidOperationException("Existing IP assignment detection failed.");
+            ToolkitAdapter probeAdapter = new ToolkitAdapter { IP = "192.168.2.251", Mask = "255.255.255.0" };
+            if (!SameIpv4Subnet(probeAdapter, "192.168.2.10") || SameIpv4Subnet(probeAdapter, "192.168.3.10"))
+                throw new InvalidOperationException("Duplicate IP subnet check failed.");
             IpRestorePoint restoreSample = new IpRestorePoint { AdapterGuid = "sample", AdapterName = "Ethernet 3", IPAddress = "192.0.2.10",
                 SubnetMask = "255.255.255.0", Gateway = "192.0.2.1", DnsAutomatic = false, Dns1 = "1.1.1.1", Dns2 = "8.8.8.8" };
             string[] restoreCommands = RestoreIpCommands(restoreSample, "Ethernet 3");
@@ -2453,6 +2596,9 @@ internal sealed partial class ToolkitWindow : Form
             TabPage ipPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "IP Shifter");
             if (!ipPage.Controls.OfType<Button>().Any(c => c.Text == "Restore Previous IP"))
                 throw new InvalidOperationException("IP restore action is missing.");
+            if (!ipPage.Controls.OfType<Button>().Any(c => c.Text == "Export Backup") ||
+                !ipPage.Controls.OfType<Button>().Any(c => c.Text == "Import Backup"))
+                throw new InvalidOperationException("Profile backup actions are missing.");
             string checksumSample = new string('a', 64) + "  TEC-Systems-FieldToolkit-Setup.exe";
             if (ParseReleaseChecksum(checksumSample + "\n") != new string('a', 64) ||
                 ParseReleaseChecksum(checksumSample + "\r\n") != new string('a', 64))
@@ -2467,6 +2613,9 @@ internal sealed partial class ToolkitWindow : Form
                 throw new InvalidOperationException("IP Scanner/RDP tab order or hidden Sites tab is incorrect.");
             SelfTestSiteWorkspace();
             TabPage networkPage = tabs.TabPages.Cast<TabPage>().First(p => p.Text == "Network Troubleshooting");
+            if (!networkPage.Controls.OfType<GroupBox>().First(p => p.Text == "Device Checks").Controls.OfType<Button>()
+                .Any(c => c.Text == "Duplicate IP"))
+                throw new InvalidOperationException("Duplicate IP check is missing from Network Troubleshooting.");
             if (!networkPage.Controls.OfType<Button>().Any(c => c.Text == "Export Summary"))
                 throw new InvalidOperationException("Troubleshooting summary export is missing.");
             string summarySample = BuildTroubleshootingSummary(
