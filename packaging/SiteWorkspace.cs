@@ -476,7 +476,10 @@ internal sealed partial class ToolkitWindow
 
     private void ShowIpHistory()
     {
-        using (Form dialog = new Form { Text = "IP Change History", StartPosition = FormStartPosition.CenterParent, Size = new Size(960, 460), MinimumSize = new Size(700, 300) })
+        Rectangle work = Screen.FromControl(this).WorkingArea;
+        using (Form dialog = new Form { Text = "IP Change History", StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(Math.Min(960, work.Width), Math.Min(460, work.Height)),
+            MinimumSize = new Size(Math.Min(700, work.Width), Math.Min(300, work.Height)) })
         {
             ListView list = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true };
             list.Columns.Add("UTC", 145); list.Columns.Add("Adapter", 130); list.Columns.Add("Action", 105);

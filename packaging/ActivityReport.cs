@@ -237,7 +237,12 @@ internal sealed class ActivityWindow : Form
     {
         folder = dataFolder; rdpCount = getRdpCount; ipCount = getIpCount; dark = darkTheme; preview = previewMode;
         Text = preview ? "TEC Systems — Activity Report (Sample Data)" : "TEC Systems — Activity Report";
-        ClientSize = new Size(930, 700); MinimumSize = new Size(840, 630);
+        Rectangle work = Screen.PrimaryScreen.WorkingArea;
+        MinimumSize = new Size(Math.Min(840, work.Width), Math.Min(630, work.Height));
+        ClientSize = new Size(Math.Min(930, Math.Max(600, work.Width - 40)),
+            Math.Min(700, Math.Max(480, work.Height - 70)));
+        AutoScroll = true;
+        AutoScrollMinSize = new Size(930, 680);
         StartPosition = FormStartPosition.CenterParent; Font = new Font("Segoe UI", 9f);
         Color canvas = dark ? Color.FromArgb(27, 36, 43) : Color.FromArgb(240, 244, 248);
         Color surface = dark ? Color.FromArgb(38, 50, 59) : Color.White;

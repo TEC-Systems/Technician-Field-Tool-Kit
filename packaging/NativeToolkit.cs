@@ -350,6 +350,8 @@ internal sealed partial class ToolkitWindow : Form
     private Panel headerPanel;
     private Panel footerPanel;
     private PictureBox brandPicture;
+    private Label productLabel, managedLabel, versionLabel, searchLabel, hostLabel, modeLabel;
+    private Button searchButton, activityButton, backupButton;
     private Image lightBrand;
     private Image darkBrand;
     private ListView logView;
@@ -410,8 +412,9 @@ internal sealed partial class ToolkitWindow : Form
         LoadSettings();
         Text = Product;
         StartPosition = FormStartPosition.CenterScreen;
-        Size = new Size(1280, 780);
-        MinimumSize = new Size(1120, 680);
+        Rectangle workingArea = Screen.PrimaryScreen.WorkingArea;
+        MinimumSize = new Size(Math.Min(900, workingArea.Width), Math.Min(560, workingArea.Height));
+        Size = new Size(Math.Min(1320, workingArea.Width), Math.Min(850, workingArea.Height));
         Font = new Font("Segoe UI", 9f);
         string iconFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "TEC Systems Field Toolkit.ico");
         if (File.Exists(iconFile)) Icon = new Icon(iconFile);
@@ -421,7 +424,7 @@ internal sealed partial class ToolkitWindow : Form
         if (startup) ShowInTaskbar = false;
         ApplyTheme();
         Shown += delegate {
-            SetInitialSplit(); ApplyTitleBarTheme();
+            SetInitialSplit(); FitWindowToWorkingArea(); LayoutChrome(); ApplyTitleBarTheme();
             if (startup) Hide();
             if (testing) return;
             RefreshProfiles(); RefreshAdaptersAsync(); UpdateInternet(); internetTimer.Start(); updateTimer.Start(); usageTimer.Start(); CheckUpdates(true);
@@ -433,6 +436,7 @@ internal sealed partial class ToolkitWindow : Form
             }));
         };
         FormClosing += OnClosing;
+        SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
         Activated += delegate { StartUsage(); };
         Deactivate += delegate { FlushUsage(); };
         VisibleChanged += delegate { if (!Visible) FlushUsage(); };
@@ -598,6 +602,10 @@ internal sealed partial class ToolkitWindow : Form
     private TabPage Page(string name)
     {
         TabPage tab = new TabPage(name) { AutoScroll = true, Padding = new Padding(0) };
+        if (name == "IP Shifter") tab.AutoScrollMinSize = new Size(730, 565);
+        else if (name == "IP Scanner") tab.AutoScrollMinSize = new Size(720, 560);
+        else if (name == "Network Troubleshooting") tab.AutoScrollMinSize = new Size(735, 615);
+        else if (name == "Packet Analyzer") tab.AutoScrollMinSize = new Size(650, 620);
         tabs.TabPages.Add(tab);
         return tab;
     }
@@ -615,28 +623,33 @@ internal sealed partial class ToolkitWindow : Form
             brandPicture = new PictureBox { Left = 18, Top = 16, Width = 300, Height = 64, SizeMode = PictureBoxSizeMode.Zoom, Image = lightBrand };
             header.Controls.Add(brandPicture);
         }
-        header.Controls.Add(new Label { Text = Product, Left = 340, Top = 18, Width = 320, Height = 32, Font = new Font("Segoe UI", 15f, FontStyle.Bold) });
-        header.Controls.Add(L("Managed by TEC Systems IT", 342, 53, 250));
-        header.Controls.Add(L("Version " + version, 342, 76, 200));
-        header.Controls.Add(L("Search log", 670, 51, 120));
+        productLabel = new Label { Text = Product, Left = 340, Top = 18, Width = 320, Height = 32, Font = new Font("Segoe UI", 15f, FontStyle.Bold) };
+        header.Controls.Add(productLabel);
+        managedLabel = L("Managed by TEC Systems IT", 342, 53, 250); header.Controls.Add(managedLabel);
+        versionLabel = L("Version " + version, 342, 76, 200); header.Controls.Add(versionLabel);
+        searchLabel = L("Search log", 670, 51, 120); header.Controls.Add(searchLabel);
         searchBox = T(670, 75, 138, "");
         header.Controls.Add(searchBox);
         searchBox.KeyDown += delegate(object sender, KeyEventArgs args) { if (args.KeyCode == Keys.Enter) { SearchLog(); args.SuppressKeyPress = true; } };
-        B(header, "Search", 818, 70, 72, SearchLog, "Find entries in the current technician log.", Green);
+        searchButton = B(header, "Search", 818, 70, 72, SearchLog, "Find entries in the current technician log.", Green);
         themeButton = B(header, "Dark Mode", 900, 70, 98, ToggleTheme, "Switch between light and dark appearance.", Slate);
-        header.Controls.Add(new Label { Text = "Hostname: " + Environment.MachineName, Left = 1050, Top = 18, Width = 190, Height = 22, TextAlign = ContentAlignment.MiddleRight, Anchor = AnchorStyles.Top | AnchorStyles.Right });
-        header.Controls.Add(new Label { Text = IsAdmin() ? "Mode: Administrator" : "Mode: Standard User", Left = 1050, Top = 69, Width = 190, Height = 22, TextAlign = ContentAlignment.MiddleRight, Anchor = AnchorStyles.Top | AnchorStyles.Right });
+        hostLabel = new Label { Text = "Hostname: " + Environment.MachineName, Left = 1050, Top = 18, Width = 190, Height = 22, TextAlign = ContentAlignment.MiddleRight };
+        modeLabel = new Label { Text = IsAdmin() ? "Mode: Administrator" : "Mode: Standard User", Left = 1050, Top = 69, Width = 190, Height = 22, TextAlign = ContentAlignment.MiddleRight };
+        header.Controls.Add(hostLabel); header.Controls.Add(modeLabel);
 
         footerPanel = new Panel { Dock = DockStyle.Bottom, Height = 42 };
         Panel footer = footerPanel;
         Controls.Add(footer);
-        statusLabel = L("Ready", 18, 11, 295);
+        statusLabel = L("Ready", 18, 11, 295); statusLabel.AutoEllipsis = true;
         footer.Controls.Add(statusLabel);
         updateButton = B(footer, "Check Updates", 338, 5, 148, OpenUpdateOffer, "Check for a newer toolkit release or install an available update.", Cobalt);
-        B(footer, "Activity Report", 500, 5, 148, ShowActivityReport, "View this week's saved sites and technician activity.", Green);
-        B(footer, "Backup & Restore", 664, 5, 148, ShowBackupDialog, "Export or import saved IP and RDP profiles.", Slate);
+        activityButton = B(footer, "Activity Report", 500, 5, 148, ShowActivityReport, "View this week's saved sites and technician activity.", Green);
+        backupButton = B(footer, "Backup & Restore", 664, 5, 148, ShowBackupDialog, "Export or import saved IP and RDP profiles.", Slate);
         internetLabel = new Label { Text = "Internet: Checking", Dock = DockStyle.Right, Width = 270, TextAlign = ContentAlignment.MiddleRight, Padding = new Padding(0, 0, 18, 0) };
         footer.Controls.Add(internetLabel);
+        header.SizeChanged += delegate { LayoutChrome(); };
+        footer.SizeChanged += delegate { LayoutChrome(); };
+        LayoutChrome();
 
         split = new SplitContainer { Dock = DockStyle.Fill };
         Controls.Add(split);
@@ -668,9 +681,62 @@ internal sealed partial class ToolkitWindow : Form
 
     private void SetInitialSplit()
     {
-        split.Panel1MinSize = 650;
-        split.Panel2MinSize = 260;
+        split.Panel1MinSize = 550;
+        split.Panel2MinSize = 170;
         split.SplitterDistance = Math.Min(870, split.Width - split.Panel2MinSize - split.SplitterWidth);
+    }
+
+    private void LayoutChrome()
+    {
+        if (headerPanel != null && productLabel != null && searchButton != null && themeButton != null)
+        {
+            int width = headerPanel.ClientSize.Width;
+            bool wide = width >= 1260;
+            int informationLeft = wide ? 340 : width >= 950 ? 275 : 230;
+            int searchLeft = wide ? 670 : width - 330;
+            if (brandPicture != null) brandPicture.Width = wide ? 300 : width >= 950 ? 240 : 200;
+            productLabel.Left = informationLeft;
+            productLabel.Width = Math.Min(360, Math.Max(200, width - informationLeft - 16));
+            managedLabel.Left = versionLabel.Left = informationLeft;
+            managedLabel.Width = versionLabel.Width = Math.Max(145, searchLeft - informationLeft - 12);
+            searchLabel.Left = searchBox.Left = searchLeft;
+            searchButton.Left = searchLeft + (wide ? 148 : 145);
+            themeButton.Left = searchLeft + (wide ? 230 : 215);
+            hostLabel.Visible = modeLabel.Visible = wide;
+            hostLabel.Left = modeLabel.Left = width - 230;
+        }
+        if (footerPanel != null && statusLabel != null && updateButton != null && activityButton != null && backupButton != null && internetLabel != null)
+        {
+            int width = footerPanel.ClientSize.Width;
+            bool twoRows = width < 790;
+            int wantedHeight = twoRows ? 76 : 42;
+            if (footerPanel.Height != wantedHeight) footerPanel.Height = wantedHeight;
+            statusLabel.Width = twoRows ? Math.Max(160, width - 200) : width >= 1160 ? 295 : width >= 940 ? 180 : 120;
+            int buttonsLeft = twoRows ? 18 : statusLabel.Right + 22;
+            updateButton.Left = buttonsLeft;
+            activityButton.Left = updateButton.Right + 14;
+            backupButton.Left = activityButton.Right + 14;
+            updateButton.Top = activityButton.Top = backupButton.Top = twoRows ? 39 : 5;
+            internetLabel.Width = twoRows ? 170 : Math.Min(270, Math.Max(145, width - backupButton.Right - 8));
+        }
+    }
+
+    private void FitWindowToWorkingArea()
+    {
+        Rectangle work = Screen.FromControl(this).WorkingArea;
+        MinimumSize = new Size(Math.Min(900, work.Width), Math.Min(560, work.Height));
+        if (WindowState != FormWindowState.Normal) return;
+        if (Width > work.Width || Height > work.Height)
+            Size = new Size(Math.Min(Width, work.Width), Math.Min(Height, work.Height));
+        Location = new Point(Math.Max(work.Left, Math.Min(Left, work.Right - Width)),
+            Math.Max(work.Top, Math.Min(Top, work.Bottom - Height)));
+    }
+
+    private void OnDisplaySettingsChanged(object sender, EventArgs args)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke(new Action(delegate { if (!IsDisposed) { FitWindowToWorkingArea(); LayoutChrome(); } })); }
+        catch (InvalidOperationException) { }
     }
 
     private void BuildLogPanel()
@@ -806,6 +872,7 @@ internal sealed partial class ToolkitWindow : Form
         ShowInTaskbar = true;
         if (!Visible) Show();
         WindowState = FormWindowState.Normal;
+        FitWindowToWorkingArea();
         BringToFront();
         Activate();
         NativeToolkit.SetForegroundWindow(Handle);
@@ -828,6 +895,7 @@ internal sealed partial class ToolkitWindow : Form
         if (!exitRequested && args.CloseReason == CloseReason.UserClosing) { args.Cancel = true; Hide(); return; }
         FlushUsage();
         SystemEvents.UserPreferenceChanged -= OnWindowsPreferenceChanged;
+        SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         if (internetTimer != null) { internetTimer.Stop(); internetTimer.Dispose(); }
         if (updateTimer != null) { updateTimer.Stop(); updateTimer.Dispose(); }
         if (usageTimer != null) { usageTimer.Stop(); usageTimer.Dispose(); }
@@ -1120,13 +1188,13 @@ internal sealed partial class ToolkitWindow : Form
             captureBrowse.Left = capturePath.Right + 12;
             captureFindings.Width = width;
             captureReport.Width = width;
-            captureReport.Height = Math.Max(120, page.ClientSize.Height - captureReport.Top - 18);
+            captureReport.Height = Math.Max(120, page.ClientSize.Height - 424 - 18);
             int detailsWidth = Math.Max(120, width - 72 - 180 - 245 - 8);
             captureFindings.Columns[0].Width = 72;
             captureFindings.Columns[1].Width = 180;
             captureFindings.Columns[2].Width = 245;
             captureFindings.Columns[3].Width = detailsWidth;
-            captureStatus.Width = Math.Max(150, page.ClientSize.Width - captureStatus.Left - 18);
+            captureStatus.Width = Math.Max(150, page.ClientSize.Width - 448 - 18);
         };
         page.Resize += delegate { fit(); };
         fit();
@@ -1220,6 +1288,7 @@ internal sealed partial class ToolkitWindow : Form
             tools.Width = Math.Max(134, page.ClientSize.Width - 36);
             int columns = Math.Max(1, tools.ClientSize.Width / 134);
             tools.Height = ((tools.Controls.Count + columns - 1) / columns) * 42 + 4;
+            page.AutoScrollMinSize = new Size(0, 244 + tools.Height + 16);
         };
         page.SizeChanged += delegate { fitTools(); };
         fitTools();
@@ -2126,11 +2195,15 @@ internal sealed partial class ToolkitWindow : Form
         B(page, "Stop", 458, 120, 74, delegate { stopScan = true; }, "Stop the current scan.", Slate);
         B(page, "Export CSV", 540, 120, 110, ExportScan, "Save discovered IPs, hostnames, ping times, MAC owners, and ports.", Green);
         scanStatus = L("Ready | Ping and common TCP services", 18, 164, 660); page.Controls.Add(scanStatus);
-        scanView = new ListView { Left = 18, Top = 194, Width = 690, Height = 326, View = View.Details, FullRowSelect = true, GridLines = true, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right };
+        scanView = new ListView { Left = 18, Top = 194, Width = 690, Height = 326, View = View.Details, FullRowSelect = true, GridLines = true };
         scanView.Columns.Add("IP address", 110); scanView.Columns.Add("Hostname", 145); scanView.Columns.Add("Ping", 58); scanView.Columns.Add("MAC address", 125); scanView.Columns.Add("Manufacturer", 155); scanView.Columns.Add("Open TCP ports", 95);
         scanView.SizeChanged += delegate { UpdateScanColumns(); };
         scanView.ColumnClick += delegate(object sender, ColumnClickEventArgs args) { SortScanResults(args.Column); };
         page.Controls.Add(scanView);
+        page.SizeChanged += delegate {
+            scanView.Width = Math.Max(690, page.ClientSize.Width - 36);
+            scanView.Height = Math.Max(220, page.ClientSize.Height - 194 - 18);
+        };
         tips.SetToolTip(scanView, "Manufacturer is the registered MAC-prefix owner, which may differ from the device brand. Some devices do not publish a hostname or expose a MAC to this laptop.");
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add("Ping", null, delegate { if (scanView.SelectedItems.Count > 0) PingTerminal(scanView.SelectedItems[0].Text, true); });
@@ -2561,22 +2634,28 @@ internal sealed partial class ToolkitWindow : Form
         if (notes.Length > 12000) notes = notes.Substring(0, 12000) + "\r\n\r\nMore details are on the GitHub release page.";
         Color background = dark ? Color.FromArgb(27, 36, 43) : Color.White;
         Color foreground = dark ? Color.FromArgb(235, 242, 246) : Color.FromArgb(20, 36, 57);
+        Rectangle work = Screen.FromControl(this).WorkingArea;
         using (Form dialog = new Form { Text = "Toolkit Update Available", StartPosition = FormStartPosition.CenterParent,
-            Size = new Size(680, 530), MinimumSize = new Size(680, 530), FormBorderStyle = FormBorderStyle.FixedDialog,
+            Size = new Size(Math.Min(680, work.Width), Math.Min(530, work.Height)),
+            MinimumSize = new Size(Math.Min(600, work.Width), Math.Min(380, work.Height)), FormBorderStyle = FormBorderStyle.FixedDialog,
             MaximizeBox = false, MinimizeBox = false, BackColor = background, ForeColor = foreground, Font = new Font("Segoe UI", 9f) })
         {
-            dialog.Controls.Add(new Label { Text = "Version " + latest + " is available", Left = 22, Top = 18, Width = 620, Height = 33,
+            int contentWidth = dialog.ClientSize.Width - 44;
+            dialog.Controls.Add(new Label { Text = "Version " + latest + " is available", Left = 22, Top = 18, Width = contentWidth, Height = 33,
                 Font = new Font("Segoe UI", 15f, FontStyle.Bold), ForeColor = foreground });
             dialog.Controls.Add(new Label { Text = "Installed version: " + version + "    |    What's changed and what's removed:",
-                Left = 22, Top = 59, Width = 620, Height = 25, ForeColor = foreground });
-            dialog.Controls.Add(new TextBox { Text = notes, Left = 22, Top = 91, Width = 620, Height = 305,
+                Left = 22, Top = 59, Width = contentWidth, Height = 25, ForeColor = foreground });
+            TextBox notesBox = new TextBox { Text = notes, Left = 22, Top = 91, Width = contentWidth,
+                Height = Math.Max(150, dialog.ClientSize.Height - 190),
                 Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, WordWrap = true,
-                BackColor = dark ? Color.FromArgb(38, 50, 59) : Color.White, ForeColor = foreground });
+                BackColor = dark ? Color.FromArgb(38, 50, 59) : Color.White, ForeColor = foreground };
+            dialog.Controls.Add(notesBox);
             dialog.Controls.Add(new Label { Text = "Updating will close and reopen the toolkit. Saved profiles and logs will stay in place.",
-                Left = 22, Top = 410, Width = 620, Height = 28, ForeColor = foreground });
-            Button later = new Button { Text = "Later", Left = 394, Top = 446, Width = 115, Height = 34,
+                Left = 22, Top = notesBox.Bottom + 12, Width = contentWidth, Height = 28, ForeColor = foreground });
+            int buttonTop = dialog.ClientSize.Height - 46;
+            Button later = new Button { Text = "Later", Left = dialog.ClientSize.Width - 266, Top = buttonTop, Width = 115, Height = 34,
                 DialogResult = DialogResult.No, BackColor = Slate, ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-            Button install = new Button { Text = "Update Now", Left = 525, Top = 446, Width = 117, Height = 34,
+            Button install = new Button { Text = "Update Now", Left = dialog.ClientSize.Width - 139, Top = buttonTop, Width = 117, Height = 34,
                 DialogResult = DialogResult.Yes, BackColor = Cobalt, ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
             later.FlatAppearance.BorderSize = 0; install.FlatAppearance.BorderSize = 0;
             dialog.Controls.Add(later); dialog.Controls.Add(install); dialog.CancelButton = later;
@@ -2823,6 +2902,17 @@ internal sealed partial class ToolkitWindow : Form
                 profileSort.SelectedIndex = 0; RefreshProfiles();
             }
             Show(); Application.DoEvents();
+            Size normalSize = Size;
+            Rectangle testWork = Screen.FromControl(this).WorkingArea;
+            Size = new Size(Math.Min(900, testWork.Width), Math.Min(560, testWork.Height));
+            Application.DoEvents();
+            TabPage narrowNetwork = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "Network Troubleshooting");
+            tabs.SelectedTab = narrowNetwork; Application.DoEvents();
+            if (Right > testWork.Right || Bottom > testWork.Bottom || searchBox.Right > headerPanel.ClientSize.Width ||
+                themeButton.Right > headerPanel.ClientSize.Width || backupButton.Right > internetLabel.Left ||
+                !narrowNetwork.AutoScroll || narrowNetwork.AutoScrollMinSize.Height < 600)
+                throw new InvalidOperationException("Toolkit controls are clipped at a smaller Windows working area.");
+            Size = normalSize; SetInitialSplit(); Application.DoEvents();
             tabs.SelectedTab = tabs.TabPages.Cast<TabPage>().First(page => page.Text == "IP Shifter");
             split.SplitterDistance = 650;
             Application.DoEvents();

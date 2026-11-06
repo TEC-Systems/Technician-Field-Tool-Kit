@@ -317,8 +317,10 @@ internal sealed class RdpManager : UserControl
         bool darkTheme = Parent != null && Parent.BackColor.GetBrightness() < 0.5f;
         Color background = darkTheme ? Color.FromArgb(27, 36, 43) : Color.White;
         Color foreground = darkTheme ? Color.FromArgb(235, 242, 246) : Color.FromArgb(20, 36, 57);
+        Rectangle work = Screen.FromControl(this).WorkingArea;
         using (Form dialog = new Form { Text = "RDP Login Help", StartPosition = FormStartPosition.CenterParent,
-            Size = new Size(900, 600), MinimumSize = new Size(760, 440), BackColor = background, ForeColor = foreground,
+            Size = new Size(Math.Min(900, work.Width), Math.Min(600, work.Height)),
+            MinimumSize = new Size(Math.Min(760, work.Width), Math.Min(440, work.Height)), BackColor = background, ForeColor = foreground,
             Font = new Font("Segoe UI", 9f) })
         {
             TextBox text = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true,
